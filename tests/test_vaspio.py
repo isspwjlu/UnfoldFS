@@ -55,14 +55,16 @@ def test_read_eigenval_efermi_is_nan():
 # ------------------------------------------------------------------- DOSCAR
 def test_read_doscar_fermi_is_fourth_field_of_line6():
     ef = read_doscar_fermi(str(FIXTURE_DOSCAR))
-    lines = open(str(FIXTURE_DOSCAR)).read().splitlines()
+    with open(str(FIXTURE_DOSCAR), encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
     assert abs(ef - float(lines[5].split()[3])) < 1e-12
 
 
 def test_read_doscar_fermi_value_and_not_emax_emin():
     ef = read_doscar_fermi(str(FIXTURE_DOSCAR))
     assert abs(ef - (-1.84458790)) < 1e-8
-    lines = open(str(FIXTURE_DOSCAR)).read().splitlines()
+    with open(str(FIXTURE_DOSCAR), encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
     fields = [float(x) for x in lines[5].split()]
     # 第 6 行 = EMAX EMIN NEDOS EFERMI ...; E_F 不是 EMAX/EMIN/NEDOS
     assert ef != fields[0] and ef != fields[1] and ef != fields[2]
@@ -111,13 +113,14 @@ def test_read_procar_complex_last_column_is_sum_of_squared_moduli():
 def _raw_complex_last_column(path):
     """从原始 PROCAR 文本里取第 1 个 k 点第 1 个 band 的复投影块末列。"""
     rows = []
-    for line in open(path, encoding="utf-8"):
-        s = line.strip()
-        toks = s.split()
-        if toks and toks[0].isdigit() and len(toks) == 20:
-            rows.append(float(toks[19]))
-            if len(rows) == 27:
-                break
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            s = line.strip()
+            toks = s.split()
+            if toks and toks[0].isdigit() and len(toks) == 20:
+                rows.append(float(toks[19]))
+                if len(rows) == 27:
+                    break
     return np.array(rows)
 
 
@@ -197,4 +200,117 @@ def test_read_procar_missing_ion_header_raises(tmp_path):
                     "# of k-points: 1 # of bands: 1 # of ions: 1\n",
                     encoding="utf-8")
     with pytest.raises(ValueError, match="ion"):
+        read_procar(str(path))
+
+
+# ------------------------------------------------------- EIGENVAL 错误路径
+def _eigenval_with_ispin(tmp_path, ispin):
+    """把真实 EIGENVAL 第 1 行的 ISPIN(第 3 个字段)改成指定值。"""
+    lines = FIXTURE_EIGENVAL.read_text(encoding="utf-8").splitlines(keepends=True)
+    head = lines[0].split()
+    assert len(head) == 4 and head[2] == "1", head
+    head[2] = str(ispin)
+    lines[0] = "   " + "   ".join(head) + "\n"
+    path = tmp_path / f"EIGENVAL_ISPIN{ispin}"
+    path.write_text("".join(lines), encoding="utf-8")
+    return path
+
+
+def test_read_eigenval_rejects_spin_polarized_ispin2(tmp_path):
+    """ISPIN=2 的带行是 5 个字段(E↑ occ↑ E↓ occ↓)。
+
+    按 3 字段解析会把自旋下半静默丢掉, 而 energies/occupations 看起来却是完整的
+    -> 必须显式报错。
+    """
+    path = _eigenval_with_ispin(tmp_path, 2)
+    with pytest.raises(ValueError, match="ISPIN"):
+        read_eigenval(str(path))
+
+
+def test_read_eigenval_rejects_band_index_misalignment(tmp_path):
+    """带行首字段是带号; 错位(丢行/多行)必须报错而不是静默产出垃圾。"""
+    lines = FIXTURE_EIGENVAL.read_text(encoding="utf-8").splitlines(keepends=True)
+    toks = lines[8].split()
+    assert int(toks[0]) == 1, toks          # 第 1 个 k 点的第 1 条带
+    toks[0] = "5"
+    lines[8] = "  " + "  ".join(toks) + "\n"
+    path = tmp_path / "EIGENVAL_BADBAND"
+    path.write_text("".join(lines), encoding="utf-8")
+    with pytest.raises(ValueError, match="带号"):
+        read_eigenval(str(path))
+
+
+def test_read_eigenval_nkpt_header_mismatch_raises(tmp_path):
+    """头部第 2 个字段声明的 NKPT 必须等于文件里实际的 k 点块数。"""
+    lines = FIXTURE_EIGENVAL.read_text(encoding="utf-8").splitlines(keepends=True)
+    hdr = lines[5].split()
+    assert len(hdr) == 3 and hdr[1] == "2", hdr   # NELECT NKPT NBANDS
+    hdr[1] = "1"                                   # 实际有 2 个 k 点块
+    lines[5] = "    " + "      ".join(hdr) + "\n"
+    path = tmp_path / "EIGENVAL_BADNK"
+    path.write_text("".join(lines), encoding="utf-8")
+    with pytest.raises(ValueError, match="NKPT"):
+        read_eigenval(str(path))
+
+
+def test_read_eigenval_truncated_raises(tmp_path):
+    """文件被截断(作业被 kill / 磁盘满)时必须报错, 不能补 0。"""
+    lines = FIXTURE_EIGENVAL.read_text(encoding="utf-8").splitlines(keepends=True)
+    path = tmp_path / "EIGENVAL_TRUNC"
+    path.write_text("".join(lines[:150]), encoding="utf-8")   # 截在第 2 个 k 点中间
+    with pytest.raises(ValueError, match="提前结束"):
+        read_eigenval(str(path))
+
+
+# -------------------------------------------------------- PROCAR 错误路径
+def _truncate_procar_in_last_band(tmp_path):
+    """把真实 PROCAR 在最后一个 band 块内部截断(复投影块之前)。
+
+    复现评审场景: VASP 作业被 kill / 磁盘满 -> 文件只写了一半。
+    """
+    lines = FIXTURE_PROCAR.read_text(encoding="utf-8").splitlines(keepends=True)
+    last_band = max(i for i, ln in enumerate(lines) if ln.strip().startswith("band "))
+    cut = None
+    for i in range(last_band, len(lines)):
+        s = lines[i].strip()
+        # 复投影块的 ion 表头比模方块表头少一列("tot")
+        if s.startswith("ion") and len(s.split()) != 11:
+            cut = i
+            break
+    assert cut is not None, "未找到最后一个 band 的复投影表头"
+    path = tmp_path / "PROCAR_TRUNC"
+    path.write_text("".join(lines[:cut]), encoding="utf-8")
+    return path
+
+
+def test_read_procar_truncated_in_last_band_block_raises(tmp_path):
+    """尾部截断 -> 最后一个 band 的复投影系数被静默补 0 -> 必须报错。"""
+    path = _truncate_procar_in_last_band(tmp_path)
+    with pytest.raises(ValueError, match="复投影"):
+        read_procar(str(path))
+
+
+def test_read_procar_truncated_in_modulus_block_raises(tmp_path):
+    """模方块块内截断 -> 该 band 的 |p|^2 被静默补 0 -> 必须报错。"""
+    lines = FIXTURE_PROCAR.read_text(encoding="utf-8").splitlines(keepends=True)
+    last_band = max(i for i, ln in enumerate(lines) if ln.strip().startswith("band "))
+    # 截在最后一个 band 的模方块第 5 行之后
+    cut = last_band + 8
+    path = tmp_path / "PROCAR_TRUNC_MOD"
+    path.write_text("".join(lines[:cut]), encoding="utf-8")
+    with pytest.raises(ValueError, match="模方块"):
+        read_procar(str(path))
+
+
+def test_read_procar_rejects_band_number_misalignment(tmp_path):
+    """PROCAR 的 band 行必须带连续带号; 错位说明文件结构对不上。"""
+    lines = FIXTURE_PROCAR.read_text(encoding="utf-8").splitlines(keepends=True)
+    idx = next(i for i, ln in enumerate(lines)
+               if ln.strip().startswith("band") and ln.split()[1] == "5")
+    toks = lines[idx].split()
+    toks[1] = "9"
+    lines[idx] = " ".join(toks) + "\n"
+    path = tmp_path / "PROCAR_BADBAND"
+    path.write_text("".join(lines), encoding="utf-8")
+    with pytest.raises(ValueError, match="带号"):
         read_procar(str(path))
