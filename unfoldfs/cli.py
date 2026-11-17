@@ -28,7 +28,7 @@ import numpy as np
 
 from .expand import build_spectral_function, expand_to_full_grid
 from .fsout import (band_edges, make_e_grid, select_fermi_energy, write_bxsf,
-                    write_cube, write_fermisurfer_bands, write_grd,
+                    write_cube, write_fermisurfer_bands,
                     write_spectral_npz)
 from .geometry import (common_symmetry_ops, read_poscar, read_transmat,
                        reciprocal, resolve_transform)
@@ -245,12 +245,18 @@ def cmd_unfold(args: argparse.Namespace) -> int:
         strict_dominance=args.strict_dominance)
     expanded = expand_to_full_grid(unfolded, gm)
 
-    vbm, cbm = band_edges(band)
+    # VBM/CBM 只在 EIGENVAL 里有占据态时才有意义; --ef <数值> 不该被它挡住
+    try:
+        vbm, cbm = band_edges(band)
+        vbm_txt = f"{vbm:.6f} / {cbm:.6f} eV"
+    except ValueError as exc:
+        vbm, cbm = float("nan"), float("nan")
+        vbm_txt = f"不可用 ({exc})"
     e_f = select_fermi_energy(dos_ef, band, mode=args.ef, offset=args.delta,
                                gap_tol=_GAP_TOL)
     print(f"相位约定      : s1 = {unfolded.s1:+d}, s2 = {unfolded.s2:+d} "
           f"(单 G 主导度 {unfolded.dominance:.4f})")
-    print(f"VBM / CBM     : {vbm:.6f} / {cbm:.6f} eV")
+    print(f"VBM / CBM     : {vbm_txt}")
     print(f"E_F           : {e_f:.6f} eV  (--ef {args.ef}, "
           f"--delta {args.delta:g})")
 
@@ -260,23 +266,24 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     comments = _fs_comments(e_f, args, vbm, cbm)
 
     cube_path = os.path.join(args.outdir, "FS.cube")
-    grd_path = os.path.join(args.outdir, "FS.grd")
     bxsf_path = os.path.join(args.outdir, "FS.bxsf")
     npz_path = os.path.join(args.outdir, "A(k,E).npz")
     write_cube(cube_path, expanded, b_prim, values, comments=comments)
-    write_grd(grd_path, expanded, b_prim, values, comments=comments)
-    write_bxsf(bxsf_path, expanded, b_prim, e_f, comments=comments)
-    band_paths = write_fermisurfer_bands(args.outdir, expanded, b_prim, e_f,
-                                         comments=comments)
+    print(f"已写出        : {cube_path}")
+    # BXSF 只支持 Gamma 网格(见 docs/formats.md §3): MP 网格下跳过它,
+    # 但把原因说清楚 —— 其余输出(FS.cube / band.N / npz)对 MP 网格都成立
+    try:
+        write_bxsf(bxsf_path, expanded, b_prim, e_f, comments=comments)
+    except ValueError as exc:
+        print(f"已跳过        : {bxsf_path} ({exc})")
+    else:
+        print(f"已写出        : {bxsf_path}")
+    band_paths = write_fermisurfer_bands(args.outdir, expanded, b_prim, e_f)
+    print(f"已写出        : {os.path.join(args.outdir, 'band.1')} ... "
+          f"band.{len(band_paths)}")
     e_grid = make_e_grid(e_f, _NPZ_HALF_WIDTH, _NPZ_N_POINTS)
     write_spectral_npz(npz_path, expanded, b_prim, e_f, vbm=vbm, cbm=cbm,
                        e_grid=e_grid, sigma=args.sigma)
-
-    print(f"已写出        : {cube_path}")
-    print(f"已写出        : {grd_path}")
-    print(f"已写出        : {bxsf_path}")
-    print(f"已写出        : {os.path.join(args.outdir, 'band.1')} ... "
-          f"band.{len(band_paths)}")
     print(f"已写出        : {npz_path}")
     return 0
 
@@ -285,8 +292,10 @@ def _fs_comments(e_f: float, args: argparse.Namespace, vbm: float,
                  cbm: float) -> List[str]:
     """写进各费米面文件头部的两行说明(含 E_F)。"""
     line1 = "unfoldfs: unfolded Fermi surface (spectral function A(k, E_F))"
+    vbm_txt = "n/a" if not np.isfinite(vbm) else f"{vbm:.6f}"
+    cbm_txt = "n/a" if not np.isfinite(cbm) else f"{cbm:.6f}"
     line2 = (f"E_F = {e_f:.6f} eV (--ef {args.ef}, --delta {args.delta:g}, "
-             f"--sigma {args.sigma:g}); VBM = {vbm:.6f} CBM = {cbm:.6f} eV; "
+             f"--sigma {args.sigma:g}); VBM = {vbm_txt} CBM = {cbm_txt} eV; "
              "k = 2pi/Angstrom; E = eV; cell vectors in Bohr (cube = a.u.); "
              "reciprocal box = BZ")
     return [line1, line2]

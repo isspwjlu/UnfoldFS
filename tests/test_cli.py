@@ -26,8 +26,7 @@ import numpy as np
 import pytest
 
 from unfoldfs import cli
-from unfoldfs.fsout import (read_bxsf, read_cube, read_fermisurfer_band,
-                            read_grd)
+from unfoldfs.fsout import read_bxsf, read_cube, read_fermisurfer_band
 from unfoldfs.geometry import (common_symmetry_ops, read_poscar,
                                read_transmat, reciprocal, resolve_transform)
 from unfoldfs.grid import (GridSpec, build_grid_map, filter_ops_by_grid,
@@ -300,19 +299,19 @@ def test_unfold_raises_when_k_point_count_does_not_match(tmp_path, mini_run):
         cli.main(["unfold", "--dir", run, "--outdir", str(tmp_path / "fs")])
 
 
-def test_unfold_produces_all_five_output_files(tmp_path, mini_run):
+def test_unfold_produces_all_four_output_files(tmp_path, mini_run):
+    """交付面 = 4 种格式(FS.grd 已删除: 没有任何标准读取器)。"""
     fs = tmp_path / "fs"
     rc = cli.main(["unfold", "--dir", str(mini_run), "--outdir", str(fs)])
     assert rc == 0
-    for name in ("FS.cube", "FS.grd", "FS.bxsf", "A(k,E).npz"):
+    for name in ("FS.cube", "FS.bxsf", "A(k,E).npz"):
         assert (fs / name).is_file(), name
     assert (fs / "band.1").is_file()
+    assert not (fs / "FS.grd").exists()
     # 写出的文件能被自己的读取器读回来
     cube = read_cube(str(fs / "FS.cube"))
     assert cube["dims"] == [3, 1, 1]
     assert cube["field"].size == 3
-    grd = read_grd(str(fs / "FS.grd"))
-    assert (grd["nx"], grd["ny"], grd["nz"]) == (3, 1, 1)
     bxsf = read_bxsf(str(fs / "FS.bxsf"))
     assert bxsf["dims"] == [4, 2, 2]
     assert bxsf["nb"] >= 1
@@ -350,10 +349,27 @@ def test_ef_modes_have_the_documented_semantics(tmp_path, mini_run, ef_arg,
     assert float(npz["cbm"]) == pytest.approx(-2.0, abs=1e-9)
 
 
-def test_ef_auto_uses_doscar_fermi_for_a_metal(tmp_path):
-    """金属(分数占据)时 auto 取 DOSCAR 的 E_F, 而不是 VBM。"""
+def test_ef_auto_takes_the_vbm_when_the_doscar_ef_sits_inside_the_gap(tmp_path):
+    """带边的**分数占据不再意味着金属**(Ruling 25)。
+
+    占据 (1, 1, 0.4, 0) => VBM=-6, CBM=-2(gap 4 eV), 而 DOSCAR 的 E_F=-5
+    落在带隙里 => auto 取 VBM+delta。展宽体系里带边占据数本来就是 0.4/0.98
+    这种小数(实测 MoS2: gap=1.61 eV 却因带边 0.9866 被判成金属, auto 于是
+    取了带隙中央的 DOSCAR E_F => 费米面是空的)。
+    """
     run = tmp_path / "run"
     _write_mini_system(str(run), occupations=(1.0, 1.0, 0.4, 0.0))
+    _write_grid_map(str(run))
+    fs = tmp_path / "fs"
+    cli.main(["unfold", "--dir", str(run), "--outdir", str(fs)])
+    npz = np.load(str(fs / "A(k,E).npz"))
+    assert float(npz["ef"]) == pytest.approx(-6.0 + 0.05, abs=1e-9)
+
+
+def test_ef_auto_uses_doscar_fermi_when_the_ef_is_outside_the_gap(tmp_path):
+    """E_F 落在带隙之外 ⇒ 金属 ⇒ auto 取 DOSCAR 的 E_F。"""
+    run = tmp_path / "run"
+    _write_mini_system(str(run), occupations=(1.0, 1.0, 1.0, 0.0))
     _write_grid_map(str(run))
     fs = tmp_path / "fs"
     cli.main(["unfold", "--dir", str(run), "--outdir", str(fs)])

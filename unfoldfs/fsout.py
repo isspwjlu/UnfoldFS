@@ -1,4 +1,4 @@
-"""费米面文件输出: FS.cube / FS.grd / FS.bxsf / band.N / A(k,E).npz。
+"""费米面文件输出: FS.cube / FS.bxsf / band.N / A(k,E).npz(共 4 种)。
 
 **格式不凭空设计**: 每一种格式的字段顺序、单位、约定都在 ``docs/formats.md``
 里逐条记录了出处(XCrySDen 自带样例、vaspkit 262 的输出、FermiSurfer 2.2.1 的
@@ -12,13 +12,18 @@
   * ``valid == False`` 的补位槽(能量 +inf、权重 0)绝不进入任何输出。
 
 补位槽在 BXSF / FermiSurfer 逐带文件里的处理: 该槽位对应的带在该 k 点上
-根本不存在, 必须填一个数。填**同一 k 点上下一条有效带的能量**(没有则填该点
-最高有效带的能量), 这样跨过有效/无效边界时场是连续的, 不会凭空多出一张
-等值面; 权重视为 0(该态不存在)。
+根本不存在, 必须填一个数。填**该点最高有效带的能量**(该点一条有效带都没有
+时填 0) —— 规则见 docs/formats.md §5。补位带与最高有效带重合, 所以最高带
+过 E_F 的地方可能出现**重合的**等值面。
+
+FermiSurfer 的 ``band.N`` 写的是**相对 E_F** 的能量(E − E_F): FermiSurfer
+默认 ``EF = 0``(``fermisurfer.cpp:219``), 它的官方 .frmsf 样例也全部以 0
+为中心 ⇒ 写绝对能量会画不出费米面(静默失败)。
 """
 from __future__ import annotations
 
 import os
+import warnings
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
@@ -29,9 +34,9 @@ from .vaspio import BandData
 __all__ = [
     "BOHR_IN_ANGSTROM",
     "band_edges", "is_metal", "select_fermi_energy", "make_e_grid",
-    "write_cube", "write_grd", "write_bxsf", "write_fermisurfer_bands",
+    "write_cube", "write_bxsf", "write_fermisurfer_bands",
     "write_spectral_npz",
-    "read_cube", "read_grd", "read_bxsf", "read_fermisurfer_band",
+    "read_cube", "read_bxsf", "read_fermisurfer_band",
 ]
 
 # ---------------------------------------------------------------- 网格重建
@@ -72,9 +77,12 @@ def _field_on_grid(expanded: ExpandedData, b_prim: np.ndarray,
 
 
 def _filled_band_energies(expanded: ExpandedData) -> np.ndarray:
-    """逐带能量, 补位槽按"同一 k 点上下一条有效带"填充。
+    """逐带能量, 补位槽填**该点最高有效带的能量**(该点无有效带则填 0)。
 
     返回 (n_points, n_band_eff); 全部为有限值(没有有效带的点填 0)。
+
+    实现上取"下标更大且有效的带"优先, 但 ``unfold`` 产生的补位槽恒为**连续
+    尾部** ⇒ 不存在这样的带 ⇒ 实际恒等于"最高有效带"(见 docs/formats.md §5)。
     """
     e = np.asarray(expanded.band_e, dtype=float)
     valid = np.asarray(expanded.valid, dtype=bool)
@@ -122,37 +130,67 @@ def band_edges(band: BandData, threshold: float = 0.5) -> tuple:
 
 
 def is_metal(band: BandData, gap_tol: float = 0.05) -> bool:
-    """金属判据: 带隙 <= gap_tol, **或**存在分数占据态。
+    """金属判据: **带隙 <= gap_tol**。
 
-    分数占据(占据数严格落在 0 与 1 之间)说明费米面上有态 —— 这是金属的
-    可靠特征, 在 smearing 较大导致"表观带隙"不可信时仍能判对。
+    ⚠ "存在分数占据"**不是**金属判据: 任何用了展宽的**有带隙**体系, 带边的
+    占据数都会变成 0.98 这类小数(高斯展宽与四面体法都一样) —— 用它判金属
+    会把半导体误判成金属(实测: MoS2 的 VBM=-2.077449 / CBM=-0.465849 /
+    gap=1.61 eV 因带边占据 0.9866 被判成金属, auto 于是取了带隙中央的
+    DOSCAR E_F ⇒ 费米面是空的)。
+
+    E_F 的最终选择见 ``select_fermi_energy`` 的 ``auto`` 分支(它还看
+    DOSCAR 的 E_F 落在带隙的哪一侧)。
     """
     vbm, cbm = band_edges(band)
-    if cbm - vbm <= gap_tol:
-        return True
-    occ = np.asarray(band.occupations, dtype=float)
-    return bool(np.any((occ > 1e-6) & (occ < 1.0 - 1e-6)))
+    return bool(cbm - vbm <= gap_tol)
 
 
 def select_fermi_energy(dos_ef: float, band: BandData, mode: str = "auto",
                          offset: float = 0.0, gap_tol: float = 0.05) -> float:
     """按 ``--ef auto|vbm|<数值>`` 的语义选费米能(eV)。
 
-    * ``auto``    金属 -> DOSCAR 的 E_F; 半导体/绝缘体 -> VBM + offset
+    * ``auto``    按**带隙与 DOSCAR 的 E_F 的相对位置**决定(见下)
     * ``vbm``     总是 VBM + offset
     * ``doscar``  总是 DOSCAR 的 E_F
     * 数值/数值字符串 -> 直接当作 E_F(绝对值, 不加 offset)
+
+    ``auto`` 的判据(不依赖展宽宽度, 因此不需要额外物理参数)::
+
+        gap = CBM - VBM
+        gap <= gap_tol                 -> DOSCAR 的 E_F   (真金属/半金属)
+        VBM <= dos_ef <= CBM           -> VBM + offset    (E_F 落在带隙里)
+        否则                             -> DOSCAR 的 E_F   (E_F 在带隙外)
+
+    ⚠ "带边有分数占据" **不能**用来判金属: 用了展宽的有带隙体系, 带边占据数
+    都会是 0.98 这类小数(实测: MoS2 的 gap=1.61 eV 被误判成金属, auto 于是
+    取了带隙中央的 DOSCAR E_F ⇒ 费米面是空的)。
+
+    **只有 ``auto`` 与 ``vbm`` 需要 EIGENVAL**: 数值与 ``doscar`` 模式完全不
+    碰 EIGENVAL —— 用户明明白白给了 E_F, 不该被一个用不上的 EIGENVAL 挡住。
+    ``auto`` 模式若 EIGENVAL 里没有占据态(VBM 不可得), 退化到 DOSCAR 的 E_F
+    并给出明确 warning(不静默)。
     """
-    vbm, _cbm = band_edges(band)
     if isinstance(mode, str):
         key = mode.strip().lower()
-        if key == "auto":
-            return float(dos_ef) if is_metal(band, gap_tol=gap_tol) \
-                else float(vbm) + float(offset)
-        if key == "vbm":
-            return float(vbm) + float(offset)
         if key in ("doscar", "dos"):
             return float(dos_ef)
+        if key == "auto":
+            try:
+                vbm, cbm = band_edges(band)
+            except ValueError as exc:
+                warnings.warn(
+                    f"EIGENVAL 里读不到占据态({exc}); auto 模式退化到 DOSCAR "
+                    f"的费米能 {float(dos_ef):.6f} eV。")
+                return float(dos_ef)
+            gap = cbm - vbm
+            if gap <= gap_tol:                    # 真金属/半金属
+                return float(dos_ef)
+            if vbm <= float(dos_ef) <= cbm:       # E_F 落在带隙里 ⇒ 半导体
+                return float(vbm) + float(offset)
+            return float(dos_ef)                  # E_F 在带隙外 ⇒ 金属
+        if key == "vbm":
+            vbm, _cbm = band_edges(band)
+            return float(vbm) + float(offset)
         try:
             return float(mode)
         except ValueError as exc:
@@ -169,6 +207,8 @@ def make_e_grid(e_f: float, half_width: float, n: int) -> np.ndarray:
 
     n 取奇数, E_F 落在正中一个格点上 —— 这样谱函数在 E_F 处的值不必再做
     插值, 也不受网格步长影响。
+
+    **偶数 n 会被上调一格**(n -> n+1, 使 E_F 正好落在格点上); n < 3 直接报错。
     """
     n = int(n)
     if n < 3:
@@ -191,6 +231,27 @@ _HEADER_COMMENT = [
     "units: E in eV; cell vectors in Bohr (cube format = atomic units); "
     "k = 2pi/Angstrom / 0.529177; reciprocal box = BZ",
 ]
+
+
+def _isolevel_hint(vmax: float) -> str:
+    """cube 头部里的"体数据最大值 + 建议等值面层级"。
+
+    VESTA 的默认 isolevel = 0 —— 只有当高斯尾巴**恰好**下溢到 0.0 时才看得见
+    等值面(实测: 换个 sigma 或能量窗口就可能什么都没有)。故给出"最大值的一
+    半"作为建议层级: 稳健, 且落在 (0, max) 内。
+    """
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        return f"field max = {vmax:.3e}; (empty field: no isosurface)"
+    return (f"field max = {vmax:.3e}; "
+            f"use isosurface level ~ {0.5 * vmax:.3e}")
+
+
+def _check_lines(lines: List[str], min_lines: int, path: str) -> None:
+    """行数检查: 畸形/被截断的文件给可读信息, 而不是 IndexError。"""
+    if len(lines) < min_lines:
+        raise ValueError(
+            f"{os.path.basename(path)} 被截断: 只有 {len(lines)} 行, "
+            f"至少需要 {min_lines} 行")
 
 
 def _fmt_vec(v: Sequence[float], prec: int = 8) -> str:
@@ -230,6 +291,10 @@ def write_cube(path: str, expanded: ExpandedData, b_prim: np.ndarray,
 
     ⚠ VASP 的 CHGCAR **不是**这个约定(它写整条晶格矢量, 且是 VASP 专有
     格式), 别拿 CHGCAR 当 cube 的参考。
+
+    **头部给出体数据最大值与建议等值面层级**: VESTA 的默认 isolevel = 0,
+    "画不画得出来"会取决于高斯尾巴是否恰好下溢到 0.0 ⇒ 头部必须写明该选
+    什么层级(见 docs/formats.md §2)。
     """
     b = np.asarray(b_prim, dtype=float)
     field, dims = _field_on_grid(expanded, b, values)
@@ -240,6 +305,8 @@ def write_cube(path: str, expanded: ExpandedData, b_prim: np.ndarray,
     while len(lines) < 2:
         lines.append("")
     lines = lines[:2]
+    # 第 2 行补上"最大值 + 建议层级"(头部只有两行, 单位说明与它挤在一起)
+    lines[1] = lines[1] + "; " + _isolevel_hint(float(np.max(data)))
     lines.append(f"{0:5d}{_fmt_vec([0.0, 0.0, 0.0], prec=12)}")
     for a in range(3):
         # 增量矢量要多给几位: 盒子 = 增量 × 格点数, 位数不够会把 k 点拉偏
@@ -257,7 +324,9 @@ def read_cube(path: str) -> Dict:
     """
     with open(path, encoding="utf-8", errors="replace") as fh:
         lines = fh.read().splitlines()
+    _check_lines(lines, 3, path)
     natoms = int(lines[2].split()[0])
+    _check_lines(lines, 6 + natoms, path)
     origin = [float(x) for x in lines[2].split()[1:4]]
     dims = []
     vectors = []
@@ -278,80 +347,6 @@ def read_cube(path: str) -> Dict:
     cell = inc * np.array(dims, dtype=float)[:, None] * BOHR_IN_ANGSTROM
     return {"comment": lines[:2], "natoms": natoms, "origin": origin,
             "dims": dims, "vectors": inc, "cell": cell,
-            "data": np.asarray(vals), "field": field}
-
-
-# ---------------------------------------------------------------- FS.grd
-
-def write_grd(path: str, expanded: ExpandedData, b_prim: np.ndarray,
-               values: np.ndarray, *, comments: Optional[Sequence[str]] = None,
-               per_line: int = 6) -> None:
-    """写 GNUPLOT ASCII grid(消费者: XCrySDen 的 grid 导入)。
-
-    布局::
-
-        # 注释行
-        <nx> <ny>
-        <xmin> <xmax>
-        <ymin> <ymax>
-        <zmin> <zmax>
-        <z 切片 1: ny 行, 每行 nx 个值, x 最快>
-        <空行>
-        <z 切片 2 ...>
-
-    三个坐标轴 = 倒格矢 b1/b2/b3 方向上的笛卡尔长度(2π/Å); gnuplot 的
-    grid 格式只支持正交轴, 非正交 BZ 的形变无法避免 —— 要保持 BZ 形状
-    请用 FS.cube(假晶格 = 倒格矢)或 FS.bxsf。
-    坐标区间取**实际采样范围**(第 n 个点在 (n-1)/n 处), 与 gnuplot 按
-    "区间等分"插值的口径一致。
-    """
-    b = np.asarray(b_prim, dtype=float)
-    field, dims = _field_on_grid(expanded, b, values)
-    lens = np.linalg.norm(b, axis=1)
-    lines = list(comments) if comments is not None else list(_HEADER_COMMENT)
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        for c in lines:
-            fh.write(f"# {c}\n")
-        fh.write(f"{dims[0]} {dims[1]}\n")
-        for a in range(3):
-            hi = lens[a] * (dims[a] - 1) / dims[a]
-            fh.write(f"{0.0:.10f} {hi:.10f}\n")
-        # 每个 z 切片: ny 行, 每行 nx 个值(x 最快)
-        for i3 in range(dims[2]):
-            if i3:
-                fh.write("\n")
-            for i2 in range(dims[1]):
-                row = field[:, i2, i3]
-                fh.write("".join(f"{x:13.5E}" for x in row) + "\n")
-
-
-def read_grd(path: str) -> Dict:
-    """读回 gnuplot ASCII grid(往返自检用)。
-
-    ``field`` 按 (i1, i2, i3) 排(与展开结果的点序一致)。
-    """
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        raw = fh.read().splitlines()
-    body = [ln for ln in raw if not ln.lstrip().startswith("#")]
-    nx, ny = (int(x) for x in body[0].split())
-    ranges = []
-    for a in range(3):
-        lo, hi = (float(x) for x in body[1 + a].split())
-        ranges.append((lo, hi))
-    vals: List[float] = []
-    n_blanks = 0
-    for ln in body[4:]:
-        if not ln.strip():
-            n_blanks += 1
-            continue
-        vals.extend(float(x) for x in ln.split())
-    nz = n_blanks + 1
-    if len(vals) != nx * ny * nz:
-        raise ValueError(
-            f"grd 数据个数 {len(vals)} != {nx}×{ny}×{nz} = {nx * ny * nz}")
-    # 文件里 x(i1) 最快, z 切片最慢 -> (nz, ny, nx) -> 转成 (nx, ny, nz)
-    field = np.asarray(vals).reshape(nz, ny, nx).transpose(2, 1, 0)
-    return {"nx": nx, "ny": ny, "nz": nz, "ranges": ranges,
             "data": np.asarray(vals), "field": field}
 
 
@@ -389,7 +384,17 @@ def write_bxsf(path: str, expanded: ExpandedData, b_prim: np.ndarray,
       * 能量是**绝对值**(eV), E_F 单独写在 INFO 块里 —— FermiSurfer 的
         ``read_bxsf`` 会自己减去 E_F;
       * 每个带一段, 带号从 1 起。
+
+    **只支持 Γ 网格**: FermiSurfer 的 ``read_bxsf()`` 结尾写死
+    ``shiftk[ii] = 0`` —— 一律按 Γ 网格解释(而 ``.frmsf`` 路径有 MP 处理)。
+    MP 网格的数据会被整体平移半个倒格矢 ⇒ 静默的错误费米面, 故直接报错。
     """
+    if expanded.spec.grid_type != "gamma":
+        raise ValueError(
+            "BXSF 只支持 Gamma 网格: FermiSurfer 的 .bxsf 读取路径一律按 Gamma "
+            f"网格解释(shiftk 写死 0), MP 网格的数据会被整体平移半个倒格矢。"
+            f"当前网格类型是 {expanded.spec.grid_type!r} —— 请改用 Gamma 网格, "
+            "或改用 FS.cube / band.N(以及 A(k,E).npz)。")
     b = np.asarray(b_prim, dtype=float)
     idx, dims = _grid_indices(expanded, b)
     filled = _filled_band_energies(expanded)
@@ -433,10 +438,12 @@ def read_bxsf(path: str) -> Dict:
     """
     with open(path, encoding="utf-8", errors="replace") as fh:
         lines = fh.read().splitlines()
+    _check_lines(lines, 8, path)
     i_ef = next(i for i, ln in enumerate(lines) if "Fermi Energy:" in ln)
     ef = float(lines[i_ef].split()[-1])
     i_grid = next(i for i, ln in enumerate(lines)
                   if ln.strip() in ("BEGIN_BANDGRID_3D", "BANDGRID_3D_BANDS"))
+    _check_lines(lines, i_grid + 7, path)
     nb = int(lines[i_grid + 1].split()[0])
     dims = [int(x) for x in lines[i_grid + 2].split()]
     bvec = np.array([[float(x) for x in lines[i_grid + 4 + a].split()]
@@ -464,7 +471,6 @@ def read_bxsf(path: str) -> Dict:
 
 def write_fermisurfer_bands(dirpath: str, expanded: ExpandedData,
                              b_prim: np.ndarray, e_f: float, *,
-                             comments: Optional[Sequence[str]] = None,
                              per_line: int = 6) -> List[str]:
     """写 FermiSurfer 的逐带文件(``band.1`` / ``band.2`` / ...)。
 
@@ -485,10 +491,18 @@ def write_fermisurfer_bands(dirpath: str, expanded: ExpandedData,
         <能量: n1·n2·n3 个, 第 3 个轴最快>
         <矩阵元: 3 轴 × n1·n2·n3 个(本模块写 0)>
 
-    能量是**绝对值**(eV); FermiSurfer 从批处理文件读 ``fermienergy``,
-    用它做等值面 —— 详见 docs/formats.md。
+    **能量是相对 E_F 的(E − E_F)**: FermiSurfer 从批处理文件读
+    ``fermienergy`` 来定等值面, 缺省是 ``0.0``(``fermisurfer.cpp:219``);
+    它自带的三个 .frmsf 样例(mgb2_vfz / pb_vf3D / srvo3_orb)能量也全部
+    以 0 为中心(配套 ``frmsf.in`` 写 ``fermienergy 0.0``)⇒ 写绝对能量
+    会让用户直接打开时**画不出费米面**(静默失败)。
+
+    ⚠ ``.frmsf`` 格式**放不下注释行**(第一行就被 ``sscanf("%d%d%d")`` 读走),
+    所以本函数没有 ``comments`` 参数 —— 单位与能量口径见 docs/formats.md §4
+    与 ``A(k,E).npz``。
     """
     b = np.asarray(b_prim, dtype=float)
+    e_f = float(e_f)
     idx, dims = _grid_indices(expanded, b)
     filled = _filled_band_energies(expanded)
     n_band = filled.shape[1]
@@ -498,7 +512,7 @@ def write_fermisurfer_bands(dirpath: str, expanded: ExpandedData,
     for n in range(n_band):
         field = np.zeros(dims, dtype=float)
         field[idx[:, 0], idx[:, 1], idx[:, 2]] = filled[:, n]
-        energies = field.reshape(-1)          # 第 3 个轴最快
+        energies = field.reshape(-1) - e_f    # 第 3 个轴最快; 相对 E_F
         n_grid = int(np.prod(dims))
         lines = [f"{dims[0]:12d}{dims[1]:12d}{dims[2]:12d}",
                  f"{lshift:12d}",
@@ -522,6 +536,7 @@ def read_fermisurfer_band(path: str) -> Dict:
     """读回 FermiSurfer 的 ``.frmsf`` 逐带文件(往返自检用)。"""
     with open(path, encoding="utf-8", errors="replace") as fh:
         lines = fh.read().splitlines()
+    _check_lines(lines, 6, path)
     dims = [int(x) for x in lines[0].split()]
     lshift = int(lines[1].split()[0])
     nb = int(lines[2].split()[0])
@@ -532,7 +547,8 @@ def read_fermisurfer_band(path: str) -> Dict:
         vals.extend(float(x) for x in ln.split())
     if len(vals) < nb * n_grid:
         raise ValueError(
-            f"frmsf 数据个数 {len(vals)} < {nb}×{n_grid}")
+            f"{os.path.basename(path)} 被截断: 数据个数 {len(vals)} < "
+            f"{nb}×{n_grid} = {nb * n_grid}")
     energies = np.asarray(vals[:nb * n_grid])
     return {"dims": dims, "lshift": lshift, "nb": nb, "bvec": bvec,
             "energies": energies}
@@ -545,17 +561,23 @@ def write_spectral_npz(path: str, expanded: ExpandedData, b_prim: np.ndarray,
                        sigma: float) -> None:
     """写完整谱函数 + 元信息(自用/二次分析)。
 
-    存: A(k,E) 体数据、E 网格、k 坐标、逐带能量/权重/有效位掩码,
-    以及 E_F / VBM / CBM / sigma / 单位说明。
+    存: A(k,E) 体数据、E 网格、k 坐标(笛卡尔 + 分数)、逐带能量/权重/有效位
+    掩码, 以及 E_F / VBM / CBM / sigma / 单位说明。
+
+    分数坐标 ``k_frac`` 由 ``b_prim`` 反推(k_cart · b_prim⁻¹)—— 二次分析不必
+    再去找倒格矢, 也不必自己算周期距离。
     """
     from .expand import build_spectral_function
     e_grid = np.atleast_1d(np.asarray(e_grid, dtype=float))
     a = build_spectral_function(expanded, e_grid, float(sigma))
+    k_cart = np.asarray(expanded.k_cart, dtype=float)
+    k_frac = k_cart @ np.linalg.inv(np.asarray(b_prim, dtype=float))
     np.savez_compressed(
         path,
         A=a,
         e_grid=e_grid,
-        k_cart=np.asarray(expanded.k_cart, dtype=float),
+        k_cart=k_cart,
+        k_frac=k_frac,
         band_e=np.asarray(expanded.band_e, dtype=float),
         band_w=np.asarray(expanded.band_w, dtype=float),
         valid=np.asarray(expanded.valid, dtype=bool),
