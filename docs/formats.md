@@ -308,3 +308,52 @@ BXSF / FermiSurfer 的网格是**规则**的，无法留空，故按下面规则
   XCrySDen 的 `.grd` 导入器在本机无法核对（无源码、无命令行选项）。
 * `bin/cube2xsf` 在服务器上**对参考 cube 也报同样的错**（工具自身损坏），
   故未用作 cube 的验证器。
+
+## 10. KPOINTS 首行与 VASP 的解析分支（2026-11-18 端到端实跑）
+
+`unfoldfs gen` 写出的 `KPOINTS` 的**首行**决定 VASP 走哪个解析分支：
+
+| 首行形式 | VASP 6.6.0 的行为（OUTCAR 实测） |
+|---|---|
+| `Parameters to Generate KPOINTS (Don't Edit This Line) -- explicit k-point list, G grid 3x3x3` | `Read explicit list of k-points.` / `Found 9 k-points` ✓ |
+| `G    3    3    3    0.758     # Parameters to Generate KPOINTS (Don't Edit This Line)`（`grid.write_kpoints` 的原始输出） | `Read explicit list of k-points.` / `Found 9 k-points` ✓ |
+
+**结论**：VASP 6.6.0 对这两种首行**都**走"显式 k 点列表"分支 —— OUTCAR
+明确打印 `Read explicit list of k-points.`，且算出的 k 点集合与顺序与
+`KPOINTS` 里写的完全一致。`KPOINTS` 的第二行是 k 点个数、第三行是
+`Reciprocal lattice`（坐标类型），这个"体"才是决定性的。
+
+`unfoldfs gen` 仍把首行写成**纯注释**（把 `G/M` 标签挪进注释里）：这样不
+依赖 VASP 的分支判定细节，语义也自解释（"这是一份显式 k 点列表"），
+与 VASP 官方文档里的 `Explicit k-point list` 写法一致。
+
+**实测事实（同一目录、同一份 INCAR，只换 KPOINTS 首行）**：
+
+```
+ KPOINTS: G    3    3    3    0.758     # Paramete
+Read explicit list of k-points.
+ Found      9 k-points:
+   k-points           NKPTS =      9   k-points in BZ     NKDIM =      9   number of bands    NBANDS=     39
+```
+
+⇒ **VASP 不对显式 k 点表去重**：算出的 k 点数（9）== `grid_map.n_k`（9）。
+
+## 11. 端到端实跑（2026-11-18，master / VASP 6.6.0）
+
+服务器 `210.73.16.15`，Python 3.9.13（numpy 1.23.5 / scipy 1.13.1 /
+spglib 2.0.2），VASP `vasp.6.6.0 06Mar2026`。3x1x1 MoS2 超胞（9 原子，
+`M = diag(3,1,1)`），原胞网格 3x3x3（满网格 27 点 → 9 个超胞 k 点）：
+
+* `unfoldfs gen` 写出的 `KPOINTS` + `INCAR.suggested` 原样跑 VASP，
+  `EIGENVAL` 头 `54  9  39`（NELECT / **NKPT=9** / NBANDS），与
+  `grid_map.n_k = 9` 一致；
+* `unfoldfs unfold --strict-dominance` 通过（单 G 主导度 0.8747），
+  产出 `FS.cube` / `FS.grd` / `FS.bxsf` / `band.1..band.18` / `A(k,E).npz`；
+* `FS.bxsf` 用 XCrySDen 自带的 `bin/fsReadBXSF` 读出（exit=0，
+  `ALL VERICES OF VORONOI: NVER=96`）✓；
+* `FS.cube` 用 **ASE 3.26 `ase.io.cube.read_cube`** 读回：盒子 =
+  `b_prim`（`[[1.96939968, 1.13703344, 0], [0, 2.27406687, 0],
+  [0, 0, 0.35581576]]`），增量矢量 = `b_prim/n`，体数据 `(3,3,3)` ✓
+  —— §2 的三条约定再次被第三方读取器验证；
+* `FS.grd` 与 `band.N` 是 GUI-only 消费方（VESTA / FermiSurfer），
+  仍按 §3 / §5 的规范实现，格式依据见本文件各节。
