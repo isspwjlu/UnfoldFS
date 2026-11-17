@@ -95,6 +95,12 @@ def test_denominator_lcm():
 
 
 def test_common_symmetry_ops_are_valid_in_both_bases():
+    """判据 = 旋转条件 M^-1 R M ∈ Z³ (该旋转把超胞晶格映到自身)。
+
+    平移**不参与**筛选: spglib 给的 t 是模原胞格矢的代表元 (C3^2 的代表元是
+    (1,0,0)), 换基底后 t·M^-1 未必是整数, 用它筛选会误删操作。因此这里只
+    断言平移是合法的原胞分数平移 (落在 [0,1)³ 内), 不断言 t·M^-1 是整数。
+    """
     prim = read_poscar(str(FIXTURE_PRIMCELL))
     m = read_transmat(str(FIXTURE_TRANSMAT))
     ops = common_symmetry_ops(prim, m)
@@ -104,16 +110,16 @@ def test_common_symmetry_ops_are_valid_in_both_bases():
         assert np.allclose(inv @ r @ m.astype(float), np.round(inv @ r @ m.astype(float)))
         assert np.allclose(np.round(inv @ r @ m.astype(float)), r)   # 对角阵下二者等价
     for t in ops.translations:
-        assert np.allclose(t @ inv, np.round(t @ inv))
+        assert np.all(t >= -1e-9) and np.all(t < 1.0 + 1e-9)
 
 
 def test_common_symmetry_ops_count_for_fixture():
     """MoS2 3x3x1 超胞与原胞相容, 公共对称集 = 原胞 D3h 的全部 12 个操作。
 
-    不能直接拿 spglib 返回的 t 去判 "t·M^-1 ∈ Z³": t 只在原胞格矢意义下
-    确定(spglib 给 C3^2 的代表元是 t=(1,0,0)), 用未归一化的代表元去筛
-    会误删 C3^2, 得到 8 个**不成群**的操作(C3 在集合内而 C3^2 不在),
-    后续轨道分解与对称扩展都会因此出错。
+    平移不参与筛选: spglib 返回的 t 是模原胞格矢的代表元(spglib 给 C3^2 的
+    代表元是 t=(1,0,0)), 换到超胞基底后 t·M^-1 未必是整数。若拿它筛选就会
+    误删 C3^2, 得到 8 个**不成群**的操作(C3 在集合内而 C3^2 不在), 泛点轨道
+    只有 8 像而不是 D3h 的 12 像, 轨道分解与对称扩展会因此出错。
     """
     prim = read_poscar(str(FIXTURE_PRIMCELL))
     m = read_transmat(str(FIXTURE_TRANSMAT))
@@ -170,8 +176,9 @@ def test_common_symmetry_ops_apply_is_invertible():
                                 0.0, atol=1e-6):
                 k1 = ops.apply(k, i)
                 k2 = ops.apply(k1, j)
-                # 用环绕距离比较(mod(x,1) 对 -1e-16 会给 1.0 而不是 0)
-                assert np.allclose(np.mod(k2 - k + 0.5, 1.0) - 0.5, 0.0, atol=1e-8)
+                # 用环绕距离比较(mod(x,1) 对 -1e-16 会给 1.0 而不是 0);
+                # 容差 1e-6: spglib 的平移代表元带 ~1e-8 数值残差
+                assert np.allclose(np.mod(k2 - k + 0.5, 1.0) - 0.5, 0.0, atol=1e-6)
                 break
         else:
             raise AssertionError(f"操作 {i} 在集合内没有逆元")
