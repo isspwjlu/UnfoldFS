@@ -12,12 +12,30 @@
 
 ## 0. 全局约定
 
+**交付面 = 4 种格式**：
+
+| 文件 | 消费者 | 内容 |
+|---|---|---|
+| `FS.cube` | VESTA / XCrySDen / VMD | Gaussian cube：假晶格 = 倒格矢，体数据 = A(k, E_F) |
+| `FS.bxsf` | XCrySDen / FermiSurfer | 逐带能量网格（**只支持 Γ 网格**，见 §3） |
+| `band.N` | FermiSurfer | FermiSurfer 的 `.frmsf` 逐带文件（能量**相对 E_F**，见 §4） |
+| `A(k,E).npz` | 自用/二次分析 | 完整谱函数体数据 + 元信息 |
+
+> **原计划的 `FS.grd` 已删除**（2026-11-18）。它**没有任何标准读取器**：
+> XCrySDen 1.5.60 全树没有 `.grd` 代码路径（`grep -rIl grd` 只命中一句英文
+> 注释与无关的 Tcl 变量 `newgrd`；`bin/*` 的 strings 命中数全为 0；`usage`
+> 里没有 `--grd`）；gnuplot 5.2 的 `splot` **直接报错**
+> （`2 columns only possible with explicit pm3d style (line 3)`）—— 它自己的
+> 手册里根本没有"带头部的三维网格"这种格式。简报 v2 要求"不要凭空设计
+> 格式"，故这一格交付物被**删掉**，而不是保留一个谁也不读的文件。
+> 二次分析的需求由 `A(k,E).npz` 覆盖。
+
 | 项 | 约定 | 说明 |
 |---|---|---|
 | k 单位 | **2π/Å**（含 2π） | 与 `unfoldfs.geometry.reciprocal` 一致；`b_prim` 的行 = 倒矢量 |
-| E 单位 | **eV** | 绝对能量（相对真空零点），E_F 另列 |
+| E 单位 | **eV** | `FS.cube` / `FS.bxsf` 写**绝对**能量；`band.N` 写**相对 E_F** 的能量（见 §4） |
 | 网格 | 原胞的**均匀网格**，点数 = `spec.n_points`（满网格点数） | **不是**超胞 k 点数 `n_k` |
-| 补位槽 | `valid == False` 的槽（能量 `+inf`、权重 0）**绝不进入任何输出** | 见 §6 |
+| 补位槽 | `valid == False` 的槽（能量 `+inf`、权重 0）**绝不进入任何输出** | 见 §5 |
 | 网格下标 | `i1/i2/i3` 对应倒格矢 `b1/b2/b3` 方向 | 与 `expand.ExpandedData.k_cart` 的分数坐标一致 |
 
 ## 1. 机器可读规范
@@ -28,18 +46,20 @@ cube.data_per_line = 6
 cube.axis_order = third-axis-fastest
 cube.vector_kind = increment
 cube.vector_unit = Bohr
-grd.header_order = nx ny|xmin xmax|ymin ymax|zmin zmax
-grd.slice_separator = blank line
+cube.isolevel_hint = half-of-field-max
 bxsf.block = BEGIN_BLOCK_BANDGRID_3D
 bxsf.grid_block = BEGIN_BANDGRID_3D
 bxsf.values_per_line = 6
 bxsf.grid_dims = unique+1
 bxsf.axis_order = third-axis-fastest
+bxsf.supported_grid = gamma-only
 frmsf.lshift_gamma = 1
 frmsf.lshift_mp = 2
 frmsf.matrix_axes = 3
 frmsf.grid_dims = unique
 frmsf.axis_order = third-axis-fastest
+frmsf.energy_origin = relative-to-ef
+padding.fill_rule = highest-valid-band
 ```
 
 ## 2. `FS.cube` —— Gaussian cube（消费者：VESTA / XCrySDen / VMD）
@@ -81,6 +101,18 @@ ASE 3.26 的 `ase/io/cube.py::read_cube`。
 格点位置 `origin + (i1/n1)·b1 + (i2/n2)·b2 + (i3/n3)·b3`，与展开结果的
 均匀网格逐点对应（`i` 取 0…n-1，不含重复的周期端点）。
 
+**头部给出的等值面层级建议**（`cube.isolevel_hint = half-of-field-max`）：
+第 2 行注释里带体数据的最大值与建议层级，例如
+
+```
+ field max = 3.700e-01; use isosurface level ~ 1.850e-01
+```
+
+VESTA 的默认 **isolevel = 0** —— "画不画得出来"只取决于高斯尾巴是否
+**恰好**下溢到 `0.0`（实测：换个 sigma 或能量窗口就可能什么都没有）。
+故头部必须写明该选什么层级；建议值取最大值的一半，落在 `(0, max)` 内。
+头部只有两行（cube 格式如此），单位说明与这一条挤在第 2 行。
+
 > ⚠ **VASP 的 `CHGCAR` 不是这个约定**（它写整条晶格矢量，且是 VASP 专有
 > 格式），别拿 CHGCAR 当 cube 的参考。EPW 写出的 cube 也有自己的扩展头
 > （多一行网格信息），同样不能当参考。
@@ -101,55 +133,7 @@ ASE 还原的盒子(Å⁻¹) = [[2,0,0],[1,1.5,0],[0.3,0.2,1.8]]   ← 与写入
 （`0.656466561 0.379011146 0` / `0 0.758022291 0` / `0 0 0.355815763`），
 即本项目用 `b_prim`（含 2π）作为"假盒子"是与 VASPKIT 一致的。
 
-## 3. `FS.grd` —— 三维网格 ASCII 文件（消费者：XCrySDen 的 grid 导入）
-
-**出处与核对状态（请注意这一条与其它格式不同）**：简报把该格式称作
-"GNUPLOT ASCII grid"。实测核对后发现：
-
-* gnuplot 5.2 的手册（`/usr/share/info/gnuplot.info.gz`，节点 `data-file`）
-  里，`splot` 支持的数据格式是 **`matrix`（无头部，空行分隔 datablock）**与
-  **`using` 列格式**，**没有**"nx ny + 坐标区间"这种带头部的网格格式 ⇒
-  本文件**不是** gnuplot 的 splot 输入格式；
-* 服务器上能找到的所有 `.grd` 文件都是 VASPKIT 写的 **k 路径剖面**
-  （两列：路径距离 + 值，见 `ref/VASPKIT_manual.md` 第 834 行），也不是三维场；
-* XCrySDen 1.5.60 的 `bin/xcrys` 内含 grid 读取例程
-  （`cryGeneralGridRegPeriodInterpolator` 等）与一套**自有的块结构**
-  "DataGrid" 格式（`Tcl/parseDataGrid.tcl` + 二进制里的
-  `ReadDataGrid`/`WriteDataGrid`/`GetNumberOfGridBlocks`），但它的**源码不在
-  本机**（只有二进制安装），无法逐字段核对。
-
-⇒ 本项目按"带头部的三维规则网格"这一常见写法实现（下面的布局），
-并在文件头里写清单位与网格维度。**这一条是五种格式里唯一没能用现成读取器
-端到端验证的**（gnuplot 能解析文件，但会把它当普通列数据；XCrySDen 的
-`.grd` 导入器无法在本机核对）。需要严格的等值面工具时，请用
-`FS.cube`（已被 ASE 实测验证）或 `FS.bxsf`（已被 XCrySDen 实测验证）。
-
-**布局**：
-
-```
- # 注释行（单位/约定）
- <nx> <ny>
- <xmin> <xmax>
- <ymin> <ymax>
- <zmin> <zmax>
- <z 切片 1: ny 行, 每行 nx 个值, x 最快>
- <空行>
- <z 切片 2: ...>
-```
-
-* `nx`/`ny` 是前两个网格方向的点数；**nz 不写在头部**，由空行分隔的
-  切片数给出。
-* 三个坐标轴 = 倒格矢 `b1/b2/b3` 方向上的**笛卡尔长度**（2π/Å）。
-  该格式只支持正交轴，非正交 BZ 的形变无法避免 —— 需要保持 BZ 形状
-  请用 `FS.cube` 或 `FS.bxsf`。
-* 坐标区间取**实际采样范围**（第 n 个点在 `(n-1)/n` 处），与"区间等分"
-  插值口径一致。
-* 体数据 = `A(k, E_F)`。
-
-> 注：VASPKIT 也会写 `.grd`，但那是 **k 路径剖面**（两列：路径距离 + 值），
-> 与本文件的三维场格式**不是一回事**，不能混用。
-
-## 4. `FS.bxsf` —— Band-XCRYSDEN-Structure-File（消费者：XCrySDen / FermiSurfer）
+## 3. `FS.bxsf` —— Band-XCRYSDEN-Structure-File（消费者：XCrySDen / FermiSurfer）
 
 **出处**（三份互相独立的一致证据）：
 
@@ -195,8 +179,9 @@ ASE 还原的盒子(Å⁻¹) = [[2,0,0],[1,1.5,0],[0.3,0.2,1.8]]   ← 与写入
   FermiSurfer 的读取器 `ng0[ii] -= 1` 后按 `(ng0+1)³` 读，XCrySDen 的
   MgB2 样例（`13 13 10` × 1690 个值）也满足这个关系 ✓。
 * **存储顺序 = 第 3 个轴最快**（实测：对 XCrySDen 的 MgB2 样例做
-  周期端点相等性检验，只有 `(n1, n2, n3)` 的 C 序展开在三个轴上
-  全部满足“首末相等”）。
+  周期端点相等性检验，**在排除前两轴互换之后**，只有"第 3 轴最快"的 C 序
+  展开在三个轴上全部满足"首末相等"。注意 MgB2 样例的 `n1 == n2`，前两轴
+  本来就不可区分 —— 故可区分的结论只有"第 3 轴最快"这一条）。
 * 能量是**绝对值**（eV）：VASPKIT 写出的第一条带能量 `-16.178176`
   与 fixture `EIGENVAL` 的最低带能量 `-16.202533` 同量级同符号，
   而非平移后的值；FermiSurfer 的 `read_bxsf` 自己会 `eig -= EF`。
@@ -206,10 +191,18 @@ ASE 还原的盒子(Å⁻¹) = [[2,0,0],[1,1.5,0],[0.3,0.2,1.8]]   ← 与写入
   `BANDGRID_3D_BANDS`，本项目统一用 `BEGIN_BANDGRID_3D`。
 * 每个带一段，数值每行 6 个（实测样例即如此）。
 
-**本项目写入的内容**：逐带 —— 第 n 段是**展开后第 n 条带**在均匀网格上的
-能量 `E_n(k)`（绝对 eV）。补位槽的处理见 §6。
+**只支持 Γ 网格**（`bxsf.supported_grid = gamma-only`）：FermiSurfer 的
+`read_bxsf()` 结尾写死 `for (ii = 0; ii < 3; ii++) shiftk[ii] = 0;` ——
+**一律按 Γ 网格解释**（而 `.frmsf` 路径有 MP 处理：`lshift == 2` ⇒ 半格
+偏移）。MP 网格的数据（第 i 个点在 `(i+0.5)/n`）会被放到 `i/n`，整张费米面
+相对 BZ **平移半个倒格矢** ⇒ 静默的错误费米面。
+⇒ `write_bxsf` 遇到 MP 网格**直接报错**（消息里给出可操作的替代方案）。
+XCrySDen 侧的 BXSF 读取器同样假定 Γ（其源码不在本机，无法核对）。
 
-## 5. `band.N` —— FermiSurfer 逐带文件（消费者：FermiSurfer）
+**本项目写入的内容**：逐带 —— 第 n 段是**展开后第 n 条带**在均匀网格上的
+能量 `E_n(k)`（绝对 eV）。补位槽的处理见 §5。
+
+## 4. `band.N` —— FermiSurfer 逐带文件（消费者：FermiSurfer）
 
 **出处**：FermiSurfer 2.2.1 的源码
 `src/read_file.cpp::read_file()`（读 `.frmsf`）、`src/read_bxsf()`（读 `.bxsf`）
@@ -235,27 +228,41 @@ ASE 还原的盒子(Å⁻¹) = [[2,0,0],[1,1.5,0],[0.3,0.2,1.8]]   ← 与写入
 
 * `lshift`：本项目 Gamma 网格写 `1`，MP 网格写 `2`（两种情况下
   FermiSurfer 都按 `ii = i` 直读，索引不变换）。
-* 存储顺序 = 第 3 个轴最快（`for i0 → for i1 → for i2`）✓ 与 §4 一致。
-* 能量是**绝对值**；FermiSurfer 从批处理文件（`frmsf.in`）读
-  `fermienergy` 来定等值面 —— 打开本文件时需把 `fermienergy` 设成本次
-  计算的 E_F（或用 `FS.bxsf`，它把 E_F 写在文件里）。
+* 存储顺序 = 第 3 个轴最快（`for i0 → for i1 → for i2`）✓ 与 §3 一致。
+* **能量是相对 E_F 的（E − E_F）**（`frmsf.energy_origin = relative-to-ef`）：
+  FermiSurfer 从批处理文件（`frmsf.in`）读 `fermienergy` 来定等值面，
+  缺省是 `0.0`（`fermisurfer.cpp:219`）；它自带的三个官方样例
+  `mgb2_vfz`（`[-0.428, +0.498]`）、`pb_vf3D`（`[-4.28, +7.50]`）、
+  `srvo3_orb`（`[-0.0396, +0.0522]`）的能量**全部以 0 为中心**，配套的
+  `frmsf.in` 也写 `fermienergy 0.0`。
+  ⇒ 写绝对能量 + FermiSurfer 默认 `EF = 0` ⇒ 打开画不出费米面（**静默
+  失败**：文件能打开、不报错，画出来的东西不是费米面）。
+  ⇒ 本模块写 `E − E_F`，用户**直接打开即可**，不需要另配 `fermienergy`。
+  （与 §3 的 `FS.bxsf` 不同：BXSF 的 INFO 块里带着 E_F，FermiSurfer 的
+  `read_bxsf` 自己会 `eig -= EF`，所以 BXSF 写绝对值。）
 * **矩阵元**：FermiSurfer 在能量之后还会读 3 个轴的矩阵元（用于费米速度
   着色）。本模块没有速度数据，写 **0**（确定值；不留未初始化内存给
   FermiSurfer）。文件里共有 `n1·n2·n3·(1+3)` 个数。
 * 矢量行：FermiSurfer 只用它们画 BZ 形状（整体比例任意）。本模块与
-  §2/§4 保持一致，写 `b_prim`（2π/Å）。
+  §2/§3 保持一致，写 `b_prim`（2π/Å）。
+* ⚠ **`.frmsf` 放不下注释行**（第一行就被 `sscanf("%d%d%d")` 读走，加注释
+  会直接读崩）⇒ `band.N` **没有头部注释**，与简报"每个文件头部写明单位"
+  的要求不符。单位与能量口径以本节与 `A(k,E).npz` 为准。
 
-## 6. 补位槽（`valid == False`）在逐带输出里的填充规则
+## 5. 补位槽（`valid == False`）在逐带输出里的填充规则
 
 补位槽表示“该候选在这个 k 点上没有第 n 条带”（能量 `+inf`、权重 0）。
-BXSF / FermiSurfer 的网格是**规则**的，无法留空，故按下面规则填：
+BXSF / FermiSurfer 的网格是**规则**的，无法留空，故按下面规则填
+（`padding.fill_rule = highest-valid-band`）：
 
-* 填**同一 k 点上下一条有效带的能量**；若没有下一条，则填该点**最高
-  有效带**的能量。
-* 这样跨过有效/无效边界时场是连续的，**不会凭空多出一张等值面**。
+* 填**该点最高有效带的能量**；该点一条有效带都没有时填 **0**。
+  （实现上取"下标更大且有效的带"优先，但 `unfold` 产生的补位槽恒为**连续
+  尾部** ⇒ 不存在这样的带 ⇒ 实际恒等于"最高有效带"。）
 * 权重视为 0（该态不存在），故不进入谱函数。
+* **实话**：补位带与最高有效带**重合** ⇒ 若最高带在某些 k 上跨过 E_F，
+  那里会出现若干张**重合的**等值面（不是"多出一张"，也不是"不多出"）。
 
-## 7. `A(k,E).npz` —— 完整谱函数（自用 / 二次分析）
+## 6. `A(k,E).npz` —— 完整谱函数（自用 / 二次分析）
 
 `numpy.savez_compressed`，键：
 
@@ -264,28 +271,46 @@ BXSF / FermiSurfer 的网格是**规则**的，无法留空，故按下面规则
 | `A` | (n_points, n_E) 谱函数 `A(k,E) = Σ_n w_n(k)·exp(−(E−E_n)²/2σ²)` |
 | `e_grid` | (n_E,) 能量网格 (eV)，用 `make_e_grid` 构造时**恰好含 E_F** |
 | `k_cart` | (n_points, 3) 笛卡尔 k (2π/Å) |
+| `k_frac` | (n_points, 3) 分数坐标 k（`k_cart · b_prim⁻¹`），便于二次分析 |
 | `band_e` / `band_w` / `valid` | 逐带能量 / 权重 / 有效位掩码（原始展开数据） |
 | `ef` / `vbm` / `cbm` | 费米能 / 价带顶 / 导带底 (eV) |
 | `sigma` | 展宽 (eV) |
 | `k_units` | `"2pi/Angstrom"` |
 | `e_units` | `"eV"` |
 
-## 8. 费米能（E_F）选取
+## 7. 费米能（E_F）选取
 
-| 模式 | 语义 |
-|---|---|
-| `auto`（默认） | 金属 → DOSCAR 的 `E_F`；半导体/绝缘体 → VBM（可加偏移） |
-| `vbm` | 总是 VBM + 偏移 |
-| `doscar` | 总是 DOSCAR 的 `E_F` |
-| 数值 | 直接当作 E_F（绝对值） |
+| 模式 | 语义 | 需要 EIGENVAL？ |
+|---|---|---|
+| `auto`（默认） | 按**带隙与 DOSCAR 的 E_F 的相对位置**决定（见下） | 是（不可用时退化到 DOSCAR 的 E_F 并 warning） |
+| `vbm` | 总是 VBM + 偏移 | 是 |
+| `doscar` | 总是 DOSCAR 的 `E_F` | **否** |
+| 数值 | 直接当作 E_F（绝对值） | **否** |
 
 * **VBM/CBM** 由 EIGENVAL 的占据数给出：占据判据为 `occ > 0.5`，
   VBM = 占据态最高能量，CBM = 未占据态最低能量。
-* **金属判据**：带隙 ≤ `gap_tol`（默认 0.05 eV）**或**存在分数占据态
-  （占据数严格落在 0 与 1 之间）。后者在 smearing 较大、表观带隙不可信时
-  仍能判对。
+* **`auto` 的判据**（只用带隙与 DOSCAR 的 E_F 的位置关系，不需要展宽宽度）：
 
-## 9. 复核记录（2026-11-17）
+  ```
+  gap = CBM - VBM
+  gap <= gap_tol            -> DOSCAR 的 E_F     (真金属/半金属)
+  VBM <= dos_ef <= CBM      -> VBM + offset      (E_F 落在带隙里 ⇒ 半导体)
+  否则                       -> DOSCAR 的 E_F     (E_F 在带隙外 ⇒ 金属)
+  ```
+
+* ⚠ **"带边有分数占据"不是金属判据**：任何用了展宽的**有带隙**体系，带边的
+  占据数都会变成 0.98 这类小数（高斯展宽与四面体法都一样）。
+  实测（MoS2，服务器端到端跑）：`band 27` 的占据数是 `0.9866..1.0267`
+  （唯一的分数占据），`band 28` 空 ⇒ VBM = `-2.077449`、CBM = `-0.465849`、
+  gap = `1.6116 eV`（明确的半导体），但若按"有分数占据 ⇒ 金属"判，
+  `auto` 会取 DOSCAR 的 E_F = `-1.920079 eV` —— 它落在**带隙中央**
+  ⇒ 画出来的费米面是空的。
+* **只有 `auto` 与 `vbm` 会去读 EIGENVAL**：数值与 `doscar` 模式完全不碰
+  EIGENVAL —— 用户明明白白给了 E_F，不该被一个用不上的 EIGENVAL 挡住。
+  `auto` 模式若 EIGENVAL 里没有占据态（VBM 不可得）⇒ 退化到 DOSCAR 的
+  `E_F` 并给出明确 warning（不静默）。
+
+## 8. 复核记录（2026-11-17）
 
 * FermiSurfer 2.2.1 的 `src/read_file.cpp`、`src/fermisurfer.cpp` 通读；
   `examples/mgb2_vfz.frmsf`、`examples/pb.bxsf` 逐字节查看。
@@ -302,14 +327,22 @@ BXSF / FermiSurfer 的网格是**规则**的，无法留空，故按下面规则
   （唯一点+1 + 周期端点重复）、矢量行顺序与 XCrySDen 自己的写法完全一致。
 * **cube 实测**：探针 cube 用 **ASE 3.26 `ase.io.cube.read_cube`** 读回，
   轴序/增量约定/Bohr 单位三条同时验证 ✓（见 §2）。
-* **grd 实测（有限）**：本模块写出的 `FS.grd` 用服务器上的 **gnuplot 5.2**
-  解析**无错**（但 gnuplot 会把它当普通列数据 —— 它自己的 splot 格式没有
-  头部，见 §3）；按三维网格布局手工解析得到 (nz, ny, nx) 的体数据 ✓。
-  XCrySDen 的 `.grd` 导入器在本机无法核对（无源码、无命令行选项）。
+* **`.frmsf` 能量口径**：FermiSurfer 2.2.1 自带的三个官方样例
+  `mgb2_vfz.frmsf` / `pb_vf3D.frmsf` / `srvo3_orb.frmsf` 的特征值区间分别是
+  `[-0.428, +0.498]` / `[-4.280, +7.505]` / `[-0.0396, +0.0522]` ——
+  **全部以 0 为中心**；配套 `examples/frmsf.in` 写 `fermienergy 0.0`，
+  且 `fermisurfer.cpp:219` 的缺省 `EF = 0.0` ⇒ `.frmsf` 的约定是
+  **相对 E_F**（见 §4）。
+* **`.grd` 的实测结论（2026-11-18 更正）**：原 FS.grd 已按上文的理由删除。
+  更正前本文件曾写"gnuplot 5.2 解析**无错**" —— **不成立**：gnuplot 的
+  `splot` 直接拒绝该文件（`2 columns only possible with explicit pm3d
+  style (line 3)`，因为 gnuplot 根本没有"带头部的三维网格"格式；
+  加 `set pm3d style line 3` 则是 `invalid pm3d option`），
+  `plot` 只能把它当普通列数据。
 * `bin/cube2xsf` 在服务器上**对参考 cube 也报同样的错**（工具自身损坏），
   故未用作 cube 的验证器。
 
-## 10. KPOINTS 首行与 VASP 的解析分支（2026-11-18 端到端实跑）
+## 9. KPOINTS 首行与 VASP 的解析分支（2026-11-18 端到端实跑）
 
 `unfoldfs gen` 写出的 `KPOINTS` 的**首行**决定 VASP 走哪个解析分支：
 
@@ -338,7 +371,7 @@ Read explicit list of k-points.
 
 ⇒ **VASP 不对显式 k 点表去重**：算出的 k 点数（9）== `grid_map.n_k`（9）。
 
-## 11. 端到端实跑（2026-11-18，master / VASP 6.6.0）
+## 10. 端到端实跑（2026-11-18，master / VASP 6.6.0）
 
 服务器 `210.73.16.15`，Python 3.9.13（numpy 1.23.5 / scipy 1.13.1 /
 spglib 2.0.2），VASP `vasp.6.6.0 06Mar2026`。3x1x1 MoS2 超胞（9 原子，
@@ -348,12 +381,13 @@ spglib 2.0.2），VASP `vasp.6.6.0 06Mar2026`。3x1x1 MoS2 超胞（9 原子，
   `EIGENVAL` 头 `54  9  39`（NELECT / **NKPT=9** / NBANDS），与
   `grid_map.n_k = 9` 一致；
 * `unfoldfs unfold --strict-dominance` 通过（单 G 主导度 0.8747），
-  产出 `FS.cube` / `FS.grd` / `FS.bxsf` / `band.1..band.18` / `A(k,E).npz`；
+  产出 `FS.cube` / `FS.bxsf` / `band.1..band.18` / `A(k,E).npz`
+  （**不含 `FS.grd`** —— 该格式已删除，见 §0）；
 * `FS.bxsf` 用 XCrySDen 自带的 `bin/fsReadBXSF` 读出（exit=0，
   `ALL VERICES OF VORONOI: NVER=96`）✓；
 * `FS.cube` 用 **ASE 3.26 `ase.io.cube.read_cube`** 读回：盒子 =
   `b_prim`（`[[1.96939968, 1.13703344, 0], [0, 2.27406687, 0],
   [0, 0, 0.35581576]]`），增量矢量 = `b_prim/n`，体数据 `(3,3,3)` ✓
   —— §2 的三条约定再次被第三方读取器验证；
-* `FS.grd` 与 `band.N` 是 GUI-only 消费方（VESTA / FermiSurfer），
-  仍按 §3 / §5 的规范实现，格式依据见本文件各节。
+* `band.N` 是 GUI-only 消费方（FermiSurfer），按 §4 的规范实现
+  （能量相对 E_F）。
