@@ -245,7 +245,7 @@ def test_gen_writes_kpoints_gridmap_and_incar(tmp_path):
     assert tags["LWAVE"] == ".TRUE."
 
 
-def test_gen_inc_is_free_of_the_vasp_auto_grid_wording(tmp_path):
+def test_gen_incar_kpoints_is_free_of_the_vasp_auto_grid_wording(tmp_path):
     """M7: 首行别再用 "Parameters to Generate KPOINTS ..." 的措辞 ——
     这份文件是**显式 k 点列表**, 不是自动网格。"""
     out = tmp_path / "run"
