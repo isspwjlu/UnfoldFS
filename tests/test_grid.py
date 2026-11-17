@@ -2,12 +2,14 @@
 import numpy as np
 import pytest
 
-from unfoldfs.geometry import (SymmetryOps, common_symmetry_ops, read_poscar,
+from unfoldfs.geometry import (SymmetryOps, candidate_g_vectors,
+                               common_symmetry_ops, read_poscar,
                                read_transmat, reciprocal, resolve_transform)
-from unfoldfs.grid import (GridMap, GridSpec, choose_grid_points,
+from unfoldfs.grid import (GridSpec, build_grid_map, choose_grid_points,
                             decompose_grid, filter_ops_by_grid,
-                            grid_resolution, load_grid_map, matrix_denominator_lcm,
-                            primitive_grid_points, save_grid_map, write_kpoints)
+                            grid_resolution, load_grid_map,
+                            matrix_denominator_lcm, primitive_grid_points,
+                            save_grid_map, supercell_kpoints, write_kpoints)
 from tests.conftest import FIXTURE_POSCAR, FIXTURE_PRIMCELL, FIXTURE_TRANSMAT
 
 # spglib 的平移代表元带 ~3e-8 数值残差(硬化只吸附接近 0/1 的分量)
@@ -31,20 +33,12 @@ def _fixture_grid_map(spec=None):
     grid = primitive_grid_points(spec)
     ops = common_symmetry_ops(prim, tr.m_eff)
     ops = filter_ops_by_grid(ops, grid)
-    ir_idx, mult, full_to_ir, rot = decompose_grid(grid, ops)
-    gm = GridMap(
-        spec=spec,
-        ir_k_prim=grid[ir_idx],
-        ir_k_super=np.array([tr.super_from_prim(k) for k in grid[ir_idx]]),
-        multiplicity=mult,
-        full_to_ir=full_to_ir,
-        rot_of_full=rot,
-        ops=ops,
-        transform=tr,
-        b_prim=reciprocal(prim.lattice),
-        b_super=reciprocal(sc.lattice),
-    )
+    gm = build_grid_map(spec, grid, ops, tr,
+                        reciprocal(prim.lattice), reciprocal(sc.lattice))
     return gm, grid
+
+
+BIG_SPEC = GridSpec(p=(12, 12, 3), grid_type="gamma", shift=(0.0, 0.0, 0.0))
 
 
 # ------------------------------------------------------------------ 网格点生成
@@ -70,19 +64,28 @@ def test_grid_point_count_matches_spec():
 
 
 def test_choose_grid_points_respects_comm():
+    # 第二参必须是 resolve_transform 探测过行/列约定的 m_eff(与 CLI 口径一致);
+    # 直接传原始 TRANSMAT 在"对称 M"下恰好相等, 掩盖了行/列约定的隐患。
     prim = read_poscar(str(FIXTURE_PRIMCELL))
+    sc = read_poscar(str(FIXTURE_POSCAR))
     m = read_transmat(str(FIXTURE_TRANSMAT))
-    spec = choose_grid_points(prim.lattice, m, resolution=0.2, grid_type="gamma")
+    tr = resolve_transform(sc, prim, m)
+    spec = choose_grid_points(prim.lattice, tr.m_eff, resolution=0.2,
+                              grid_type="gamma")
     assert all(p % 3 == 0 for p in spec.p)
-    assert matrix_denominator_lcm(m) == 3
+    assert matrix_denominator_lcm(tr.m_eff) == 3
 
 
 def test_choose_grid_points_scales_with_resolution():
     """分辨率越细 -> 网格点数越多; 且点数永远 >= 1。"""
     prim = read_poscar(str(FIXTURE_PRIMCELL))
+    sc = read_poscar(str(FIXTURE_POSCAR))
     m = read_transmat(str(FIXTURE_TRANSMAT))
-    coarse = choose_grid_points(prim.lattice, m, resolution=0.5, grid_type="gamma")
-    fine = choose_grid_points(prim.lattice, m, resolution=0.1, grid_type="gamma")
+    tr = resolve_transform(sc, prim, m)
+    coarse = choose_grid_points(prim.lattice, tr.m_eff, resolution=0.5,
+                                grid_type="gamma")
+    fine = choose_grid_points(prim.lattice, tr.m_eff, resolution=0.1,
+                              grid_type="gamma")
     assert all(f >= c for f, c in zip(fine.p, coarse.p))
     assert all(p >= 1 for p in fine.p)
 
@@ -233,13 +236,13 @@ def test_write_kpoints_format_and_weights(tmp_path):
     lines = path.read_text().splitlines()
     assert lines[0].startswith("G")
     assert lines[2] == "Reciprocal lattice"
-    assert len(lines) == 3 + int(gm.ir_k_prim.shape[0])
+    assert len(lines) == 3 + gm.k_super.shape[0]
     weights = [float(l.split()[3]) for l in lines[3:]]
     assert abs(sum(weights) - gm.spec.n_points) < 1e-9
 
 
 def test_write_kpoints_header_and_coordinates(tmp_path):
-    """首行 = VASPKIT 风格网格声明; 坐标行 = 超胞分数坐标 + 权重。"""
+    """首行 = VASPKIT 风格网格声明; 坐标行 = 去重后的超胞分数坐标 + 权重。"""
     gm, grid = _fixture_grid_map()
     path = tmp_path / "KPOINTS"
     write_kpoints(str(path), gm)
@@ -249,8 +252,9 @@ def test_write_kpoints_header_and_coordinates(tmp_path):
         "G", str(gm.spec.p[0]), str(gm.spec.p[1]), str(gm.spec.p[2]),
         f"{grid_resolution(gm.b_prim, gm.spec):.3f}"]
     assert "# Parameters to Generate KPOINTS (Don't Edit This Line)" in header
-    assert int(lines[1]) == gm.n_ir
-    for line, k, w in zip(lines[3:], gm.ir_k_super, gm.multiplicity):
+    assert int(lines[1]) == gm.k_super.shape[0]
+    weights = np.bincount(gm.full_to_k, minlength=gm.k_super.shape[0])
+    for line, k, w in zip(lines[3:], gm.k_super, weights):
         parts = line.split()
         assert len(parts) == 4
         assert np.allclose([float(x) for x in parts[:3]], k, atol=1e-9)
@@ -266,17 +270,139 @@ def test_write_kpoints_mp_tag(tmp_path):
 
 
 def test_grid_map_roundtrip(tmp_path):
-    gm, grid = _fixture_grid_map()
+    gm, grid = _fixture_grid_map(BIG_SPEC)
     npz = tmp_path / "grid_map.npz"
     save_grid_map(str(npz), gm)
     back = load_grid_map(str(npz))
     assert np.allclose(back.ir_k_prim, gm.ir_k_prim)
-    assert np.allclose(back.ir_k_super, gm.ir_k_super)
+    assert np.allclose(back.k_super, gm.k_super)
+    assert np.array_equal(back.ir_to_k, gm.ir_to_k)
+    assert np.array_equal(back.k_to_ir, gm.k_to_ir)
     assert np.array_equal(back.full_to_ir, gm.full_to_ir)
+    assert np.array_equal(back.full_to_k, gm.full_to_k)
     assert np.array_equal(back.rot_of_full, gm.rot_of_full)
     assert np.array_equal(back.multiplicity, gm.multiplicity)
+    assert np.array_equal(back.gset, gm.gset)
     assert back.spec == gm.spec
     assert np.allclose(back.b_prim, gm.b_prim)
     assert np.allclose(back.b_super, gm.b_super)
     assert np.array_equal(back.ops.rotations, gm.ops.rotations)
+    # 平移必须往返一致: 平移错一位会让整个轨道分解静默失效
+    assert np.array_equal(back.ops.translations, gm.ops.translations)
     assert np.array_equal(back.transform.m_eff, gm.transform.m_eff)
+
+
+# ------------------------------------------------- 超胞 k 点去重(回归测试)
+
+def test_distinct_supercell_k_count_is_folding_count():
+    """不同超胞 k 数 = 满网格折叠后的**不同值数**(不是 IR 点数)。
+
+    折叠 K = k'·M^T (mod 1) 把 det(M) 个原胞点折到同一个超胞 k;
+    若只按 IR 点的像去重, 会漏掉"代表点不落在该 k 上"的那些原胞点
+    -> 下游按 (k, G) 展开时找不到覆盖候选。
+    """
+    gm, grid = _fixture_grid_map(BIG_SPEC)
+    k_all = np.mod(grid @ gm.transform.m_eff.T, 1.0)
+    n_distinct = len(np.unique(np.round(k_all, 8), axis=0))
+    assert gm.k_super.shape[0] == n_distinct
+    assert gm.k_super.shape[0] == gm.spec.n_points // gm.transform.det
+    assert gm.k_super.shape[0] < gm.n_ir          # 去重确实省了 VASP 算量
+    assert gm.k_super.shape[0] < gm.spec.n_points
+
+
+def test_k_super_rows_are_unique():
+    """k_super 内部不得有重复行(否则 VASP 会把同一个 k 算两遍)。"""
+    for spec in (GridSpec((6, 6, 1), "gamma", (0.0, 0.0, 0.0)), BIG_SPEC):
+        gm, _ = _fixture_grid_map(spec)
+        uniq = np.unique(np.round(gm.k_super, 8), axis=0)
+        assert uniq.shape[0] == gm.k_super.shape[0]
+
+
+def test_kpoints_writes_each_distinct_k_once(tmp_path):
+    """KPOINTS 行数 = 不同超胞 k 数, 行序 = k_super 序, 且无重复行。"""
+    gm, grid = _fixture_grid_map(BIG_SPEC)
+    path = tmp_path / "KPOINTS"
+    write_kpoints(str(path), gm)
+    lines = path.read_text().splitlines()
+    rows = np.array([[float(x) for x in ln.split()[:3]] for ln in lines[3:]])
+    assert int(lines[1]) == gm.k_super.shape[0]
+    assert len(lines) == 3 + gm.k_super.shape[0]
+    assert len(np.unique(np.round(rows, 8), axis=0)) == rows.shape[0]
+    assert np.allclose(rows, gm.k_super, atol=1e-9)
+
+
+def test_kpoints_weights_sum_to_full_grid_points(tmp_path):
+    """写出的权重之和 == 满网格点数(设计规格 §5.2 的自检)。"""
+    for spec in (GridSpec((6, 6, 1), "gamma", (0.0, 0.0, 0.0)), BIG_SPEC):
+        gm, _ = _fixture_grid_map(spec)
+        path = tmp_path / "KPOINTS"
+        write_kpoints(str(path), gm)
+        weights = [float(ln.split()[3]) for ln in path.read_text().splitlines()[3:]]
+        assert abs(sum(weights) - gm.spec.n_points) < 1e-9
+
+
+def test_multiplicity_still_sums_to_full_grid_points():
+    gm, _ = _fixture_grid_map(BIG_SPEC)
+    assert int(gm.multiplicity.sum()) == gm.spec.n_points
+
+
+def test_full_to_k_matches_folding_of_each_point():
+    """full_to_k[i] 指向的超胞 k == 满网格点 i 折叠后的超胞 k。"""
+    gm, grid = _fixture_grid_map(BIG_SPEC)
+    for i in range(grid.shape[0]):
+        k = gm.k_super[gm.full_to_k[i]]
+        assert np.allclose(k, np.mod(grid[i] @ gm.transform.m_eff.T, 1.0),
+                           atol=1e-9)
+
+
+def test_ir_to_k_and_k_to_ir_are_consistent():
+    """ir_to_k: IR 点 -> 其像所在 k; k_to_ir: k -> 首个映射到它的 IR 点。"""
+    gm, _ = _fixture_grid_map(BIG_SPEC)
+    for a in range(gm.n_ir):
+        k = np.mod(gm.ir_k_prim[a] @ gm.transform.m_eff.T, 1.0)
+        assert np.allclose(gm.k_super[gm.ir_to_k[a]], k, atol=1e-9)
+    for k in range(gm.k_super.shape[0]):
+        if gm.k_to_ir[k] >= 0:
+            assert gm.ir_to_k[gm.k_to_ir[k]] == k
+        else:
+            # 没有 IR 代表点的 k: 任何 IR 点都不该映到它
+            assert not np.any(gm.ir_to_k == k)
+
+
+def test_every_full_grid_point_maps_to_exactly_one_k_and_g():
+    """每个满网格点 -> 唯一的 (k, G) 对 —— 下游展开的前提。
+
+    (k_super[k] + g)·M^-T 必须恰好命中一个满网格点, 且每个满网格点
+    恰好被一对 (k, g) 命中(不能有落单的满网格点)。
+    """
+    gm, grid = _fixture_grid_map(BIG_SPEC)
+    m_inv = gm.transform.m_inv
+    gset = gm.gset
+    total = np.zeros(grid.shape[0], dtype=int)
+    for k in range(gm.k_super.shape[0]):
+        cand = (gm.k_super[k] + gset) @ m_inv.T          # (detM, 3)
+        d = np.abs((cand[None, :, :] - grid[:, None, :]) + 0.5) % 1.0 - 0.5
+        hits = (np.abs(d).sum(axis=2) <= 1e-6).sum(axis=1)
+        sel = gm.full_to_k == k
+        assert np.all(hits[sel] == 1)                    # 属于该 k 的点恰好命中一次
+        assert np.all(hits[~sel] == 0)                   # 不属于该 k 的点一次都不命中
+        total += hits
+    assert np.all(total == 1)                            # 每个满网格点被恰好一对命中
+    assert np.all(gm.full_to_k >= 0)                     # 不允许有落单的满网格点
+
+
+def test_gset_covers_all_candidates():
+    """gset = det(M) 个候选折叠矢量, 与 geometry.candidate_g_vectors 一致。"""
+    gm, _ = _fixture_grid_map(BIG_SPEC)
+    assert gm.gset.shape == (gm.transform.det, 3)
+    assert np.array_equal(gm.gset, candidate_g_vectors(gm.transform.m_eff))
+
+
+def test_supercell_kpoints_matches_manual_folding():
+    """supercell_kpoints 的去重结果 == 手工折叠后的不同值集合。"""
+    gm, grid = _fixture_grid_map(BIG_SPEC)
+    k_super, full_to_k, weight = supercell_kpoints(grid, gm.transform)
+    assert np.allclose(k_super, gm.k_super)
+    assert np.array_equal(full_to_k, gm.full_to_k)
+    assert np.array_equal(weight,
+                          np.bincount(gm.full_to_k, minlength=gm.k_super.shape[0]))
