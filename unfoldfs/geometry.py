@@ -155,11 +155,12 @@ def common_symmetry_ops(prim: Structure, m_eff: np.ndarray,
                         symprec: float = 1e-5) -> SymmetryOps:
     """原胞对称操作中, 同时也是超胞对称的那些。
 
-    判据 (行约定):  M^-1 R M 为整数矩阵  且  t·M^-1 为整数矢量。
+    判据 (行约定):  M^-1 R M 为整数矩阵 (该旋转把超胞晶格映到自身)。
 
-    注意 t 必须先归一化到 [0,1)³ 再判: 平移只在原胞格矢意义下确定, spglib
-    返回的代表元可能是 (1,0,0) 而非 (0,0,0) (同一个操作, 不同代表元),
-    直接拿未归一化的 t 去判会误删操作, 得到不成群的集合。
+    平移**不参与**筛选: spglib 给的 t 是模原胞格矢的代表元 (C3^2 的代表元是
+    (1,0,0)), 换到超胞基底后 t·M^-1 未必是整数 —— 用它筛选会误删操作, 得到
+    不成群的集合 (C3 在内而 C3^2 不在)。平移只需是原胞晶格平移 (spglib 已保证),
+    而 A(k,E) 对整个原胞点群不变。
     """
     import spglib
 
@@ -175,27 +176,12 @@ def common_symmetry_ops(prim: Structure, m_eff: np.ndarray,
     for r, t in zip(rotations, translations):
         r_sc = inv @ r.astype(float) @ m
         if not np.allclose(r_sc, np.round(r_sc), atol=1e-6):
-            continue                     # 在超胞基底非整数 -> 不是超胞对称
-        t_prim = _canonical_translation(t)
-        t_sc = t_prim @ inv
-        if not np.allclose(t_sc, np.round(t_sc), atol=1e-6):
-            continue                     # 平移不落在超胞晶格 -> 不是超胞对称
+            continue        # 旋转在超胞基底非整数 -> 该操作不保持超胞晶格
         keep_r.append(r.astype(int))
-        keep_t.append(t_prim)
+        keep_t.append(np.mod(t, 1.0))
     if not keep_r:
         raise ValueError("未找到任何公共对称操作")
     return SymmetryOps(np.array(keep_r), np.array(keep_t))
-
-
-def _canonical_translation(t: np.ndarray, tol: float = 1e-6) -> np.ndarray:
-    """平移归一化到 [0,1)³。
-
-    贴近 0 的分量是数值残差(spglib 返回 ~1e-8), 贴近 1 的分量与 0 等价
-    (同一个操作的另一个代表元), 两者都归零。
-    """
-    t_mod = np.mod(np.asarray(t, dtype=float), 1.0)
-    t_mod = np.where(np.abs(t_mod - 1.0) < tol, 0.0, t_mod)
-    return np.where(np.abs(t_mod) < tol, 0.0, t_mod)
 
 
 def _species_ids(species: Tuple[str, ...]) -> np.ndarray:
