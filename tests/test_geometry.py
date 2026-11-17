@@ -213,15 +213,44 @@ def test_common_symmetry_ops_apply_is_invertible():
             raise AssertionError(f"操作 {i} 在集合内没有逆元")
 
 
-def test_common_symmetry_ops_map_k_point_into_bz():
-    """操作作用后仍落在原胞 BZ 内(分数坐标 mod 1)。"""
+def test_common_symmetry_ops_apply_follows_group_composition():
+    """apply() 必须与群复合律一致 —— 这才是有判别力的检查。
+
+    列向量约定下 {R_i|t_i} o {R_j|t_j} = {R_j R_i | t_j + R_j t_i},
+    故"先作用 i 再作用 j"必须等于"直接作用该复合元"。
+    (旧断言只是"像点落在 [0,1)³", 而 apply 内部已 mod -> 恒真, 判别力为零。)
+
+    另验证泛点轨道大小 = 操作数: 每个操作必须给出不同的像。
+    """
     prim = read_poscar(str(FIXTURE_PRIMCELL))
     m = read_transmat(str(FIXTURE_TRANSMAT))
     ops = common_symmetry_ops(prim, m)
+    n = ops.rotations.shape[0]
     k = np.array([0.13, 0.07, 0.21])
-    for i in range(ops.rotations.shape[0]):
-        img = ops.apply(k, i)
-        assert np.all(img >= -1e-9) and np.all(img < 1.0 + 1e-9)
+
+    def find(r, t):
+        for p in range(n):
+            if np.allclose(ops.rotations[p], np.round(r), atol=1e-6) and \
+                    np.allclose(np.mod(ops.translations[p] - t + 0.5, 1.0) - 0.5,
+                                0.0, atol=1e-6):
+                return p
+        return None
+
+    for i in range(n):
+        for j in range(n):
+            ri = ops.rotations[i].astype(float)
+            rj = ops.rotations[j].astype(float)
+            r_comp = rj @ ri                                   # {R_j R_i | ...}
+            t_comp = np.mod(ops.translations[j] + rj @ ops.translations[i], 1.0)
+            p = find(r_comp, t_comp)
+            assert p is not None, f"复合 {i} o {j} 不在集合内"
+            two_step = ops.apply(ops.apply(k, i), j)
+            one_step = ops.apply(k, p)
+            assert np.allclose(np.mod(two_step - one_step + 0.5, 1.0) - 0.5,
+                               0.0, atol=1e-6)
+
+    imgs = {tuple(np.round(ops.apply(k, i), 8)) for i in range(n)}
+    assert len(imgs) == n          # 泛点的轨道大小 = 操作数
 
 
 # ---------------------------------------------------------------- 非对称 M 的合成用例
@@ -255,6 +284,10 @@ def test_k_mapping_matches_reciprocal_lattice_for_asymmetric_m():
     diff = np.mod(tr.super_from_prim(k_prim) - k_super_phys + 0.5, 1.0) - 0.5
     assert np.allclose(diff, 0.0, atol=1e-9)
 
+    # 回环: prim_from_super(super_from_prim(k), G=0) ≡ k (mod 1)
+    back = tr.prim_from_super(tr.super_from_prim(k_prim), np.zeros(3))
+    assert np.allclose(np.mod(back - k_prim + 0.5, 1.0) - 0.5, 0.0, atol=1e-9)
+
 
 def test_candidate_g_vectors_fold_back_consistent_for_asymmetric_m():
     """每个候选 k 折叠回超胞 k 必须回到原点(mod 1): k_prim · M^T ≡ K。"""
@@ -286,3 +319,36 @@ def test_common_symmetry_ops_rotation_criterion_for_asymmetric_m():
     m = np.array([[1, -1, 0], [1, 2, 0], [0, 0, 1]])
     ops = common_symmetry_ops(prim, m)
     assert ops.rotations.shape[0] == 12
+
+
+def test_common_symmetry_ops_rotation_criterion_matches_cartesian_truth():
+    """判据必须与笛卡尔物理基准**逐个**吻合(不只是个数相同)。
+
+    物理基准 = "该旋转把超胞晶格映回自身"(笛卡尔几何, 与分数约定无关):
+        A_sc · R_cart^T · A_sc^-1 ∈ Z³,  R_cart = A_col R A_col^-1 (列约定)。
+    60° 莫尔型 M=[[1,1],[-1,2]] 下真值只保留 4/12, 而旧判据 M^-1 R M 与
+    字面式 M R M^-1 都会留下 12/12(把被剪切破坏的对称也留下) -> 只有
+    M^-T R M^T 逐个吻合。
+    """
+    import spglib
+
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    a_p = prim.lattice
+    a_col = a_p.T
+    sym = spglib.get_symmetry((a_p, prim.positions, [1, 2, 2]), symprec=1e-5)
+
+    for m in (np.array([[1, -1, 0], [1, 2, 0], [0, 0, 1]]),
+              np.array([[1, 1, 0], [-1, 2, 0], [0, 0, 1]])):
+        a_sc = m @ a_p
+        truth = []
+        for r in sym["rotations"]:
+            r_cart = a_col @ np.asarray(r, float) @ np.linalg.inv(a_col)
+            x = a_sc @ r_cart.T @ np.linalg.inv(a_sc)
+            if np.allclose(x, np.round(x), atol=1e-6):
+                truth.append(np.asarray(r, int))
+
+        ops = common_symmetry_ops(prim, m)
+        assert ops.rotations.shape[0] == len(truth)
+        for r in ops.rotations:
+            assert any(np.array_equal(r, t) for t in truth), \
+                f"判据多留了操作 {r.tolist()}"
