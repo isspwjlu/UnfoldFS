@@ -71,13 +71,14 @@ def reciprocal(lattice: np.ndarray) -> np.ndarray:
 def read_transmat(path: str) -> np.ndarray:
     """读 TRANSMAT.in -> (3,3) 整数矩阵(跳过注释行)。"""
     rows = []
-    for line in open(path):
-        line = line.split("#")[0].strip()
-        if not line:
-            continue
-        parts = line.split()
-        if len(parts) == 3:
-            rows.append([int(float(x)) for x in parts])
+    with open(path) as fh:
+        for line in fh:
+            line = line.split("#")[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) == 3:
+                rows.append([int(float(x)) for x in parts])
     if len(rows) != 3:
         raise ValueError(f"TRANSMAT 解析失败, 得到 {len(rows)} 行")
     return np.array(rows, dtype=int)
