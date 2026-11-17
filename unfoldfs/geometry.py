@@ -1,11 +1,16 @@
 """几何与对称性：结构解析、变换矩阵、候选折叠矢量、公共对称操作集。
 
-约定(全模块统一):
+约定(全模块统一, Ruling 8: 直接空间用 M, 倒空间用 M^-T):
   * 晶格矩阵 lattice: 行 = 实矢量(Å);  倒格矢 reciprocal(): 行 = 倒矢量(含 2π)
   * 变换矩阵 m_eff: 行约定 A_sc = m_eff @ A_prim
+    -> 倒格矢   B_sc = (m_eff^-1)^T @ B_prim   (由 A_sc B_sc^T = 2πI 推得)
+    -> 位置     r_prim = r_sc @ m_eff          (分数坐标换基)
+    -> k        k_prim = k_sc @ (m_eff^-1)^T   (分数坐标换基)
   * 分数坐标: 原胞/超胞各自基底下的无量纲坐标, 行向量写法 k @ M
-  * spglib 的对称操作按列向量约定存储: x' = R x + t
-    (故对行向量 k 的作用为 k @ R.T + t)
+  * spglib 的对称操作按**列向量**约定存储: x' = R x + t
+    (故对行向量 k 的作用为 k @ R.T + t);
+    超胞基底下的旋转 = M^-T R M^T, 整数性判据即 M^-T R M^T ∈ Z³
+    (行向量约定下才是 M R M^-1; 对称 M 时两者恒等)
 """
 from __future__ import annotations
 
@@ -88,12 +93,12 @@ class Transform:
         return int(round(abs(np.linalg.det(self.m_eff))))
 
     def prim_from_super(self, k_super: np.ndarray, g: np.ndarray) -> np.ndarray:
-        """k'_prim = (K + G) · M_eff^-1"""
-        return (k_super + g) @ self.m_inv
+        """k'_prim = (K + G) · (M_eff^-1)^T   (倒空间用 M^-T)"""
+        return (k_super + g) @ self.m_inv.T
 
     def super_from_prim(self, k_prim: np.ndarray) -> np.ndarray:
-        """K = k'_prim · M_eff (mod 1)"""
-        return np.mod(k_prim @ self.m_eff, 1.0)
+        """K = k'_prim · M_eff^T (mod 1)   (倒空间用 M^-T 的逆变换)"""
+        return np.mod(k_prim @ self.m_eff.T, 1.0)
 
 
 def resolve_transform(sc: Structure, prim: Structure, m: np.ndarray) -> Transform:
@@ -125,14 +130,17 @@ def _gcd(a: int, b: int) -> int:
 
 
 def candidate_g_vectors(m_eff: np.ndarray) -> np.ndarray:
-    """{g ∈ Z³ : g·M_eff^-1 ∈ [0,1)³}, 恰 det(M) 个。"""
+    """{g ∈ Z³ : g·(M_eff^-1)^T ∈ [0,1)³}, 恰 det(M) 个。
+
+    基本区域判据用 (M^-1)^T (倒空间用 M^-T), 与 prim_from_super 保持一致。
+    """
     inv = np.linalg.inv(np.asarray(m_eff, dtype=float))
     det = int(round(abs(np.linalg.det(np.asarray(m_eff, dtype=float)))))
     span = int(np.abs(np.asarray(m_eff)).max()) + 2
     out = []
     for g in np.ndindex(*([2 * span + 1] * 3)):
         gg = np.array(g) - span
-        t = gg @ inv
+        t = gg @ inv.T
         if np.all(t >= -1e-9) and np.all(t < 1.0 - 1e-9):
             out.append(gg)
     if len(out) != det:
@@ -155,11 +163,13 @@ def common_symmetry_ops(prim: Structure, m_eff: np.ndarray,
                         symprec: float = 1e-5) -> SymmetryOps:
     """原胞对称操作中, 同时也是超胞对称的那些。
 
-    判据 (行约定):  M^-1 R M 为整数矩阵 (该旋转把超胞晶格映到自身)。
+    判据 (行约定):  M^-T R M^T 为整数矩阵 (该旋转把超胞晶格映到自身)。
+    spglib 的 R 是列向量约定 (x' = R x), 故超胞基底下的旋转是 M^-T R M^T;
+    行向量约定下才是 M R M^-1 (对称 M 时两者恒等)。
 
     平移**不参与**筛选: spglib 给的 t 是模原胞格矢的代表元 (C3^2 的代表元是
-    (1,0,0)), 换到超胞基底后 t·M^-1 未必是整数 —— 用它筛选会误删操作, 得到
-    不成群的集合 (C3 在内而 C3^2 不在)。平移只需是原胞晶格平移 (spglib 已保证),
+    (1,0,0)), 换基底后 t·M^-1 未必是整数 —— 用它筛选会误删操作, 得到不成群的
+    集合 (C3 在内而 C3^2 不在)。平移只需是原胞晶格平移 (spglib 已保证),
     而 A(k,E) 对整个原胞点群不变。
     """
     import spglib
@@ -174,14 +184,24 @@ def common_symmetry_ops(prim: Structure, m_eff: np.ndarray,
     inv = np.linalg.inv(m)
     keep_r, keep_t = [], []
     for r, t in zip(rotations, translations):
-        r_sc = inv @ r.astype(float) @ m
+        r_sc = inv.T @ r.astype(float) @ m.T
         if not np.allclose(r_sc, np.round(r_sc), atol=1e-6):
             continue        # 旋转在超胞基底非整数 -> 该操作不保持超胞晶格
         keep_r.append(r.astype(int))
-        keep_t.append(np.mod(t, 1.0))
+        keep_t.append(_harden_translation(t))
     if not keep_r:
         raise ValueError("未找到任何公共对称操作")
     return SymmetryOps(np.array(keep_r), np.array(keep_t))
+
+
+def _harden_translation(t: np.ndarray, tol: float = 1e-8) -> np.ndarray:
+    """平移归一化到 [0,1)³, 并把接近 0/1 的分量吸附到 0。
+
+    spglib 给 C3^2 的代表元是 t=(0.9999999999999999, 0, 0) —— 与 0 等价但
+    数值上 != 0; 原样存下, 下游按 int(mod(t*n,1)*n) 做网格检查会静默错一格。
+    """
+    t_mod = np.mod(np.asarray(t, dtype=float), 1.0)
+    return np.where(t_mod > 1.0 - tol, 0.0, t_mod)
 
 
 def _species_ids(species: Tuple[str, ...]) -> np.ndarray:
