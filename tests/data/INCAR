@@ -1,0 +1,15 @@
+ISTART = 0
+ICHARG = 2
+LWAVE  = .TRUE.
+LCHARG = .FALSE.
+LORBIT = 12
+ENCUT  = 320
+PREC   = Normal
+ISMEAR = 0
+SIGMA  = 0.05
+EDIFF  = 1E-6
+IBRION = -1
+NSW    = 0
+ISYM   = 0
+LREAL  = Auto
+NBANDS = 120
