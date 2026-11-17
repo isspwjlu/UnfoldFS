@@ -15,13 +15,16 @@
 - 行向量约定：`A_sc[i] = Σ_j M_eff[i][j] · a_prim[j]`；`B_sc = (M_eff⁻¹)ᵀ · B_prim`；`k'_prim = (K + G) · M_eff⁻¹`；`K = k'_prim · M_eff (mod 1)`
 - **行/列约定必须运行时探测**：先试 `M @ A_prim`，不匹配则试 `Mᵀ @ A_prim`，都不匹配 → 报错（一般非对角 M 才能区分）
 - VASP 计算必须 `LORBIT=12`（`LORBIT=11` 不写复投影块）；`ISMEAR=0`；`NBANDS ≥ det(M) × 原胞带数`
+  - **建议 `NBANDS` 取 det(M) 的整数倍**（否则最高几条带属于不完整折叠像集；本 fixture 用 120 = 13×9+3，
+    占据区 1–81 恰为 9 个完整像集，费米面不受影响，但做能带-原胞带逐条映射时顶部 3 条会错配）
 - PROCAR(LORBIT=12) 每 band 两块：**11 字段**模方块（ion + 9 轨道 |p|² + tot）、**20 字段**复投影块（ion + 9×(Re,Im) + |c|²）
 - 复投影块是**晶胞周期规范**（同一原胞各副本复值相同，不含 e^{iK·R}）
 - 候选折叠矢量集 `Gset = {g ∈ Z³ : g·M_eff⁻¹ ∈ [0,1)³}`，基数恰为 `det(M)`
 - 原胞网格点数 `P_i` 须为 `comm(M_eff⁻¹)` 的倍数（comm = M_eff⁻¹ 各元素分母的最小公倍数）
 - 相位符号约定 `s1, s2 ∈ {+1,−1}` 由自检自动选定：取 4 种组合中「单 G 主导度」平均最大者；主导度 = max(w)/Σw，阈值 0.5，低于即报错
 - DOSCAR 的 E_F 在**第 6 行第 4 个数**（EMAX EMIN NEDOS EFERMI）
-- 测试环境：本地 `pytest`（Python 3.11.7）；master 端用 `/data/wjlu/program/anaconda3/bin/python3`（Python 3.9.13）
+- 测试环境：本地 `pytest`（Python 3.11.7，spglib 2.7.0）；master 端用 `/data/wjlu/program/anaconda3/bin/python3`（Python 3.9.13，spglib 2.0.2）
+- **spglib >= 2.0 的 API**：`spglib.get_symmetry(cell, symprec=...)` 返回 **dict**，须取 `sym["rotations"]` / `sym["translations"]`（不是 tuple）
 - master 工作目录：`/data/wjlu/work/claude/unfold_fs/`
 - 提交信息格式：`<type>: <description>`，type ∈ feat/fix/refactor/docs/test/chore
 
@@ -361,13 +364,27 @@ def test_resolve_transform_detects_row_convention():
 
 
 def test_resolve_transform_detects_column_convention():
-    """同样的物理超胞, TRANSMAT 写成列约定 -> 应自动识别并转成行约定。"""
-    prim = read_poscar(str(FIXTURE_PRIMCELL))
-    sc = read_poscar(str(FIXTURE_POSCAR))
-    m = read_transmat(str(FIXTURE_TRANSMAT))
-    tr = resolve_transform(sc, prim, m.T)
-    assert np.allclose(tr.m_eff, m)          # m.T 解释出的行约定矩阵应等于 m
-    assert tr.det == 9
+    """同样的物理超胞, TRANSMAT 写成列约定 -> 应自动识别并转成行约定。
+
+    注意: fixture 的 M 是对角的(M.T == M), 无法区分两种约定,
+    因此这里用**非对角** M 构造合成用例。
+    """
+    prim = Structure(
+        lattice=np.array([[2.0, 0.0, 0.0], [-1.0, 1.7320508, 0.0],
+                          [0.0, 0.0, 10.0]]),
+        positions=np.array([[0.0, 0.0, 0.0], [1.0 / 3.0, 1.0 / 3.0, 0.5]]),
+        species=("A", "B"),
+    )
+    m = np.array([[2, 1, 0], [0, 2, 0], [0, 0, 1]])   # 非对角, det=4
+    sc = Structure(lattice=m @ prim.lattice,
+                   positions=np.array([[0.0, 0.0, 0.0], [1.0 / 3.0, 1.0 / 3.0, 0.5]]),
+                   species=("A", "B"))
+    tr_row = resolve_transform(sc, prim, m)
+    assert np.allclose(tr_row.m_eff, m)
+    tr_col = resolve_transform(sc, prim, m.T)
+    # 列约定写法必须被还原成同一个行约定矩阵
+    assert np.allclose(tr_col.m_eff, m)
+    assert tr_col.det == 4
 
 
 def test_resolve_transform_rejects_inconsistent():
@@ -519,7 +536,10 @@ def common_symmetry_ops(prim: Structure, m_eff: np.ndarray,
 
     # spglib 的 cell = (lattice, positions, numbers): lattice 行=基矢, positions 分数坐标
     cell = (prim.lattice, prim.positions, _species_ids(prim.species))
-    rotations, translations = spglib.get_symmetry(cell, symprec=symprec)
+    # spglib >= 2.0: get_symmetry 返回 dict(rotations/translations/equivalent_atoms)
+    sym = spglib.get_symmetry(cell, symprec=symprec)
+    rotations = sym["rotations"]
+    translations = sym["translations"]
     m = np.asarray(m_eff, dtype=float)
     inv = np.linalg.inv(m)
     keep_r, keep_t = [], []
@@ -1003,15 +1023,24 @@ def test_read_procar_has_phase_block():
     assert p.has_phase is True
     assert p.coeffs.shape[:3] == p.weights.shape[:3]
     # 模方块与复投影块模长自洽
+    # 注意: VASP 两块的归一化/取整口径不同 —— 实测 58320 个比较中 0.51% 超 2e-3
+    # (最大 7.5e-3), 故容差取 1e-2; 末列(Σ|c|^2)与模方块逐离子合计则一致到 ≤8e-4
     amp = np.abs(p.coeffs)
-    assert np.allclose(amp ** 2, p.weights, atol=2e-3)
+    assert np.allclose(amp ** 2, p.weights, atol=1e-2)
 
 
 def test_read_procar_equivalent_copies_have_same_value():
-    """同一原胞的各副本在晶胞周期规范下复值相同。"""
+    """由超胞晶格平移联系起来的副本, 复投影值相同。
+
+    实测: 3x3x1 超胞里同一原胞原子的 9 个副本中, 由**超胞晶格平移**
+    (3a1 / 3a2) 联系的那 3 个复值相同; 跨平移的则相差 e^{i K.T}。
+    这里只断言"同一组内"相同: 连续 3 个离子为 1 组。
+    """
     p = read_procar(str(FIXTURE_PROCAR))
-    c0 = p.coeffs[0, 0, :9, 0]
-    assert np.allclose(c0, c0[0], atol=1e-6)
+    c = p.coeffs[0, 0, :, 0]          # band 0, k=Gamma, s 轨道
+    for start in range(0, 27, 3):
+        group = c[start:start + 3]
+        assert np.allclose(group, group[0], atol=1e-6)
 ```
 
 Run: `python -m pytest tests/test_vaspio.py -v`
@@ -1099,7 +1128,8 @@ def read_procar(path: str) -> ProcarData:
         if idx >= len(lines):
             break
         p = lines[idx].split()
-        kpoints[ik] = [float(x) for x in p[2:5]]
+        # " k-point     1 :    0.0 0.0 0.0     weight = ..." -> 坐标在 token 3..5
+        kpoints[ik] = [float(x) for x in p[3:6]]
         idx += 1
         for ib in range(nb):
             while idx < len(lines) and not lines[idx].lstrip().startswith("band"):
@@ -1258,9 +1288,9 @@ class AtomCopies:
 
 @dataclass(frozen=True)
 class UnfoldedResult:
-    k_prim: np.ndarray      # (n_cand, 3) 原胞分数坐标
-    energies: np.ndarray    # (n_cand, n_band)
-    weights: np.ndarray     # (n_cand, n_band)
+    k_cand: np.ndarray      # (n_ir, n_cand, 3) 每个计算点的候选原胞 k(分数坐标)
+    energies: np.ndarray    # (n_ir, n_cand, n_band_eff)
+    weights: np.ndarray     # (n_ir, n_cand, n_band_eff)
 
 
 def build_atom_copies(prim: Structure, sc: Structure, tr: Transform) -> AtomCopies:
@@ -1273,7 +1303,8 @@ def build_atom_copies(prim: Structure, sc: Structure, tr: Transform) -> AtomCopi
     for p in prim.positions:
         lst: List[Tuple[int, np.ndarray]] = []
         for j, q in enumerate(sc.positions):
-            dq = (q - p) @ inv_sc
+            # 必须是笛卡尔差: 分数坐标不能直接相减再乘逆晶格
+            dq = (q @ sc.lattice - p @ prim.lattice) @ inv_sc
             t = np.round(dq @ tr.m_eff)
             if np.allclose(dq @ tr.m_eff, t, atol=1e-3):
                 lst.append((j, t))
@@ -1375,8 +1406,18 @@ def select_phase_convention(k_super_frac, coeffs, energies, tr, copies, gset,
 
 def unfold_supercell(band, procar, tr, copies, gset, a_prim, prim_cart,
                       b_prim, b_super, k_super_list) -> UnfoldedResult:
-    """对每个算出的超胞 k 点展开, 并按候选重组为有效带。"""
-    all_k, all_e, all_w = [], [], []
+    """对每个算出的超胞 k 点展开, 并按候选重组为有效带。
+
+    三个返回数组都以"计算点"为第一维:
+      k_cand   (n_ir, n_cand, 3)  该计算点的候选原胞 k(分数坐标)
+      energies (n_ir, n_cand, n_band_eff)
+      weights  (n_ir, n_cand, n_band_eff)
+    每个候选内按能量排序 -> n 即原胞带序号(在对称变换下不变)。
+    """
+    n_ir = len(k_super_list)
+    n_cand = gset.shape[0]
+    k_cand = np.zeros((n_ir, n_cand, 3))
+    raw = []
     for ik, k_super in enumerate(k_super_list):
         s1, s2, score = select_phase_convention(
             k_super, procar.coeffs[ik], band.energies[ik], tr, copies, gset,
@@ -1387,26 +1428,21 @@ def unfold_supercell(band, procar, tr, copies, gset, a_prim, prim_cart,
         k_out, e_out, w_out = unfold_at_k(
             k_super, procar.coeffs[ik], band.energies[ik], tr, copies, gset,
             a_prim, prim_cart, b_prim, b_super, s1, s2)
-        # 候选重组: 每条带归属到权重最大的候选, 每个候选内按能量排序
+        k_cand[ik] = k_out
+        raw.append((e_out, w_out))
+    n_eff = max(w.shape[1] for _e, w in raw)
+    energies = np.full((n_ir, n_cand, n_eff), np.nan)
+    weights = np.zeros((n_ir, n_cand, n_eff))
+    for ik, (e_out, w_out) in enumerate(raw):
+        per_cand: List[List[Tuple[float, float]]] = [[] for _ in range(n_cand)]
         for ib in range(w_out.shape[1]):
             gi = int(np.argmax(w_out[:, ib]))
-            all_k.append((gi, k_out[gi]))
-            all_e.append((gi, e_out[gi, ib], w_out[gi, ib]))
-    # 组装: (n_cand, n_band_eff)
-    n_cand = gset.shape[0]
-    per_cand: List[List[Tuple[float, float]]] = [[] for _ in range(n_cand)]
-    for gi, e, w in all_e:
-        per_cand[gi].append((e, w))
-    n_eff = max((len(v) for v in per_cand), default=0)
-    energies = np.full((n_cand, n_eff), np.nan)
-    weights = np.zeros((n_cand, n_eff))
-    for gi, lst in enumerate(per_cand):
-        for n, (e, w) in enumerate(sorted(lst)):
-            energies[gi, n] = e
-            weights[gi, n] = w
-    k_prim = np.array([tr.prim_from_super(k_super_list[0], g)
-                       for g in gset])
-    return UnfoldedResult(k_prim, energies, weights)
+            per_cand[gi].append((e_out[gi, ib], w_out[gi, ib]))
+        for gi, lst in enumerate(per_cand):
+            for n, (e, w) in enumerate(sorted(lst)):
+                energies[ik, gi, n] = e
+                weights[ik, gi, n] = w
+    return UnfoldedResult(k_cand, energies, weights)
 ```
 
 Run: `python -m pytest tests/test_unfold.py -v`
@@ -1528,60 +1564,45 @@ from .unfold import UnfoldedResult
 
 @dataclass(frozen=True)
 class ExpandedData:
-    k_cart: np.ndarray
-    band_e: np.ndarray
-    band_w: np.ndarray
+    k_cart: np.ndarray       # (n_full,3) 原胞笛卡尔 (2π/Å), 完整均匀网格
+    band_e: np.ndarray       # (n_full, n_band_eff) 该点覆盖候选的有效带
+    band_w: np.ndarray       # (n_full, n_band_eff)
     spec: GridSpec
 
 
-def _candidate_permutation(ops_rot: np.ndarray, gset: np.ndarray,
-                           m: np.ndarray, m_inv: np.ndarray) -> np.ndarray:
-    """每个操作把候选 G 映到哪个候选: perm[o, gi] = gj。
-
-    ops_rot 是原胞基底的旋转(spglib 列向量约定)。
-    超胞基底下的旋转 R_super = M^-1 R_prim M (整数), 候选 G 按列向量变换 G' = R_super G。
-    """
-    n_ops = ops_rot.shape[0]
-    n_cand = gset.shape[0]
-    perm = np.zeros((n_ops, n_cand), dtype=int)
-    for o in range(n_ops):
-        r_super = m_inv @ ops_rot[o].astype(float) @ m
-        for gi, g in enumerate(gset):
-            g_new = r_super @ g.astype(float)
-            frac_new = g_new @ m_inv
-            for gj, gj_vec in enumerate(gset):
-                diff = frac_new - (gj_vec @ m_inv)
-                if np.allclose(diff, np.round(diff), atol=1e-6):
-                    perm[o, gi] = gj
-                    break
-            else:
-                raise ValueError(f"对称操作把候选 G 映到集合外: {g_new}")
-    return perm
-
-
 def expand_to_full_grid(unfolded: UnfoldedResult, grid_map: GridMap) -> ExpandedData:
-    """扩展 = 取代表点结果 + 按该点旋转置换候选索引。"""
+    """把代表点的候选展开结果映射到完整均匀原胞网格。
+
+    每个完整网格点 i 由唯一的 (代表点 ir, 候选 gi) 覆盖:
+      - k_i 是原胞网格点, 其超胞 k = k_i·M;
+      - 代表点 ir 与操作 o 满足 k_i = o·k_rep;
+      - 候选 gi 满足 o·k_cand[ir][gi] = k_i (mod 1)。
+    因此 data_full[i] = data_rep[ir][gi]。
+    """
     n_points = int(grid_map.full_to_ir.shape[0])
-    n_cand, n_band = unfolded.energies.shape
-    m = grid_map.transform.m_eff.astype(float)
-    m_inv = grid_map.transform.m_inv
-    perm = _candidate_permutation(grid_map.ops.rotations, _gset_of(grid_map),
-                                  m, m_inv)
-    e_out = np.zeros((n_points, n_band))
+    n_ir, n_cand, n_band = unfolded.energies.shape
+    e_out = np.full((n_points, n_band), np.nan)
     w_out = np.zeros((n_points, n_band))
+    k_prim_full = np.zeros((n_points, 3))
     for i in range(n_points):
-        rep = int(grid_map.full_to_ir[i])
+        ir = int(grid_map.full_to_ir[i])
         o = int(grid_map.rot_of_full[i])
+        cands = unfolded.k_cand[ir]
         if o < 0:
-            e_out[i] = unfolded.energies
-            w_out[i] = unfolded.weights
+            rotated = cands
+            target = grid_map.ir_k_prim[ir]
         else:
-            # perm[o, gi] = gj 表示代表点的候选 gi 对应像点的候选 gj,
-            # 故像点顺序 = 代表点顺序按 perm 的逆置换
-            inv_perm = np.argsort(perm[o])
-            e_out[i] = unfolded.energies[inv_perm]
-            w_out[i] = unfolded.weights[inv_perm]
-    k_cart = grid_map.ir_k_prim[grid_map.full_to_ir] @ grid_map.b_prim
+            rotated = np.array([grid_map.ops.apply(c, o) for c in cands])
+            target = grid_map.ops.apply(grid_map.ir_k_prim[ir], o)
+        # 找出被当前网格点覆盖的候选
+        diff = np.abs((rotated - target + 0.5) % 1.0 - 0.5).sum(axis=1)
+        gi = int(np.argmin(diff))
+        if diff[gi] > 1e-6:
+            raise ValueError(f"网格点 {i} 找不到覆盖候选(最近距离 {diff[gi]:.2e})")
+        e_out[i] = unfolded.energies[ir, gi]
+        w_out[i] = unfolded.weights[ir, gi]
+        k_prim_full[i] = target
+    k_cart = k_prim_full @ grid_map.b_prim
     return ExpandedData(k_cart, e_out, w_out, grid_map.spec)
 
 

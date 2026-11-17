@@ -1,0 +1,2 @@
+# fixture 数据必须保持字节稳定(解析按行/列切分), 不做换行转换
+tests/data/* text eol=lf
