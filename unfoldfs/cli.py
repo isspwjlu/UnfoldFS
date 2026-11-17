@@ -382,13 +382,8 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     b_prim = reciprocal(prim.lattice)
     b_super = reciprocal(sc.lattice)
 
-    # 展开必须传 gm.k_super(去重后的超胞 k), 不是 IR 点列表
-    unfolded = unfold_supercell(
-        band, procar, tr, copies, tr.m_eff, prim.lattice,
-        prim.positions @ prim.lattice, b_prim, b_super, gm.k_super,
-        strict_dominance=args.strict_dominance)
-    expanded = expand_to_full_grid(unfolded, gm)
-
+    # E_F 的选取与自检放在反折叠**之前**: 落在带隙深处时要在昂贵的计算之前
+    # 就中止(而不是让用户等完再被告知结果没有意义)。
     # VBM/CBM 只在 EIGENVAL 里有占据态时才有意义; --ef <数值> 不该被它挡住
     try:
         vbm, cbm = band_edges(band)
@@ -410,6 +405,13 @@ def cmd_unfold(args: argparse.Namespace) -> int:
             "金属请检查 ISMEAR/展宽设置。已中止, 未写出任何费米面文件。")
     if status in ("near", "warn"):
         print(f"提示: {message}", file=sys.stderr)
+
+    # 展开必须传 gm.k_super(去重后的超胞 k), 不是 IR 点列表
+    unfolded = unfold_supercell(
+        band, procar, tr, copies, tr.m_eff, prim.lattice,
+        prim.positions @ prim.lattice, b_prim, b_super, gm.k_super,
+        strict_dominance=args.strict_dominance)
+    expanded = expand_to_full_grid(unfolded, gm)
 
     print(f"相位约定      : s1 = {unfolded.s1:+d}, s2 = {unfolded.s2:+d} "
           f"(单 G 主导度 {unfolded.dominance:.4f})")
