@@ -166,7 +166,7 @@ def _incar_suggested(grid_map, n_bands: int, encut: float, kpar: int,
         "# LORBIT = 12 必须保留: PROCAR 需要复投影系数(相位), "
         "LORBIT=11 不写相位。",
         "# ISMEAR = 1 + SIGMA = 0.2 是 VASP 默认值: 每个 k 点只需几次 DAV "
-        "迭代(实测单核机器上 ~15 s/k 点)。",
+        "迭代(实测单核机器上: 9 原子超胞 ~6 s/k 点, 27 原子超胞 ~2 min/k 点)。",
         "#   展宽只影响带边占据数(带隙体系的带边占据数必然是 0.98 这类小数), "
         "并不能让费米能更准。",
         "#   有带隙的体系更推荐 ISMEAR = -5(四面体法): 占据数接近整数, "
