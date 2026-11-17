@@ -101,11 +101,28 @@ ASE 还原的盒子(Å⁻¹) = [[2,0,0],[1,1.5,0],[0.3,0.2,1.8]]   ← 与写入
 （`0.656466561 0.379011146 0` / `0 0.758022291 0` / `0 0 0.355815763`），
 即本项目用 `b_prim`（含 2π）作为"假盒子"是与 VASPKIT 一致的。
 
-## 3. `FS.grd` —— GNUPLOT ASCII grid（消费者：XCrySDen 的 grid 导入）
+## 3. `FS.grd` —— 三维网格 ASCII 文件（消费者：XCrySDen 的 grid 导入）
 
-**出处**：简报指定的格式族（GNUPLOT ASCII grid）；XCrySDen 1.5.60 的
-`bin/xcrys` 内含 `cryGeneralGridRegPeriodInterpolator` 等 grid 读取例程，
-`Tcl/parseDataGrid.tcl` 是其 “DataGrid” 展示脚本。
+**出处与核对状态（请注意这一条与其它格式不同）**：简报把该格式称作
+"GNUPLOT ASCII grid"。实测核对后发现：
+
+* gnuplot 5.2 的手册（`/usr/share/info/gnuplot.info.gz`，节点 `data-file`）
+  里，`splot` 支持的数据格式是 **`matrix`（无头部，空行分隔 datablock）**与
+  **`using` 列格式**，**没有**"nx ny + 坐标区间"这种带头部的网格格式 ⇒
+  本文件**不是** gnuplot 的 splot 输入格式；
+* 服务器上能找到的所有 `.grd` 文件都是 VASPKIT 写的 **k 路径剖面**
+  （两列：路径距离 + 值，见 `ref/VASPKIT_manual.md` 第 834 行），也不是三维场；
+* XCrySDen 1.5.60 的 `bin/xcrys` 内含 grid 读取例程
+  （`cryGeneralGridRegPeriodInterpolator` 等）与一套**自有的块结构**
+  "DataGrid" 格式（`Tcl/parseDataGrid.tcl` + 二进制里的
+  `ReadDataGrid`/`WriteDataGrid`/`GetNumberOfGridBlocks`），但它的**源码不在
+  本机**（只有二进制安装），无法逐字段核对。
+
+⇒ 本项目按"带头部的三维规则网格"这一常见写法实现（下面的布局），
+并在文件头里写清单位与网格维度。**这一条是五种格式里唯一没能用现成读取器
+端到端验证的**（gnuplot 能解析文件，但会把它当普通列数据；XCrySDen 的
+`.grd` 导入器无法在本机核对）。需要严格的等值面工具时，请用
+`FS.cube`（已被 ASE 实测验证）或 `FS.bxsf`（已被 XCrySDen 实测验证）。
 
 **布局**：
 
@@ -123,10 +140,10 @@ ASE 还原的盒子(Å⁻¹) = [[2,0,0],[1,1.5,0],[0.3,0.2,1.8]]   ← 与写入
 * `nx`/`ny` 是前两个网格方向的点数；**nz 不写在头部**，由空行分隔的
   切片数给出。
 * 三个坐标轴 = 倒格矢 `b1/b2/b3` 方向上的**笛卡尔长度**（2π/Å）。
-  gnuplot 的 grid 格式只支持正交轴，非正交 BZ 的形变无法避免 ——
-  需要保持 BZ 形状请用 `FS.cube` 或 `FS.bxsf`。
-* 坐标区间取**实际采样范围**（第 n 个点在 `(n-1)/n` 处），与 gnuplot
-  按“区间等分”插值的口径一致。
+  该格式只支持正交轴，非正交 BZ 的形变无法避免 —— 需要保持 BZ 形状
+  请用 `FS.cube` 或 `FS.bxsf`。
+* 坐标区间取**实际采样范围**（第 n 个点在 `(n-1)/n` 处），与"区间等分"
+  插值口径一致。
 * 体数据 = `A(k, E_F)`。
 
 > 注：VASPKIT 也会写 `.grd`，但那是 **k 路径剖面**（两列：路径距离 + 值），
@@ -285,7 +302,9 @@ BXSF / FermiSurfer 的网格是**规则**的，无法留空，故按下面规则
   （唯一点+1 + 周期端点重复）、矢量行顺序与 XCrySDen 自己的写法完全一致。
 * **cube 实测**：探针 cube 用 **ASE 3.26 `ase.io.cube.read_cube`** 读回，
   轴序/增量约定/Bohr 单位三条同时验证 ✓（见 §2）。
-* **grd 实测**：本模块写出的 `FS.grd` 用服务器上的 **gnuplot 5.2** 解析
-  无错；按 gnuplot grid 格式手工解析也得到 (nz, ny, nx) 的体数据 ✓。
+* **grd 实测（有限）**：本模块写出的 `FS.grd` 用服务器上的 **gnuplot 5.2**
+  解析**无错**（但 gnuplot 会把它当普通列数据 —— 它自己的 splot 格式没有
+  头部，见 §3）；按三维网格布局手工解析得到 (nz, ny, nx) 的体数据 ✓。
+  XCrySDen 的 `.grd` 导入器在本机无法核对（无源码、无命令行选项）。
 * `bin/cube2xsf` 在服务器上**对参考 cube 也报同样的错**（工具自身损坏），
   故未用作 cube 的验证器。
