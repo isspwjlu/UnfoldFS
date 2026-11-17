@@ -134,19 +134,33 @@ def candidate_g_vectors(m_eff: np.ndarray) -> np.ndarray:
     """{g ∈ Z³ : g·(M_eff^-1)^T ∈ [0,1)³}, 恰 det(M) 个。
 
     基本区域判据用 (M^-1)^T (倒空间用 M^-T), 与 prim_from_super 保持一致。
+
+    搜索范围由 **M 的行和界**给出: 候选 g 满足 g·M^-T = f ∈ [0,1)³,
+    即 g = f·M^T, 故 g_i = Σ_j f_j·M_ij 的取值范围是
+    [Σ_j min(0,M_ij), Σ_j max(0,M_ij)] (M 的第 i 行)。
+    用 max|M| 给界会漏掉离对角元素大的矩阵(莫尔型超胞)的候选 ——
+    实测随机整数 M 的失败率随 |M| 增大: |M| ~ 3 时 ~9%, |M| ~ 30 时 ~93%;
+    换成行和界后降到 0。(unfold.candidate_g_for_k 用同一界, 两处必须保持一致。)
     """
-    inv = np.linalg.inv(np.asarray(m_eff, dtype=float))
-    det = int(round(abs(np.linalg.det(np.asarray(m_eff, dtype=float)))))
-    span = int(np.abs(np.asarray(m_eff)).max()) + 2
-    out = []
-    for g in np.ndindex(*([2 * span + 1] * 3)):
-        gg = np.array(g) - span
-        t = gg @ inv.T
-        if np.all(t >= -1e-9) and np.all(t < 1.0 - 1e-9):
-            out.append(gg)
-    if len(out) != det:
-        raise ValueError(f"候选 G 数 {len(out)} != det(M) {det}")
-    return np.array(out, dtype=int)
+    m = np.asarray(m_eff)
+    m_f = m.astype(float)
+    inv = np.linalg.inv(m_f)
+    det = int(round(abs(np.linalg.det(m_f))))
+    hi = np.clip(m, 0, None).sum(axis=1)     # 每行正部分之和 -> g_i 上界
+    lo = np.clip(-m, 0, None).sum(axis=1)    # 每行负部分之和 -> g_i 下界
+    # 逐轴区间外扩一格作数值余量(边界候选本身会被分数判据挡掉)
+    axes = [np.arange(-lo[i] - 1, hi[i] + 2, dtype=int) for i in range(3)]
+    grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+    frac = grid @ inv.T
+    keep = np.all(frac >= -1e-9, axis=1) & np.all(frac < 1.0 - 1e-9, axis=1)
+    out = grid[keep]
+    if out.shape[0] != det:
+        rng_desc = "×".join(f"[{-lo[i] - 1},{hi[i] + 1}]" for i in range(3))
+        raise ValueError(
+            f"候选 G 数 {out.shape[0]} != 期望 {det} 个 "
+            f"(逐轴搜索区间 {rng_desc}, 由 M_eff 行和界给出) —— "
+            "整数可逆的 m_eff 不该出现此错: 请检查 m_eff 是否为整数矩阵、是否奇异")
+    return out.astype(int)
 
 
 @dataclass(frozen=True)

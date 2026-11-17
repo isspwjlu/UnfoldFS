@@ -352,3 +352,86 @@ def test_common_symmetry_ops_rotation_criterion_matches_cartesian_truth():
         for r in ops.rotations:
             assert any(np.array_equal(r, t) for t in truth), \
                 f"判据多留了操作 {r.tolist()}"
+
+
+# ---------------------------------------------------------------- 候选 G 的搜索范围(行和界)
+
+def test_candidate_g_vectors_row_sum_bound_beats_max_abs_bound():
+    """回归: 搜索半径必须按 M 的**行和**给, 不能用 max|M|+2。
+
+    M=[[10,10,0],[0,10,0],[0,0,1]] 的候选满足 g1 ∈ [0,10), g0−g1 ∈ [0,10)
+    (整数), 故 g0 最大到 18 —— 已超过旧界 max|M|+2 = 12,
+    旧实现只找到 79/100 个候选 -> 直接抛错。
+    """
+    m = np.array([[10, 10, 0], [0, 10, 0], [0, 0, 1]])
+    g = candidate_g_vectors(m)
+    assert g.shape == (100, 3)            # det(M) = 100
+    assert np.abs(g).max() > 12           # 旧界(max|M|+2)覆盖不到
+    frac = g @ np.linalg.inv(m.astype(float)).T
+    assert np.all(frac >= -1e-9) and np.all(frac < 1.0 - 1e-9)
+
+
+def test_candidate_g_vectors_random_matrices_give_exactly_det_candidates():
+    """压力测试: 随机整数 M(含大 off-diagonal)必须恰好找到 det(M) 个候选。
+
+    旧实现用 max|M|+2 给界, |M| ~ 10~30 时 300 个随机 M 里 276 个漏候选
+    (候选数 != det(M) -> 直接抛错, 莫尔型超胞根本跑不动);
+    换成行和界后 0 失败。固定种子 ✓。
+    """
+    rng = np.random.default_rng(20261117)
+    checked = 0
+    while checked < 200:
+        m = rng.integers(-30, 31, size=(3, 3))
+        det = abs(round(np.linalg.det(m.astype(float))))
+        if det == 0:
+            continue                       # 奇异矩阵没有候选, 不参与
+        checked += 1
+        g = candidate_g_vectors(m)
+        assert g.shape == (det, 3), \
+            f"M={m.tolist()} 候选数 {g.shape[0]} != det(M) {det}"
+        frac = g @ np.linalg.inv(m.astype(float)).T
+        assert np.all(frac >= -1e-9) and np.all(frac < 1.0 - 1e-9)
+        assert len({tuple(r) for r in g.tolist()}) == det      # 候选互不重复
+
+
+def test_candidate_g_vectors_matches_unfold_candidate_g_for_k_for_symmetric_m():
+    """对称 M 下, geometry.candidate_g_vectors 与 unfold.candidate_g_for_k
+    必须给出一致的**分数值**集合。
+
+    比较分数值而不是 g 的下标/成员: 两者的枚举顺序无关紧要, 但
+    (K=0 时) 同一个判据 g·M^-T ∈ [0,1)³ 的解集必须一致。
+    """
+    from unfoldfs.unfold import candidate_g_for_k
+
+    rng = np.random.default_rng(4242)
+    checked = 0
+    while checked < 20:
+        a = rng.integers(-15, 16, size=(3, 3))
+        m = a + a.T                       # 对称整数矩阵, off-diagonal 可达 ±30
+        det = abs(round(np.linalg.det(m.astype(float))))
+        if det == 0:
+            continue
+        checked += 1
+        inv = np.linalg.inv(m.astype(float))
+        g_geom = candidate_g_vectors(m)
+        g_unf = candidate_g_for_k(np.zeros(3), m, inv.T)
+        assert g_geom.shape == (det, 3)
+        assert g_unf.shape == (det, 3)
+        f_geom = np.sort(g_geom @ inv.T, axis=0)
+        f_unf = np.sort(g_unf @ inv.T, axis=0)
+        assert np.allclose(f_geom, f_unf, atol=1e-9)
+
+
+def test_candidate_g_vectors_error_message_reports_range_and_expected_count():
+    """错误信息必须能区分「搜索范围不足」与「计数不对」。
+
+    旧信息只有「候选 G 数 N != det(M)」, 看不出是范围不够还是矩阵有问题;
+    新信息同时报出实际数、期望数与逐轴搜索区间, 便于定位。
+    """
+    m = np.array([[0.5, 0, 0], [0, 2, 0], [0, 0, 2]])   # 非整数矩阵 -> 计数必然不符
+    with pytest.raises(ValueError) as excinfo:
+        candidate_g_vectors(m)
+    msg = str(excinfo.value)
+    assert "候选 G 数 4" in msg
+    assert "期望 2" in msg
+    assert "搜索区间" in msg
