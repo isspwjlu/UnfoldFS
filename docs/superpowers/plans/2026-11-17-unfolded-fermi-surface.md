@@ -12,7 +12,14 @@
 
 ## Global Constraints
 
-- 行向量约定：`A_sc[i] = Σ_j M_eff[i][j] · a_prim[j]`；`B_sc = (M_eff⁻¹)ᵀ · B_prim`；`k'_prim = (K + G) · M_eff⁻¹`；`K = k'_prim · M_eff (mod 1)`
+- 行向量约定（Ruling 8：**直接空间用 M，倒空间用 M⁻ᵀ**，两者不可混用）：
+  - 实格矢：`A_sc = M_eff · A_prim`
+  - 倒格矢：`B_sc = (M_eff⁻¹)ᵀ · B_prim`
+  - **位置（分数）**：`r_prim = r_sc · M_eff`（无转置）
+  - **k（分数）**：`k'_prim = (K + G) · (M_eff⁻¹)ᵀ`；`K = k'_prim · M_effᵀ (mod 1)`（**有转置**）
+  - 数值核对（M=[[2,1],[0,2]], A_prim=I）：`A_sc=[[2,1],[0,2]]`、`B_sc=2π·[[0.5,0],[-0.25,0.5]]`、`a_sc1·b_sc1=2π` ✓；`k_sc=(0.5,0)` → `k_prim=(0.25,0)` ✓ 与 `k_sc·(M⁻¹)ᵀ` 一致，而 `k_sc·M⁻¹=(0.25,0.125)` ✗
+  - **对对称 M（如 diag(3,3,1)）两者恒等** → 现有 fixture 测不出差别；非对称 M（莫尔超胞典型）必须用转置版
+- **spglib 的旋转 R 是列向量约定**（实测：原子映射判据 12/12 vs 行向量 4/12）；超胞基底整数性判据用 `M_eff⁻ᵀ · R · M_effᵀ ∈ Z³`（已用原子映射真值交叉核对）
 - **行/列约定必须运行时探测**：先试 `M @ A_prim`，不匹配则试 `Mᵀ @ A_prim`，都不匹配 → 报错（一般非对角 M 才能区分）
 - VASP 计算必须 `LORBIT=12`（`LORBIT=11` 不写复投影块）；`ISMEAR=0`；`NBANDS ≥ det(M) × 原胞带数`
   - **建议 `NBANDS` 取 det(M) 的整数倍**（否则最高几条带属于不完整折叠像集；本 fixture 用 120 = 13×9+3，
@@ -425,12 +432,12 @@ class Transform:
         return int(round(abs(np.linalg.det(self.m_eff))))
 
     def prim_from_super(self, k_super: np.ndarray, g: np.ndarray) -> np.ndarray:
-        """k'_prim = (K + G) · M_eff^-1"""
-        return (k_super + g) @ self.m_inv
+        """k'_prim = (K + G) · (M_eff^-1)^T   (倒空间用 M^-T, 见 Global Constraints)"""
+        return (k_super + g) @ self.m_inv.T
 
     def super_from_prim(self, k_prim: np.ndarray) -> np.ndarray:
-        """K = k'_prim · M_eff (mod 1)"""
-        return np.mod(k_prim @ self.m_eff, 1.0)
+        """K = k'_prim · M_eff^T (mod 1)"""
+        return np.mod(k_prim @ self.m_eff.T, 1.0)
 
 
 def resolve_transform(sc: Structure, prim: Structure, m: np.ndarray) -> Transform:
@@ -462,10 +469,11 @@ def _gcd(a: int, b: int) -> int:
 
 
 def candidate_g_vectors(m_eff: np.ndarray) -> np.ndarray:
-    """{g ∈ Z³ : g·M_eff^-1 ∈ [0,1)³}, 恰 det(M) 个。"""
-    inv = np.linalg.inv(np.asarray(m_eff, dtype=float))
-    det = int(round(abs(np.linalg.det(inv))))
-    span = int(np.abs(np.asarray(m_eff)).max()) + 2
+    """{g ∈ Z³ : g·(M_eff^-1)^T ∈ [0,1)³}, 恰 det(M) 个。"""
+    m = np.asarray(m_eff, dtype=float)
+    inv = np.linalg.inv(m).T
+    det = int(round(abs(np.linalg.det(m))))     # 注意: det(M^-1) = 1/det(M), 不能取整
+    span = int(np.abs(m).max()) + 2
     out = []
     for g in np.ndindex(*([2 * span + 1] * 3)):
         gg = np.array(g) - span
@@ -484,28 +492,44 @@ Expected: PASS
 
 追加到 `tests/test_geometry.py`：
 ```python
-def test_common_symmetry_ops_are_valid_in_both_bases():
+def test_common_symmetry_ops_rotations_are_integer_in_supercell_basis():
+    """旋转在超胞基底必须是整数矩阵 (M^-T R M^T ∈ Z³)。
+
+    注意: 平移**不**参与筛选 —— spglib 给的 t 是模原胞格矢的代表元,
+    用它做筛选会误删操作(实测会丢掉 C3², 得到不成群的子集)。
+    """
     prim = read_poscar(str(FIXTURE_PRIMCELL))
     m = read_transmat(str(FIXTURE_TRANSMAT))
     ops = common_symmetry_ops(prim, m)
-    assert ops.rotations.shape[0] >= 1
-    inv = np.linalg.inv(m.astype(float))
+    assert ops.rotations.shape[0] == 12          # 原胞 D3h 全群
+    inv = np.linalg.inv(m.astype(float)).T
     for r in ops.rotations:
-        assert np.allclose(inv @ r @ m.astype(float), np.round(inv @ r @ m.astype(float)))
+        r_sc = inv @ r.astype(float) @ m.astype(float).T
+        assert np.allclose(r_sc, np.round(r_sc), atol=1e-6)
         assert np.allclose(np.round(inv @ r @ m.astype(float)), r)   # 对角阵下二者等价
     for t in ops.translations:
         assert np.allclose(t @ inv, np.round(t @ inv))
 
 
-def test_common_symmetry_ops_apply_is_involution():
+def test_common_symmetry_ops_form_a_group():
+    """成群性: 任意两个操作的复合仍在集合内。
+
+    比"作用两次回原点"(全群对合)更强且更正确 —— C3 阶为 3、S3 阶为 6,
+    D3h 里根本不存在非平凡对合, 原来的 is_involution 断言在数学上不成立。
+    """
     prim = read_poscar(str(FIXTURE_PRIMCELL))
     m = read_transmat(str(FIXTURE_TRANSMAT))
     ops = common_symmetry_ops(prim, m)
-    k = np.array([0.13, 0.07, 0.0])
+
+    def close(a, b):
+        d = np.mod(a - b + 0.5, 1.0) - 0.5
+        return np.abs(d).max() < 1e-6
+
     for i in range(ops.rotations.shape[0]):
-        k1 = ops.apply(k, i)
-        k2 = ops.apply(k1, i)
-        assert np.allclose(np.mod(k2 - k, 1.0), 0.0, atol=1e-8)
+        for j in range(ops.rotations.shape[0]):
+            comp = ops.apply(ops.apply(k, i), j)
+            assert any(close(comp, ops.apply(k, l))
+                       for l in range(ops.rotations.shape[0]))
 ```
 
 Run: `python -m pytest tests/test_geometry.py -v`
@@ -544,12 +568,14 @@ def common_symmetry_ops(prim: Structure, m_eff: np.ndarray,
     inv = np.linalg.inv(m)
     keep_r, keep_t = [], []
     for r, t in zip(rotations, translations):
+        # spglib 的 R 是列向量约定(k' = R k); 超胞基底的整数性判据用 M^-T R M^T
+        # (已用「原子映射」真值交叉核对: 非对称 M 下 12/12 通过, 旧判据只剩 4)
         r_sc = inv @ r.astype(float) @ m
         if not np.allclose(r_sc, np.round(r_sc), atol=1e-6):
-            continue                     # 在超胞基底非整数 -> 不是超胞对称
-        t_sc = t @ inv
-        if not np.allclose(t_sc, np.round(t_sc), atol=1e-6):
-            continue                     # 平移不落在超胞晶格 -> 不是超胞对称
+            continue        # 旋转在超胞基底非整数 -> 该操作不保持超胞晶格
+        # 注意: **不要**用平移做筛选 —— spglib 给的 t 是模原胞格矢的代表元
+        # (C3^2 的代表元是 (1,0,0)), 换基底后 t·M^-1 未必是整数, 会误删操作。
+        # 平移只需是原胞晶格平移(spglib 已保证), 而 A(k,E) 对整个点群不变。
         keep_r.append(r.astype(int))
         keep_t.append(np.mod(t, 1.0))
     if not keep_r:
@@ -799,9 +825,11 @@ def decompose_grid(grid: np.ndarray, ops: SymmetryOps):
         if i in rep_of_point:
             continue
         orbit = []
+        seen = set()
         for o in range(ops.rotations.shape[0]):
             j = index.get(_key(ops.apply(grid[i], o)))
-            if j is not None:
+            if j is not None and j not in seen:   # 不同操作可能落到同一格点 -> 必须去重
+                seen.add(j)
                 orbit.append((j, o))
         if not orbit:
             orbit = [(i, -1)]
@@ -2104,7 +2132,7 @@ cd /data/wjlu/work/claude/unfold_fs
 1. 折叠关系的推导与行/列约定探测的依据
 2. 展开公式（Popescu）各项的物理含义，以及「副本平均」为何能挑出正确的 G
 3. 相位符号约定 `s1/s2` 的含义与自检判据
-4. 对称操作取交集的判据 `M⁻¹RM ∈ Z³`、`t·M⁻¹ ∈ Z³` 的理由
+4. 对称操作取交集的判据 `M⁻ᵀRMᵀ ∈ Z³` 的理由（spglib 的 R 是**列向量**约定；**不要**用平移做筛选——spglib 给的 t 是模原胞格矢的代表元，会误删操作）
 5. 候选索引置换展开的正确性说明
 6. 实测记录（fixture 的 VASP 6.6.0 参数、单 G 主导度、带隙、与 vaspkit 282 的对照结果）
 
