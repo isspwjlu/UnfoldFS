@@ -13,14 +13,16 @@
 
 KPOINTS 的首行: VASP 按首行的**第一个字符**选择解析分支 —— 'G'/'K' 会走
 "自动生成网格"分支(此时显式 k 点列表被忽略, VASP 自己生成 k 点, 个数与
-顺序都变), 'S'/'C'/'R' 分别是不可约点/笛卡尔/倒格矢分支。故这里把首行写成
-**纯注释**('P' 开头, 不落在任何分支上), 并把 G/M 标签挪进注释里 ——
-零成本, 但保证 VASP 走"显式 k 点列表"分支。
+顺序都变), 'S'/'C'/'R' 分别是不可约点/笛卡尔/倒格矢分支。故首行写成
+**纯注释**('u' 开头, 不落在任何分支上), 并把 G/M 标签挪进注释里 ——
+零成本, 但保证 VASP 走"显式 k 点列表"分支。该首行格式由
+``grid.write_kpoints(..., explicit=True)`` 给出(唯一的事实来源)。
 """
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 from typing import List, Optional, Sequence
 
@@ -32,9 +34,9 @@ from .fsout import (band_edges, make_e_grid, select_fermi_energy, write_bxsf,
                     write_spectral_npz)
 from .geometry import (common_symmetry_ops, read_poscar, read_transmat,
                        reciprocal, resolve_transform)
-from .grid import (build_grid_map, choose_grid_points, filter_ops_by_grid,
-                   load_grid_map, primitive_grid_points, save_grid_map,
-                   write_kpoints)
+from .grid import (GridSpec, build_grid_map, choose_grid_points,
+                   filter_ops_by_grid, load_grid_map, primitive_grid_points,
+                   save_grid_map, write_kpoints)
 from .unfold import build_atom_copies, unfold_supercell
 from .vaspio import read_doscar_fermi, read_eigenval, read_procar
 
@@ -46,6 +48,14 @@ _NPZ_N_POINTS = 401
 
 # 带隙判据(E_F 语义里的"金属 vs 半导体"), 与 fsout 的默认值一致
 _GAP_TOL = 0.05
+
+# E_F 落在带隙里时的**判定阈值**: E_F 离最近的一个态(任意 k, 任意带)超过
+# _EMPTY_FS_SIGMA 个 sigma 时, 谱函数在 E_F 处已经衰减到
+# exp(-d²/2σ²) <= exp(-_EMPTY_FS_SIGMA²/2) ≈ 13% 的峰值 -> 费米面是空的。
+_EMPTY_FS_SIGMA = 2.0
+
+# gen 的默认分辨率(2π/Å); 显式给了 --grid 时不用它
+_DEFAULT_RESOLUTION = 0.02
 
 # 常见元素的价电子数(PAW_PBE 势的典型 ZVAL)—— 只用于**估计** NBANDS。
 # 势函数未指定时无法知道真实 ZVAL, 故这里给一个表 + 未知元素的保守缺省值,
@@ -64,6 +74,9 @@ _VALENCE_ELECTRONS = {
 }
 _DEFAULT_VALENCE = 8
 
+# gen 顺手复制到输出目录的结构文件(unfold 默认从 --dir 里找它们)
+_STRUCTURE_FILES = ("POSCAR", "PRIMCELL.vasp", "TRANSMAT.in")
+
 
 # ------------------------------------------------------------------ 小工具
 
@@ -81,26 +94,58 @@ def _valence_estimate(species: Sequence[str]) -> tuple:
     return nelect, n_bands_prim, sorted(set(unknown))
 
 
-def _write_kpoints_explicit(path: str, grid_map) -> None:
-    """写 KPOINTS(显式 k 点列表)。
+def _nbands_with_margin(n_occ_est: int) -> int:
+    """建议的 NBANDS = 估计占据带数 + 空带余量。
 
-    k 点与权重由 ``grid.write_kpoints`` 给出(唯一的事实来源), 这里只把**首行**
-    换成纯注释形式: VASP 按首行第一个字符选解析分支, 'G'/'K' 会让 VASP 自己
-    生成 k 点(显式列表被忽略)。'P' 开头不落在任何分支上 -> 走显式列表分支。
+    余量取 ``max(10, ceil(0.1 * n_occ))``: 少一条带就会把占据态截断(费米面
+    静默缺态), 而 NBANDS 恰好等于占据带数时一点余量都不留。
     """
-    write_kpoints(path, grid_map)
-    with open(path) as fh:
-        lines = fh.read().splitlines()
-    tag = "G" if grid_map.spec.grid_type == "gamma" else "M"
-    p = grid_map.spec.p
-    lines[0] = (f"Parameters to Generate KPOINTS (Don't Edit This Line) -- "
-                f"explicit k-point list, {tag} grid {p[0]}x{p[1]}x{p[2]}")
-    with open(path, "w", newline="\n") as fh:
-        fh.write("\n".join(lines) + "\n")
+    n_occ = max(int(n_occ_est), 1)
+    return n_occ + max(10, int(np.ceil(0.1 * n_occ)))
+
+
+def _naive_supercell_count(p: Sequence[int],
+                            m_eff: np.ndarray) -> Optional[int]:
+    """朴素超胞网格的点数 ∏(P_i / M_ii)(M 非对角或不可整除时返回 None)。
+
+    这是"不利用对称性时, 超胞 BZ 里 P_i/M_i 个点"的那一套 —— KPOINTS 里
+    写的其实就是它(权重把对称等价点合并进同一个 k)。
+    """
+    m = np.asarray(m_eff, dtype=float)
+    if not np.allclose(m, np.diag(np.diag(m))):
+        return None
+    diag = np.diag(m)
+    if np.any(np.abs(diag - np.rint(diag)) > 1e-8):
+        return None
+    diag = np.rint(diag).astype(int)
+    if np.any(diag <= 0):
+        return None
+    if any(int(p[i]) % int(diag[i]) != 0 for i in range(3)):
+        return None
+    return int(np.prod([int(p[i]) // int(diag[i]) for i in range(3)]))
+
+
+def _is_numeric_ef(mode) -> bool:
+    """--ef 给的是不是一个具体数值(用户明给了 E_F)。"""
+    if isinstance(mode, (int, float, np.floating, np.integer)):
+        return True
+    try:
+        float(mode)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _nearest_state_distance(band, e_f: float) -> float:
+    """E_F 到最近的一个态(任意 k, 任意带)的距离(eV)。"""
+    e = np.asarray(band.energies, dtype=float)
+    if e.size == 0:
+        return float("inf")
+    return float(np.min(np.abs(e - float(e_f))))
 
 
 def _incar_suggested(grid_map, n_bands: int, encut: float, kpar: int,
-                     unknown_species: Sequence[str]) -> str:
+                     unknown_species: Sequence[str], n_occ_est: int) -> str:
     """给出建议的 INCAR 文本。
 
     其中 ``ISYM = 0`` 与 ``LORBIT = 12`` 是**硬要求**:
@@ -122,8 +167,16 @@ def _incar_suggested(grid_map, n_bands: int, encut: float, kpar: int,
         "LORBIT=11 不写相位。",
         "# ISMEAR = 1 + SIGMA = 0.2 是 VASP 默认值: 每个 k 点只需几次 DAV "
         "迭代(实测单核机器上 ~15 s/k 点)。",
-        "#   半导体若要更锐利的费米能, 改成 ISMEAR = 0 + SIGMA = 0.05, "
-        "但收敛会慢一个量级。",
+        "#   展宽只影响带边占据数(带隙体系的带边占据数必然是 0.98 这类小数), "
+        "并不能让费米能更准。",
+        "#   有带隙的体系更推荐 ISMEAR = -5(四面体法): 占据数接近整数, "
+        "没有 DAV 收敛问题;",
+        "#   若改用 ISMEAR = -5, 请同时删掉 SIGMA(四面体法不接受展宽)。",
+        f"# NBANDS = {n_bands} = 估计占据带数 {n_occ_est} + 空带余量 "
+        f"{n_bands - n_occ_est}(至少 10 条)。",
+        "#   NBANDS 由价电子数**估计**得出(表内 ZVAL, Mo=14/S=6 等), "
+        "**请按实际 POTCAR 的 ZVAL 核对**,",
+        "#   或直接用 unfoldfs gen --nbands <N> 覆盖。",
     ]
     if unknown_species:
         head.append(f"# NBANDS 用价电子数**估计**得出(元素 "
@@ -151,6 +204,27 @@ def _incar_suggested(grid_map, n_bands: int, encut: float, kpar: int,
 
 # ------------------------------------------------------------------ gen
 
+def _resolve_grid_spec(prim, tr, resolution: Optional[float],
+                       explicit: Optional[Sequence[int]],
+                       grid_type: str) -> GridSpec:
+    """网格规格: 显式 --grid 优先, 否则按 --resolution 推。
+
+    ``--grid`` 与 ``--resolution`` 互斥(同时给会让人猜到底是哪个生效)。
+    """
+    if explicit is not None:
+        if resolution is not None:
+            raise ValueError(
+                "--grid 与 --resolution 互斥: 只能给其中一个 "
+                "(--grid 显式指定网格, --resolution 按分辨率推)。")
+        p = tuple(int(x) for x in explicit)
+        if any(x < 1 for x in p):
+            raise ValueError(
+                f"--grid 的每一维都必须是 >= 1 的整数, 给出 {p}")
+        return GridSpec(p, grid_type, (0.0, 0.0, 0.0))
+    res = _DEFAULT_RESOLUTION if resolution is None else float(resolution)
+    return choose_grid_points(prim.lattice, tr.m_eff, res, grid_type)
+
+
 def cmd_gen(args: argparse.Namespace) -> int:
     """对称约化网格 -> KPOINTS / grid_map.npz / INCAR.suggested。"""
     prim = read_poscar(args.primcell)
@@ -159,27 +233,47 @@ def cmd_gen(args: argparse.Namespace) -> int:
     b_prim = reciprocal(prim.lattice)
     b_super = reciprocal(sc.lattice)
 
-    spec = choose_grid_points(prim.lattice, tr.m_eff, args.resolution,
-                              args.grid_type)
+    spec = _resolve_grid_spec(prim, tr, args.resolution, args.grid,
+                               args.grid_type)
     grid = primitive_grid_points(spec)
     ops = filter_ops_by_grid(common_symmetry_ops(prim, tr.m_eff), grid)
     gm = build_grid_map(spec, grid, ops, tr, b_prim, b_super)
+
+    # 自洽性: 满网格点数必须等于 n_k · det(M)(expand 的硬性前提)
+    det = int(round(tr.det))
+    if gm.spec.n_points != gm.n_k * det:
+        raise ValueError(
+            f"网格 {gm.spec.p} 与超胞变换不自洽: 满网格点数 "
+            f"{gm.spec.n_points} != n_k·det(M) = {gm.n_k}×{det}。"
+            "请换一个 --grid(每个维度都应是超胞对应维度的整数倍)。")
 
     os.makedirs(args.outdir, exist_ok=True)
     kpoints_path = os.path.join(args.outdir, "KPOINTS")
     gridmap_path = os.path.join(args.outdir, "grid_map.npz")
     incar_path = os.path.join(args.outdir, "INCAR.suggested")
-    _write_kpoints_explicit(kpoints_path, gm)
+    write_kpoints(kpoints_path, gm, explicit=True)
     save_grid_map(gridmap_path, gm)
 
     nelect, n_bands_prim, unknown = _valence_estimate(prim.species)
+    n_occ_est = det * max(n_bands_prim, 1)
     if args.nbands is not None:
         n_bands = int(args.nbands)
     else:
-        # 超胞的占据带数 = det(M) x 原胞的占据带数; 少一条带就会截断占据态
-        n_bands = int(tr.det) * max(n_bands_prim, 1)
-    with open(incar_path, "w", newline="\n") as fh:
-        fh.write(_incar_suggested(gm, n_bands, args.encut, args.kpar, unknown))
+        n_bands = _nbands_with_margin(n_occ_est)
+    with open(incar_path, "w", newline="\n", encoding="utf-8") as fh:
+        fh.write(_incar_suggested(gm, n_bands, args.encut, args.kpar, unknown,
+                                  n_occ_est))
+
+    # 结构文件顺手复制过去: unfold 默认从 --dir 里找它们
+    sources = {"POSCAR": args.supercell, "PRIMCELL.vasp": args.primcell,
+               "TRANSMAT.in": args.transmat}
+    copied = []
+    for name in _STRUCTURE_FILES:
+        src = sources[name]
+        dst = os.path.join(args.outdir, name)
+        if os.path.abspath(src) != os.path.abspath(dst):
+            shutil.copyfile(src, dst)
+            copied.append(dst)
 
     print(f"网格规格      : {spec.p[0]} x {spec.p[1]} x {spec.p[2]} "
           f"({spec.grid_type}), 满网格 {spec.n_points} 点")
@@ -187,14 +281,54 @@ def cmd_gen(args: argparse.Namespace) -> int:
     print(f"实际计算 k 点 : {gm.n_k} (超胞分数坐标), 权重和 = "
           f"{int(gm.k_weight.sum())} == 满网格点数")
     print(f"超胞变换      : det(M) = {tr.det}")
-    print(f"估计电子数    : {nelect} (价电子数估计), NBANDS = {n_bands}")
+    print(f"估计电子数    : {nelect} (价电子数估计), 估计占据带数 = {n_occ_est}, "
+          f"NBANDS = {n_bands}")
     print(f"已写出        : {kpoints_path}")
     print(f"已写出        : {gridmap_path}")
     print(f"已写出        : {incar_path}")
+    for path in copied:
+        print(f"已复制        : {path}")
     return 0
 
 
 # ------------------------------------------------------------------ unfold
+
+def _check_ef_in_gap(band, vbm: float, cbm: float, e_f: float,
+                     sigma: float, numeric_mode: bool):
+    """E_F 是否落在带隙里(落在带隙里 ⇒ 该能量上**没有任何态**)。
+
+    返回 (status, message):
+      "ok"     —— E_F 不在带隙里(或带隙/带边不可得), 无需提示;
+      "near"   —— E_F 在带隙里但离最近的态很近(谱函数在 E_F 处仍有峰),
+                  画的是价带顶附近的等值面;
+      "warn"   —— E_F 在带隙里且谱函数在 E_F 处已可忽略 —— 但用户明给了
+                  这个 E_F(数值模式), 只提示不阻断;
+      "refuse" —— 同上, 但 E_F 是 CLI 自己(或 VASP)选的 => 拒绝执行。
+
+    "离最近的态"的判据: 谱函数 A(k,E) 是高斯, 相对权重 ≈ exp(-d²/2σ²);
+    d > 2σ 时只剩 13%, 画出来的"费米面"基本是空的。
+    """
+    if not (np.isfinite(vbm) and np.isfinite(cbm)):
+        return "ok", ""
+    gap = cbm - vbm
+    if gap <= _GAP_TOL or not (vbm < e_f < cbm):
+        return "ok", ""
+    d = _nearest_state_distance(band, e_f)
+    near = d <= _EMPTY_FS_SIGMA * sigma
+    if near:
+        return "near", (
+            f"E_F = {e_f:.6f} eV 落在带隙内 (VBM={vbm:.6f}, CBM={cbm:.6f}, "
+            f"gap={gap:.6f} eV), 但离最近的态只有 {d:.6f} eV "
+            f"(<= {_EMPTY_FS_SIGMA:g}×sigma) —— 画的是价带顶附近的等值面。")
+    msg = (
+        f"选出的 E_F = {e_f:.6f} eV 落在带隙内 (VBM={vbm:.6f}, "
+        f"CBM={cbm:.6f}, gap={gap:.6f} eV), 离最近的态 {d:.6f} eV "
+        f"(> {_EMPTY_FS_SIGMA:g}×sigma) —— 该能量上没有任何态, "
+        f"产出的费米面是空的。")
+    if numeric_mode:
+        return "warn", msg
+    return "refuse", msg
+
 
 def cmd_unfold(args: argparse.Namespace) -> int:
     """读 VASP 输出 -> 反折叠 -> 对称扩展 -> 写费米面文件。"""
@@ -214,6 +348,16 @@ def cmd_unfold(args: argparse.Namespace) -> int:
         raise ValueError(
             f"VASP 算出的 k 点数 {n_calc} != grid_map 记录 {gm.n_k}。"
             f"请确认 KPOINTS 用的是 gen 写出的文件, 且 INCAR 里 ISYM=0。")
+
+    # NBANDS 事后检查: 最高带被占据 => NBANDS 偏小, 占据态被截断
+    occ = np.asarray(band.occupations, dtype=float)
+    if occ.ndim == 2 and occ.shape[1] > 0:
+        top = float(np.max(occ[:, -1]))
+        if top > 1e-6:
+            print(f"警告: 最高带(第 {occ.shape[1]} 带)的占据数最大为 "
+                  f"{top:.6f} > 0 —— NBANDS 可能偏小, 占据态被截断, "
+                  f"费米面会缺态。请在 INCAR 里加大 NBANDS(建议 "
+                  f"unfoldfs gen --nbands 覆盖)。", file=sys.stderr)
 
     procar = read_procar(os.path.join(run_dir, "PROCAR"))
     if procar.kpoints.shape[0] != gm.n_k:
@@ -254,6 +398,19 @@ def cmd_unfold(args: argparse.Namespace) -> int:
         vbm_txt = f"不可用 ({exc})"
     e_f = select_fermi_energy(dos_ef, band, mode=args.ef, offset=args.delta,
                                gap_tol=_GAP_TOL)
+
+    # ★ 自检: 选出的 E_F 落在带隙里 => 该能量上没有任何态 => 费米面是空的。
+    # 这是"默认路径静默产出空费米面"的最后一道防线(不依赖 is_metal 的判定)。
+    numeric_ef = _is_numeric_ef(args.ef)
+    status, message = _check_ef_in_gap(band, vbm, cbm, e_f, args.sigma,
+                                        numeric_ef)
+    if status == "refuse":
+        raise ValueError(
+            message + "\n      半导体请用 --ef vbm (VBM+delta); "
+            "金属请检查 ISMEAR/展宽设置。已中止, 未写出任何费米面文件。")
+    if status in ("near", "warn"):
+        print(f"提示: {message}", file=sys.stderr)
+
     print(f"相位约定      : s1 = {unfolded.s1:+d}, s2 = {unfolded.s2:+d} "
           f"(单 G 主导度 {unfolded.dominance:.4f})")
     print(f"VBM / CBM     : {vbm_txt}")
@@ -270,6 +427,13 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     npz_path = os.path.join(args.outdir, "A(k,E).npz")
     write_cube(cube_path, expanded, b_prim, values, comments=comments)
     print(f"已写出        : {cube_path}")
+    band_paths = write_fermisurfer_bands(args.outdir, expanded, b_prim, e_f)
+    print(f"已写出        : {os.path.join(args.outdir, 'band.1')} ... "
+          f"band.{len(band_paths)}")
+    e_grid = make_e_grid(e_f, _NPZ_HALF_WIDTH, _NPZ_N_POINTS)
+    write_spectral_npz(npz_path, expanded, b_prim, e_f, vbm=vbm, cbm=cbm,
+                       e_grid=e_grid, sigma=args.sigma)
+    print(f"已写出        : {npz_path}")
     # BXSF 只支持 Gamma 网格(见 docs/formats.md §3): MP 网格下跳过它,
     # 但把原因说清楚 —— 其余输出(FS.cube / band.N / npz)对 MP 网格都成立
     try:
@@ -278,13 +442,6 @@ def cmd_unfold(args: argparse.Namespace) -> int:
         print(f"已跳过        : {bxsf_path} ({exc})")
     else:
         print(f"已写出        : {bxsf_path}")
-    band_paths = write_fermisurfer_bands(args.outdir, expanded, b_prim, e_f)
-    print(f"已写出        : {os.path.join(args.outdir, 'band.1')} ... "
-          f"band.{len(band_paths)}")
-    e_grid = make_e_grid(e_f, _NPZ_HALF_WIDTH, _NPZ_N_POINTS)
-    write_spectral_npz(npz_path, expanded, b_prim, e_f, vbm=vbm, cbm=cbm,
-                       e_grid=e_grid, sigma=args.sigma)
-    print(f"已写出        : {npz_path}")
     return 0
 
 
@@ -309,12 +466,15 @@ def cmd_info(args: argparse.Namespace) -> int:
     gm = load_grid_map(gridmap_path)
     p = gm.spec.p
     ratio = gm.n_k / float(gm.spec.n_points)
+    naive = _naive_supercell_count(p, gm.transform.m_eff)
+    naive_txt = ("n/a (变换矩阵不是对角的)" if naive is None
+                 else f"{naive} 点 (∏(P_i/M_i))")
     print(f"网格规格      : {p[0]} x {p[1]} x {p[2]} ({gm.spec.grid_type})")
     print(f"满网格点数    : {gm.spec.n_points}")
     print(f"对称不可约点  : {gm.n_ir}")
     print(f"实际计算 k 点 : {gm.n_k} (超胞分数坐标)")
-    print(f"约化率        : {gm.n_k}/{gm.spec.n_points} = {ratio:.4f} "
-          f"(约化 {gm.spec.n_points / float(gm.n_k):.2f} 倍)")
+    print(f"朴素超胞网格  : {naive_txt}")
+    print(f"相对原胞满网格: {gm.n_k}/{gm.spec.n_points} = {ratio:.4f}")
     print(f"超胞变换      : det(M) = {gm.transform.det}")
     print(f"KPOINTS 权重和: {int(gm.k_weight.sum())} (应等于满网格点数 "
           f"{gm.spec.n_points})")
@@ -327,13 +487,18 @@ def _add_gen_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--supercell", required=True, help="超胞 POSCAR 路径")
     p.add_argument("--primcell", required=True, help="原胞 PRIMCELL.vasp 路径")
     p.add_argument("--transmat", required=True, help="TRANSMAT.in 路径")
-    p.add_argument("--resolution", type=float, default=0.02,
-                   help="k 网格分辨率, 单位 2π/Å, 按 |b_i| 定义")
+    p.add_argument("--resolution", type=float, default=None,
+                   help="k 网格分辨率, 单位 2π/Å, 按 |b_i| 定义 "
+                        f"(不给则用 {_DEFAULT_RESOLUTION}; 与 --grid 互斥)")
+    p.add_argument("--grid", type=int, nargs=3, default=None,
+                   metavar=("P1", "P2", "P3"),
+                   help="显式指定原胞网格点数(如 --grid 6 6 1), 绕过分辨率"
+                        "规则; 与 --resolution 互斥")
     p.add_argument("--grid-type", choices=("gamma", "mp"), default="gamma",
                    help="网格类型: gamma(Gamma 居中) 或 mp(Monkhorst-Pack)")
     p.add_argument("--outdir", default=".", help="输出目录")
     p.add_argument("--nbands", type=int, default=None,
-                   help="建议 INCAR 里的 NBANDS(不给则按价电子数估计)")
+                   help="建议 INCAR 里的 NBANDS(不给则按价电子数估计 + 余量)")
     p.add_argument("--encut", type=float, default=320.0,
                    help="建议 INCAR 里的 ENCUT (eV)")
     p.add_argument("--kpar", type=int, default=1,
@@ -404,7 +569,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _force_utf8_output()
     parser = build_parser()
     args = parser.parse_args(argv)
-    return int(args.func(args))
+    try:
+        return int(args.func(args))
+    except (FileNotFoundError, ValueError) as exc:
+        # 顶层兜底: 缺文件 / 参数不自洽 这类**用户错误**不该甩一脸 traceback
+        print(f"错误: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
