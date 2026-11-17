@@ -21,11 +21,18 @@
   用固定 gset 会给出错误的候选;
 * 副本平移 T 以**原胞格矢**为单位;
 * 原胞 k 全部用 EIGENVAL 的分数坐标(PROCAR 的 k 与之逐位相同)。
+
+**相位约定的择优口径必须与原型一致**: 原型只在 首 min(4, n_k) 个 k ×
+首 min(n_band, 40) 条带 上评估 4 种约定(见 ``CONVENTION_SAMPLE_N_K`` /
+``CONVENTION_SAMPLE_N_BAND``)。用"全部 k × 全部带"择优在 fixture 上会选出
+**不同**的约定(评审实测: 164/240 个 (k,带) 的候选归属改变 -> 重组后的能带
+结构, 即费米面, 随之改变)。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Tuple
+import warnings
+from dataclasses import dataclass, replace
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -33,8 +40,9 @@ from .geometry import Structure, Transform
 from .vaspio import BandData, ProcarData
 
 __all__ = [
-    "AtomCopies", "UnfoldedResult", "build_atom_copies", "candidate_g_for_k",
-    "unfold_at_k", "select_phase_convention", "unfold_supercell",
+    "AtomCopies", "UnfoldedResult", "DominanceReport", "build_atom_copies",
+    "candidate_g_for_k", "unfold_at_k", "select_phase_convention",
+    "unfold_supercell",
 ]
 
 # 相位符号约定的 4 种组合 (s1 作用于副本平移项, s2 作用于原胞 k 相位项)
@@ -42,6 +50,21 @@ CONVENTIONS: Tuple[Tuple[int, int], ...] = ((1, 1), (1, -1), (-1, 1), (-1, -1))
 
 # 单 G 主导度下限: 低于此值说明态没有被集中到唯一一个候选 G 上 -> 展开不可信
 MIN_DOMINANCE = 0.5
+
+# 相位约定择优的**采样口径**(与原型 unfold_procar.py 一致):
+# 只在 首 min(4, n_k) 个 k × 首 min(n_band, 40) 条带 上评估 4 种约定。
+CONVENTION_SAMPLE_N_K = 4
+CONVENTION_SAMPLE_N_BAND = 40
+
+# 统计每态主导度时的最小总权重(原型: sw > 1e-12 才计入)
+_MIN_STATE_WEIGHT = 1e-12
+
+# winner 与 runner-up 的**相对**主导度差小于此值 -> 约定选择落在退化区
+# (由噪声驱动, 换一批采样就可能换一个约定) -> 必须告警, 不能静默
+MIN_CONVENTION_MARGIN_REL = 1e-3
+
+# "好"的每态主导度阈值(真实 VASP 数据实测 0.85~1.0)
+DOMINANCE_GOOD = 0.85
 
 # 原子副本匹配容差(分数坐标下的整数性判据)
 _COPY_TOL = 1e-6
@@ -69,12 +92,42 @@ class AtomCopies:
 
 
 @dataclass(frozen=True)
+class DominanceReport:
+    """单 G 主导度的分布 + 相位约定择优的判别性诊断。
+
+    分布(全量权重 pass 上, 每个 (k,带) 是一个"态"):
+        mean / min / median     主导度的均值 / 最小 / 中位数
+        frac_above_good         主导度 > DOMINANCE_GOOD(=0.85) 的态占比
+    择优诊断(采样口径上, 顺序同 CONVENTIONS):
+        scores                  4 种约定的主导度
+        selection_score         winner 的主导度
+        runner_up_score         runner-up 的主导度
+        margin / margin_rel     winner - runner_up 及其相对值
+        degenerate              margin_rel < MIN_CONVENTION_MARGIN_REL
+                               -> 选择由噪声驱动(已告警)
+    """
+
+    mean: float = float("nan")
+    min: float = float("nan")
+    median: float = float("nan")
+    frac_above_good: float = float("nan")
+    scores: Tuple[float, ...] = ()
+    selection_score: float = float("nan")
+    runner_up_score: float = float("nan")
+    margin: float = float("nan")
+    margin_rel: float = float("nan")
+    degenerate: bool = False
+
+
+@dataclass(frozen=True)
 class UnfoldedResult:
     """一个超胞 k 点集合的展开结果。
 
     k_cand   (n_k, detM, 3)  每个计算点的候选原胞 k(分数坐标)
     energies (n_k, detM, n_band_eff)  候选内按能量升序排列的带能量
     weights  (n_k, detM, n_band_eff)  对应权重; 补位处权重 0、能量 +inf
+    valid    (n_k, detM, n_band_eff)  有效位掩码: 补位槽为 False
+             (下游若对带轴做 argmin/求最小值, 必须用它排除 +inf 补位槽)
     """
 
     k_cand: np.ndarray
@@ -83,6 +136,8 @@ class UnfoldedResult:
     s1: int = 1               # 采用的相位符号约定
     s2: int = 1
     dominance: float = float("nan")   # 选定约定下的单 G 主导度(均值)
+    valid: Optional[np.ndarray] = None
+    dominance_report: Optional[DominanceReport] = None
 
 
 @dataclass(frozen=True)
@@ -137,9 +192,15 @@ def candidate_g_for_k(k_super_frac: np.ndarray, m_eff: np.ndarray,
     K+g = v·M^T (v ∈ [0,1)³), 即 u_j = Σ_i v_i·M_ji, 故 |g_j| ≤ Σ_i|M_ji| + 1。
     用 max|M| 给界会漏掉离对角元素大的矩阵的候选(实测 300 个随机 M 中有 ~11%
     漏候选, 行和界后降到 0)。
+
+    入口先把 K 折回 [0,1)³(``k = k % 1``): 上面那条界隐含 K ∈ [0,1)³ 的假设,
+    K 落在第一布里渊区之外时(如 -0.2 / 10.3)候选会落在搜索范围之外而找不到。
+    折回不改变候选的**分数值**: K -> K+n(整数) 时候选集平移 g -> g-n, 而
+    (K+n+g-n)·(M^-1)^T ≡ (K+g)·(M^-1)^T; 相位项也用同一个折回后的 K
+    (见 ``_candidate_k``), 保证候选集合与相位自洽。
     """
     m = np.asarray(m_eff, dtype=float)
-    k = np.asarray(k_super_frac, dtype=float)
+    k = np.mod(np.asarray(k_super_frac, dtype=float), 1.0)
     m_inv_T = np.asarray(m_inv_T, dtype=float)
     spans = np.abs(m).sum(axis=1).astype(int) + 1          # 每轴的行和界
     axes = [np.arange(-s, s + 1, dtype=int) for s in spans]
@@ -182,9 +243,12 @@ def _candidate_k(k_super_frac: np.ndarray, m_eff: np.ndarray,
                  b_super: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """候选 g、候选原胞 k(分数) 与 (k'−K) 的笛卡尔差。"""
     g = candidate_g_for_k(k_super_frac, m_eff, m_inv_T)
-    k_frac = (np.asarray(k_super_frac, dtype=float) + g) @ m_inv_T
+    # 与 candidate_g_for_k 用**同一个** K(折回 [0,1)³) —— 否则候选集合与
+    # 相位项不自洽(VASP 的 KPOINTS 本身就在 [0,1)³ 内, 此时折回是恒等变换)。
+    k = np.mod(np.asarray(k_super_frac, dtype=float), 1.0)
+    k_frac = (k + g) @ m_inv_T
     k_cart = k_frac @ b_prim
-    k_super_cart = np.asarray(k_super_frac, dtype=float) @ b_super
+    k_super_cart = k @ b_super
     return g, k_frac, k_cart - k_super_cart
 
 
@@ -216,15 +280,6 @@ def _dominance(w: np.ndarray) -> np.ndarray:
     ok = tot > 0
     out[ok] = mx[ok] / tot[ok]
     return out
-
-
-def _mean_dominance(w: np.ndarray) -> float:
-    """主导度对所有(权重非零的)带取平均; w 的形状是 (..., detM, nb)。"""
-    dom = _dominance(w)
-    valid = w.sum(axis=-2) > 0
-    if not valid.any():
-        return 0.0
-    return float(dom[valid].mean())
 
 
 def _check_transform(tr: Transform, m_eff: np.ndarray) -> None:
@@ -262,25 +317,73 @@ def unfold_at_k(k_super_frac: np.ndarray, coeffs: np.ndarray,
     return k_frac, e, w
 
 
-def _best_convention(doms: np.ndarray) -> Tuple[int, int, float]:
-    """从 4 种约定的主导度里选最优的, 并做两项自检。
+def _evaluate_conventions(samples: List[Tuple[np.ndarray, np.ndarray]],
+                          cp: _CopyArrays, tr: Transform, m_eff: np.ndarray,
+                          a_prim: np.ndarray, prim_cart: np.ndarray,
+                          b_prim: np.ndarray, b_super: np.ndarray) -> np.ndarray:
+    """在给定的采样上评估 4 种相位约定的平均单 G 主导度。
+
+    samples: [(k_frac (3,), coeffs (n_band, n_ions, norb)), ...]
+        每个元素是一组 (k, 该 k 上参与统计的带)。
+    返回 (4,) 数组, 顺序同 ``CONVENTIONS``。
+
+    每个 (k, 带) 的主导度 = max_g W / Σ_g W(总权重 > 1e-12 才计入, 与原型
+    ``unfold_procar.py`` 的 ``if sw > 1e-12`` 一致), 再对全部样本取平均。
+    """
+    scores = np.zeros(len(CONVENTIONS))
+    for ci, (s1, s2) in enumerate(CONVENTIONS):
+        doms = []
+        for k_frac, coeffs in samples:
+            _, w = _weight_matrix(k_frac, coeffs, cp, tr, m_eff, a_prim,
+                                  prim_cart, b_prim, b_super, s1, s2)
+            keep = w.sum(axis=0) > _MIN_STATE_WEIGHT
+            if keep.any():
+                doms.append(_dominance(w)[keep])
+        scores[ci] = float(np.concatenate(doms).mean()) if doms else 0.0
+    return scores
+
+
+def _choose_convention(scores: np.ndarray) -> Tuple[int, int, DominanceReport]:
+    """从 4 种约定里择优, 并做三项检查。
 
     1. 主导度 < MIN_DOMINANCE -> 抛错: 展开没有把态集中到唯一一个候选 G 上,
        此时的谱函数不可信;
-    2. 4 种约定给不出区分(主导度完全相同) -> 抛错: 相位约定本身没有意义。
+    2. 4 种约定给不出区分(主导度完全相同) -> 抛错: 相位约定本身没有意义;
+    3. winner 与 runner-up 的相对差 < MIN_CONVENTION_MARGIN_REL -> **告警**:
+       选择落在退化区(噪声驱动), 必须让用户看见而不是静默接受。
     """
-    doms = np.asarray(doms, dtype=float)
-    best = int(np.argmax(doms))
+    scores = np.asarray(scores, dtype=float)
+    order = np.argsort(-scores, kind="stable")
+    best, second, worst = int(order[0]), int(order[1]), int(order[-1])
     s1, s2 = CONVENTIONS[best]
-    if doms[best] < MIN_DOMINANCE:
+    if scores[best] < MIN_DOMINANCE:
         raise ValueError(
-            f"单 G 主导度 {doms[best]:.4f} < {MIN_DOMINANCE} —— "
+            f"单 G 主导度 {scores[best]:.4f} < {MIN_DOMINANCE} —— "
             "展开没有把态集中到唯一一个候选 G 上, 相位约定/副本平均不可信")
-    if doms[best] <= doms.min() + 1e-12:
+    if scores[best] - scores[worst] <= 1e-12:
         raise ValueError(
             "4 种相位约定没有区分度(主导度完全相同) —— 相位约定无法确定, "
             "展开结果没有意义")
-    return int(s1), int(s2), float(doms[best])
+    margin = float(scores[best] - scores[second])
+    margin_rel = margin / scores[best] if scores[best] > 0 else 0.0
+    degenerate = bool(margin_rel < MIN_CONVENTION_MARGIN_REL)
+    report = DominanceReport(
+        scores=tuple(float(x) for x in scores),
+        selection_score=float(scores[best]),
+        runner_up_score=float(scores[second]),
+        margin=margin,
+        margin_rel=float(margin_rel),
+        degenerate=degenerate,
+    )
+    if degenerate:
+        warnings.warn(
+            f"相位约定择优落在退化区: winner=({s1:+d},{s2:+d}) 主导度 "
+            f"{scores[best]:.6f}, runner-up 主导度 {scores[second]:.6f}, "
+            f"相对差仅 {margin_rel:.2e} < {MIN_CONVENTION_MARGIN_REL:.0e} —— "
+            "选出的约定由噪声主导(换一批采样就可能换一个约定), 结果不可复现; "
+            "请检查展开输入或扩大采样",
+            UserWarning, stacklevel=3)
+    return int(s1), int(s2), report
 
 
 def select_phase_convention(k_super_frac: np.ndarray, coeffs: np.ndarray,
@@ -294,6 +397,11 @@ def select_phase_convention(k_super_frac: np.ndarray, coeffs: np.ndarray,
     返回 (s1, s2, 主导度)。主导度 < 0.5 视为失败(抛错): 展开没有把态集中到
     唯一一个候选 G 上, 此时的谱函数不可信。4 种约定给不出区分时同样抛错 ——
     那说明相位约定本身没有意义。
+
+    口径: **单个 k**、该 k 的全部带(能量非有限的带不参与统计)。
+    生产路径(``unfold_supercell``)用的是原型口径 —— 首 min(4, n_k) 个 k ×
+    首 min(n_band, 40) 条带 —— 见 ``CONVENTION_SAMPLE_N_K``。
+    两者共用同一套评分/择优实现(``_evaluate_conventions`` + ``_choose_convention``)。
     """
     _check_transform(tr, m_eff)
     coeffs = np.asarray(coeffs)
@@ -305,18 +413,22 @@ def select_phase_convention(k_super_frac: np.ndarray, coeffs: np.ndarray,
     cp = _copy_arrays(copies, a_prim)
     # 能量非有限的带是坏数据, 不参与主导度统计
     good = np.isfinite(energies)
-    doms = []
-    for s1, s2 in CONVENTIONS:
-        _, w = _weight_matrix(k_super_frac, coeffs, cp, tr, m_eff,
-                               a_prim, prim_cart, b_prim, b_super, s1, s2)
-        doms.append(_mean_dominance(w[:, good]) if good.any()
-                    else _mean_dominance(w))
-    return _best_convention(np.array(doms))
+    samples = [(np.asarray(k_super_frac, dtype=float),
+                coeffs[good] if good.any() else coeffs)]
+    scores = _evaluate_conventions(samples, cp, tr, m_eff, a_prim, prim_cart,
+                                   b_prim, b_super)
+    s1, s2, _ = _choose_convention(scores)
+    return s1, s2, float(scores[CONVENTIONS.index((s1, s2))])
 
 
 def _match_k(target: np.ndarray, source: np.ndarray,
              tol: float = _K_TOL) -> np.ndarray:
-    """把 target 的每个 k 匹配到 source 中周期距离最近的 k(下标)。"""
+    """把 target 的每个 k 匹配到 source 中周期距离最近的 k(下标)。
+
+    匹配必须**单射**: 两个不同的目标 k 不能落到同一个源 k 上 ——
+    否则会静默复用同一组系数, 展开结果悄悄错掉。源 k 点集合缺一个点时,
+    这里报"塌缩"而不是笼统的"找不到"。
+    """
     t = np.mod(np.atleast_2d(np.asarray(target, dtype=float)), 1.0)
     s = np.mod(np.atleast_2d(np.asarray(source, dtype=float)), 1.0)
     d = np.abs(t[:, None, :] - s[None, :, :])
@@ -326,10 +438,19 @@ def _match_k(target: np.ndarray, source: np.ndarray,
     best = dist[np.arange(t.shape[0]), idx]
     bad = np.nonzero(best > tol)[0]
     if bad.size:
+        i = int(bad[0])
+        # 塌缩检测: 是否有**另一个**目标 k 也匹配到了同一个源 k?
+        others = np.nonzero((idx == idx[i]) & (np.arange(t.shape[0]) != i))[0]
+        if others.size:
+            j = int(others[0])
+            raise ValueError(
+                f"两个不同的目标 k ({t[j].tolist()} 与 {t[i].tolist()}) 匹配到了"
+                f"同一个源 k(下标 {int(idx[i])}) —— 匹配发生塌缩, 会静默复用同一"
+                "组系数; 检查 EIGENVAL/PROCAR 的 k 点集合是否有重复或缺失")
         raise ValueError(
-            f"k 点 {np.asarray(target, dtype=float)[bad[0]].tolist()} 在 "
+            f"k 点 {np.asarray(target, dtype=float)[i].tolist()} 在 "
             "EIGENVAL/PROCAR 里找不到(周期距离 "
-            f"{best[bad[0]]:.2e} > {tol:.0e}) —— k 点集合与计算结果不一致")
+            f"{best[i]:.2e} > {tol:.0e}) —— k 点集合与计算结果不一致")
     return idx
 
 
@@ -337,14 +458,26 @@ def unfold_supercell(band: BandData, procar: ProcarData, tr: Transform,
                      copies: AtomCopies, m_eff: np.ndarray,
                      a_prim: np.ndarray, prim_cart: np.ndarray,
                      b_prim: np.ndarray, b_super: np.ndarray,
-                     k_super_list: np.ndarray) -> UnfoldedResult:
+                     k_super_list: np.ndarray,
+                     strict_dominance: bool = False) -> UnfoldedResult:
     """展开整个超胞 k 点集合, 并做候选重组。
 
     k_super_list = grid_map.k_super(长度 n_k)
 
     候选重组: 每条超胞带归属到权重最大的候选; 候选内按能量升序排列 ——
     于是重组后的第 n 条带就是该候选上的第 n 条原胞带(原胞带序号在对称
-    变换下不变, 故逐带输出自洽)。不足 n_band_eff 的候选用权重 0、能量 +inf 补位。
+    变换下不变, 故逐带输出自洽)。不足 n_band_eff 的候选用权重 0、能量 +inf 补位,
+    并在 ``UnfoldedResult.valid`` 里标出哪些槽位是有效的。
+
+    相位约定择优用**原型口径**(首 min(4, n_k) 个 k × 首 min(n_band, 40) 条带,
+    见 ``CONVENTION_SAMPLE_N_K`` / ``CONVENTION_SAMPLE_N_BAND``): 已验证的
+    原型 ``unfold_procar.py`` 就是这么选的; 用"全部 k × 全部带"择优在 fixture 上
+    会选出**不同**的约定(164/240 个 (k,带) 的候选归属改变 -> 费米面改变)。
+    选定约定后只做**一次**全量权重 pass。
+
+    strict_dominance: True 时要求**每个态**的单 G 主导度都 >= MIN_DOMINANCE
+        (简报自检①的严格版)。默认关闭 —— 合成 fixture 上有 10.8% 的态低于
+        0.5, 严格版会误报; 真实 VASP 数据上应当打开。
     """
     _check_transform(tr, m_eff)
     k_list = np.atleast_2d(np.asarray(k_super_list, dtype=float))
@@ -352,25 +485,54 @@ def unfold_supercell(band: BandData, procar: ProcarData, tr: Transform,
     det_m = tr.det
     band_idx = _match_k(k_list, band.kpoints)
     pro_idx = _match_k(k_list, procar.kpoints)
-    n_band = min(band.energies.shape[1], procar.coeffs.shape[1])
+    n_band_eig = band.energies.shape[1]
+    n_band_pro = procar.coeffs.shape[1]
+    n_band = min(n_band_eig, n_band_pro)
     if n_band == 0:
         raise ValueError("EIGENVAL / PROCAR 里没有可用的带")
+    if n_band_eig != n_band_pro:
+        warnings.warn(
+            f"EIGENVAL 有 {n_band_eig} 条带而 PROCAR 有 {n_band_pro} 条 —— "
+            f"只展开前 {n_band} 条(取两者的最小值); 两个文件的带数不一致, "
+            "请检查计算输出", UserWarning, stacklevel=2)
 
     cp = _copy_arrays(copies, a_prim)
-    # 4 种相位约定下的权重矩阵 (4, n_k, detM, n_band)
-    w_all = np.zeros((len(CONVENTIONS), n_k, det_m, n_band))
-    for ci, (s1, s2) in enumerate(CONVENTIONS):
-        for ik in range(n_k):
-            _, w = _weight_matrix(k_list[ik],
-                                    procar.coeffs[pro_idx[ik], :n_band],
-                                    cp, tr, m_eff, a_prim, prim_cart,
-                                    b_prim, b_super, s1, s2)
-            w_all[ci, ik] = w
-    doms = np.array([_mean_dominance(w_all[ci])
-                     for ci in range(len(CONVENTIONS))])
-    s1, s2, dominance = _best_convention(doms)
 
-    w_best = w_all[CONVENTIONS.index((s1, s2))]
+    # --- 相位约定择优: 原型口径的采样(首 4 个 k × 首 40 条带)
+    k_sel = list(range(min(CONVENTION_SAMPLE_N_K, n_k)))
+    band_sel = np.arange(min(CONVENTION_SAMPLE_N_BAND, n_band))
+    samples = [(k_list[ik], procar.coeffs[pro_idx[ik], band_sel])
+               for ik in k_sel]
+    scores = _evaluate_conventions(samples, cp, tr, m_eff, a_prim, prim_cart,
+                                   b_prim, b_super)
+    s1, s2, report = _choose_convention(scores)
+
+    # --- 单次全量权重 pass(只算选中的约定)
+    w_best = np.zeros((n_k, det_m, n_band))
+    for ik in range(n_k):
+        _, w = _weight_matrix(k_list[ik], procar.coeffs[pro_idx[ik], :n_band],
+                              cp, tr, m_eff, a_prim, prim_cart, b_prim, b_super,
+                              s1, s2)
+        w_best[ik] = w
+
+    # --- 每态主导度的分布 + 聚合下限(硬错)
+    dom = _dominance(w_best)                       # (n_k, n_band)
+    states = dom[w_best.sum(axis=1) > 0]
+    if states.size == 0:
+        raise ValueError("所有候选的权重都是 0 —— 展开结果为空")
+    dominance = float(states.mean())
+    if dominance < MIN_DOMINANCE:
+        raise ValueError(
+            f"全量展开的平均单 G 主导度 {dominance:.4f} < {MIN_DOMINANCE} —— "
+            "展开没有把态集中到唯一一个候选 G 上, 相位约定/副本平均不可信")
+    report = replace(report, mean=dominance, min=float(states.min()),
+                      median=float(np.median(states)),
+                      frac_above_good=float(np.mean(states > DOMINANCE_GOOD)))
+    if strict_dominance and float(states.min()) < MIN_DOMINANCE:
+        raise ValueError(
+            f"严格每态主导度下限: 最差的态只有 {states.min():.4f} < "
+            f"{MIN_DOMINANCE} —— 展开把态摊到了多个候选 G 上, 谱函数不可信")
+
     e_all = np.asarray(band.energies, dtype=float)[band_idx, :n_band]
     k_cand = np.zeros((n_k, det_m, 3))
     for ik in range(n_k):
@@ -392,14 +554,15 @@ def unfold_supercell(band: BandData, procar: ProcarData, tr: Transform,
             counts[ik, j] = order.size
         per_cand.append(row)
     n_band_eff = int(counts.max())
-    if n_band_eff == 0:
-        raise ValueError("所有候选的权重都是 0 —— 展开结果为空")
     energies = np.full((n_k, det_m, n_band_eff), np.inf)
     weights = np.zeros((n_k, det_m, n_band_eff))
+    valid = np.zeros((n_k, det_m, n_band_eff), dtype=bool)
     for ik in range(n_k):
         for j in range(det_m):
             e, w = per_cand[ik][j]
             energies[ik, j, :e.size] = e
             weights[ik, j, :e.size] = w
+            valid[ik, j, :e.size] = True
     return UnfoldedResult(k_cand=k_cand, energies=energies, weights=weights,
-                           s1=int(s1), s2=int(s2), dominance=float(dominance))
+                           s1=int(s1), s2=int(s2), dominance=dominance,
+                           valid=valid, dominance_report=report)

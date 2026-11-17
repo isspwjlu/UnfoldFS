@@ -5,12 +5,15 @@ fixture = 3x3x1 MoS2 超胞 (27 原子) + 原胞 (3 原子), M = diag(3,3,1), de
   * Γ 点最低带: 9 个候选中第 0 个单 G 主导(主导度 1.0), 其余权重 ~1e-33;
   * k=(0.1,0,0) 第 32 带: 4 种相位约定的主导度差异最大(0.52 / 0.96 / 0.98 / 0.70)。
 """
+import warnings
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 from unfoldfs.geometry import (candidate_g_vectors, read_poscar, read_transmat,
                                reciprocal, resolve_transform)
-from unfoldfs.unfold import (build_atom_copies, candidate_g_for_k,
+from unfoldfs.unfold import (CONVENTIONS, build_atom_copies, candidate_g_for_k,
                              select_phase_convention, unfold_at_k,
                              unfold_supercell)
 from unfoldfs.vaspio import read_eigenval, read_procar
@@ -79,6 +82,25 @@ def _naive_weights(k_frac, coeffs, copies, m_eff, a_prim, prim_cart,
                 cvec[i] = acc / len(lst)
             out[gi, bi] = float(np.abs(np.sum(cvec * ph[:, None])) ** 2)
     return g, out
+
+
+def _unfold_supercell(fx, k_list=None, band=None, procar=None,
+                      suppress_warnings=True, **kwargs):
+    """跑 unfold_supercell。
+
+    fixture 上相位约定的择优落在**退化区**(两个"好"约定只差 0.1%), 模块会
+    告警 —— 这里默认收声(需要检查告警时传 suppress_warnings=False)。
+    """
+    args = (band if band is not None else fx["band"],
+            procar if procar is not None else fx["procar"],
+            fx["tr"], fx["copies"], fx["m_eff"], fx["a_prim"], fx["prim_cart"],
+            fx["b_prim"], fx["b_super"],
+            fx["band"].kpoints if k_list is None else k_list)
+    if not suppress_warnings:
+        return unfold_supercell(*args, **kwargs)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        return unfold_supercell(*args, **kwargs)
 
 
 # ------------------------------------------------------------------ 副本表
@@ -318,9 +340,7 @@ def test_select_phase_convention_raises_when_conventions_are_indistinguishable()
 def test_unfold_supercell_shapes_and_candidate_consistency():
     fx = _fixture()
     k_list = fx["band"].kpoints
-    res = unfold_supercell(fx["band"], fx["procar"], fx["tr"], fx["copies"],
-                            fx["m_eff"], fx["a_prim"], fx["prim_cart"],
-                            fx["b_prim"], fx["b_super"], k_list)
+    res = _unfold_supercell(fx, k_list)
     n_k, det_m = k_list.shape[0], 9
     assert res.k_cand.shape == (n_k, det_m, 3)
     assert res.energies.shape[:2] == (n_k, det_m)
@@ -336,9 +356,7 @@ def test_unfold_supercell_recombination_assigns_each_band_to_one_candidate():
     """候选重组: 每条超胞带只归属到权重最大的那一个候选, 候选内按能量排序。"""
     fx = _fixture()
     k_list = fx["band"].kpoints
-    res = unfold_supercell(fx["band"], fx["procar"], fx["tr"], fx["copies"],
-                            fx["m_eff"], fx["a_prim"], fx["prim_cart"],
-                            fx["b_prim"], fx["b_super"], k_list)
+    res = _unfold_supercell(fx, k_list)
     for ik, k in enumerate(k_list):
         assigned = 0
         for j in range(9):
@@ -365,3 +383,204 @@ def test_unfold_supercell_rejects_k_point_absent_from_eigenval():
                           fx["m_eff"], fx["a_prim"], fx["prim_cart"],
                           fx["b_prim"], fx["b_super"],
                           np.array([[0.123, 0.456, 0.0]]))
+
+
+# ==================================================================
+# fix round 1/5 —— 相位约定的**生产路径**必须与已验证原型同口径
+#
+# 评审 Important 1: 旧的 unfold_supercell 用**全部 k × 全部带**择优,
+# 原型 unfold_procar.py 只用 **首 4 个 k × 首 40 条带**; 两者在 fixture 上
+# 选出**不同**的约定 -> 164/240 个 (k,带) 的候选归属改变 -> 重组后的
+# 能带结构(即费米面)随之改变。
+# ==================================================================
+
+def _prototype_convention_scores(fx):
+    """照抄原型 unfold_procar.py 的 [conv] 择优循环(独立代码路径)。
+
+    原型口径: k 取前 min(4, nk) 个, 带取前 min(nband, 40) 条;
+    每个 (k, 带) 算单 G 主导度 max(w)/sum(w)(总权重 > 1e-12 才计入),
+    最后对全部样本取平均。
+    """
+    nk = fx["band"].kpoints.shape[0]
+    nband = fx["band"].energies.shape[1]
+    scores = {}
+    for (s1, s2) in CONVENTIONS:
+        peaks = []
+        for ik in range(min(4, nk)):
+            k = fx["band"].kpoints[ik]
+            for ib in range(min(nband, 40)):
+                _, w = _naive_weights(k, fx["procar"].coeffs[ik, ib:ib + 1],
+                                      fx["copies"], fx["m_eff"], fx["a_prim"],
+                                      fx["prim_cart"], fx["b_prim"], fx["b_super"],
+                                      s1, s2)
+                ws = w[:, 0]
+                sw = ws.sum()
+                if sw > 1e-12:
+                    peaks.append(ws.max() / sw)
+        scores[(s1, s2)] = float(np.mean(peaks))
+    return scores
+
+
+def test_unfold_supercell_selects_the_same_convention_as_the_validated_prototype():
+    """约定择优的生产路径必须与原型 unfold_procar.py 同口径(评审 Important 1)。
+
+    原型在 fixture 上选 (s1=-1, s2=+1); 旧的"全部 k × 全部带"口径会选 (1,-1),
+    两者在 164/240 个 (k,带) 上候选归属不同。
+    """
+    fx = _fixture()
+    proto = _prototype_convention_scores(fx)
+    assert max(proto, key=proto.get) == (-1, 1)
+    res = _unfold_supercell(fx)
+    assert (res.s1, res.s2) == (-1, 1)
+    # 模块的 4 个分数与原型的 [conv] 指标逐位相同
+    for i, conv in enumerate(CONVENTIONS):
+        assert res.dominance_report.scores[i] == pytest.approx(
+            proto[conv], rel=1e-9, abs=1e-12)
+
+
+def test_unfold_supercell_matches_naive_reference_on_the_full_path():
+    """交叉核对改走 unfold_supercell 全路径(评审 Important 1)。
+
+    报告 §4 原来的比对只在 unfold_at_k 层**手工指定**约定, 从没走过生产路径;
+    这里用**独立**的朴素实现(照抄原型公式)重算权重, 再走一遍候选重组,
+    要求重组后的 (E, w) 与模块逐位一致。
+    """
+    fx = _fixture()
+    res = _unfold_supercell(fx)
+    for ik in range(fx["band"].kpoints.shape[0]):
+        k = fx["band"].kpoints[ik]
+        _, w_naive = _naive_weights(k, fx["procar"].coeffs[ik], fx["copies"],
+                                    fx["m_eff"], fx["a_prim"], fx["prim_cart"],
+                                    fx["b_prim"], fx["b_super"], res.s1, res.s2)
+        assign = w_naive.argmax(axis=0)
+        for j in range(9):
+            sel = np.nonzero(assign == j)[0]
+            sel = sel[np.argsort(fx["band"].energies[ik, sel], kind="stable")]
+            n = sel.size
+            assert np.allclose(res.energies[ik, j, :n],
+                               fx["band"].energies[ik, sel], rtol=0, atol=1e-12)
+            assert np.allclose(res.weights[ik, j, :n], w_naive[j, sel],
+                               rtol=1e-9, atol=1e-20)
+            # 补位槽必须被 valid 掩码标出来
+            assert not res.valid[ik, j, n:].any()
+
+
+def test_unfold_supercell_convention_choice_changes_candidate_assignment():
+    """记录约定选择的分量: 两种口径选出的约定在 164/240 个 (k,带) 上归属不同。
+
+    这正是旧实现"改的是费米面本身"的量化证据。
+    """
+    fx = _fixture()
+    assign = {}
+    for conv in ((1, -1), (-1, 1)):
+        rows = []
+        for ik in range(fx["band"].kpoints.shape[0]):
+            _, _, w = _unfold(fx, fx["band"].kpoints[ik], fx["procar"].coeffs[ik],
+                              conv[0], conv[1])
+            rows.append(w.argmax(axis=0))
+        assign[conv] = rows
+    diff = sum(int((assign[(1, -1)][ik] != assign[(-1, 1)][ik]).sum())
+               for ik in range(len(assign[(1, -1)])))
+    assert diff == 164
+
+
+def test_unfold_supercell_reports_convention_margin_and_flags_degenerate_choice():
+    """winner 与 runner-up 的 margin 必须随结果输出(评审 Important 2)。
+
+    fixture 上两个"好"约定只差 0.1% —— 落在退化区, 选择是噪声驱动的,
+    必须**可见**(告警), 不能静默。
+    """
+    fx = _fixture()
+    with pytest.warns(UserWarning, match="退化"):
+        res = _unfold_supercell(fx, suppress_warnings=False)
+    rep = res.dominance_report
+    assert rep.margin > 0
+    assert rep.margin_rel == pytest.approx(rep.margin / rep.selection_score)
+    assert rep.runner_up_score < rep.selection_score
+    assert rep.degenerate is True
+    assert rep.margin_rel < 1e-3
+
+
+def test_unfold_supercell_reports_per_state_dominance_distribution():
+    """每态主导度的分布(min / median / frac>0.85)必须随结果输出(评审 Important 3)。"""
+    fx = _fixture()
+    res = _unfold_supercell(fx)
+    rep = res.dominance_report
+    doms = []
+    for ik in range(fx["band"].kpoints.shape[0]):
+        _, _, w = _unfold(fx, fx["band"].kpoints[ik], fx["procar"].coeffs[ik],
+                          res.s1, res.s2)
+        tot = w.sum(axis=0)
+        doms.extend(_dominance(w)[tot > 0].tolist())
+    doms = np.array(doms)
+    assert rep.mean == pytest.approx(doms.mean())
+    assert rep.min == pytest.approx(doms.min())
+    assert rep.median == pytest.approx(np.median(doms))
+    assert rep.frac_above_good == pytest.approx(np.mean(doms > 0.85))
+    assert res.dominance == pytest.approx(doms.mean())
+
+
+def test_unfold_supercell_strict_dominance_flag_enforces_per_state_floor():
+    """严格开关(简报自检①的严格版): 每个态的主导度都必须 >= 0.5。
+
+    默认关闭 —— fixture 是合成数据, 有 10.8% 的态低于 0.5, 严格版会误报;
+    真实 VASP 数据上应打开。
+    """
+    fx = _fixture()
+    res = _unfold_supercell(fx)
+    assert res.dominance_report.min < 0.5      # fixture 上确实有态不达标
+    with pytest.raises(ValueError, match="每态"):
+        _unfold_supercell(fx, strict_dominance=True)
+
+
+def test_unfold_supercell_returns_valid_mask_for_padding_slots():
+    """补位槽(能量 +inf、权重 0)必须被有效位掩码标出来, 否则下游 argmin 会选中它。"""
+    fx = _fixture()
+    res = _unfold_supercell(fx)
+    assert res.valid is not None
+    assert res.valid.shape == res.energies.shape
+    assert np.array_equal(res.valid, res.weights > 0)
+    assert np.all(np.isinf(res.energies[~res.valid]))
+    assert np.all(np.isfinite(res.energies[res.valid]))
+    # 确实存在补位槽(否则这条测试没有意义)
+    assert not res.valid.all()
+
+
+def test_unfold_supercell_warns_when_eigenval_and_procar_band_counts_differ():
+    """EIGENVAL 与 PROCAR 的带数不一致时必须告警, 不能静默截断。"""
+    fx = _fixture()
+    procar = replace(fx["procar"],
+                     coeffs=fx["procar"].coeffs[:, :100],
+                     weights=fx["procar"].weights[:, :100])
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _unfold_supercell(fx, procar=procar, suppress_warnings=False)
+    msgs = [str(w.message) for w in caught]
+    assert any("PROCAR" in m and "条带" in m for m in msgs), msgs
+
+
+def test_unfold_supercell_reports_k_match_collapse_instead_of_silent_reuse():
+    """两个不同的目标 k 落到同一个源 k(源 k 点集合缺一个)时必须报错。
+
+    否则会静默复用同一组系数 -> 展开结果悄悄错掉。
+    """
+    fx = _fixture()
+    band = replace(fx["band"], kpoints=fx["band"].kpoints[:1])   # 只留 Γ
+    with pytest.raises(ValueError, match="塌缩"):
+        _unfold_supercell(fx, band=band, k_list=fx["band"].kpoints)
+
+
+def test_candidate_g_for_k_is_robust_to_k_outside_the_first_bz():
+    """K 落在 [0,1)³ 之外时(如 -0.2 / 10.3)也必须给出同一组候选分数值。
+
+    候选集的搜索范围按 |M| 行和给界, 该界隐含假设 K ∈ [0,1)³。
+    """
+    fx = _fixture()
+    k = np.array([0.37, 0.62, 0.0])
+    g = candidate_g_for_k(k, fx["m_eff"], fx["tr"].m_inv.T)
+    ref = sorted(map(tuple, np.round((k + g) @ fx["tr"].m_inv.T, 9)))
+    for k_shift in (k + 1.0, k - 1.0, k + 10.0, k + np.array([1.0, -1.0, 2.0])):
+        g2 = candidate_g_for_k(k_shift, fx["m_eff"], fx["tr"].m_inv.T)
+        got = sorted(map(tuple, np.round(
+            (np.mod(k_shift, 1.0) + g2) @ fx["tr"].m_inv.T, 9)))
+        assert got == ref
