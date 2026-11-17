@@ -315,22 +315,32 @@ def build_grid_map(spec: GridSpec, grid: np.ndarray, ops: SymmetryOps,
     )
 
 
-def write_kpoints(path: str, grid_map: GridMap) -> None:
+def write_kpoints(path: str, grid_map: GridMap, *, explicit: bool = False) -> None:
     """VASPKIT/标准 VASP「特殊点 + 重数」格式。
 
     写出的行 = **去重后的超胞 k 点**(每个不同的超胞 k 只算一次),
     权重 = 折到该 k 的满网格点数(权重之和 == 满网格点数)。
 
     实测: VASP 把 "Reciprocal lattice" 之后的行按 k 点读(不是倒格矢)。
+
+    ``explicit=True``: 首行写成**纯注释**(以 'u' 开头), 不落在 VASP 的任何
+    分支关键字('G'/'K'/'S'/'C'/'R')上 —— 保证 VASP 走"显式 k 点列表"分支,
+    而不是自己按首行重新生成网格(k 点的个数与顺序都会变)。首行格式的
+    唯一事实来源就是这里(不要在调用方再改一遍)。
     """
     tag = "G" if grid_map.spec.grid_type == "gamma" else "M"
     p = grid_map.spec.p
     res = grid_resolution(grid_map.b_prim, grid_map.spec)
     k_super = grid_map.k_super
     weights = grid_map.k_weight
-    with open(path, "w") as fh:
-        fh.write(f"{tag}    {p[0]}    {p[1]}    {p[2]}    {res:.3f}"
-                 f"     # Parameters to Generate KPOINTS (Don't Edit This Line)\n")
+    if explicit:
+        header = (f"unfoldfs: explicit k-point list (do not edit) -- "
+                  f"{tag} grid {p[0]}x{p[1]}x{p[2]}")
+    else:
+        header = (f"{tag}    {p[0]}    {p[1]}    {p[2]}    {res:.3f}"
+                  f"     # Parameters to Generate KPOINTS (Don't Edit This Line)")
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(header + "\n")
         fh.write(f"   {k_super.shape[0]}\n")
         fh.write("Reciprocal lattice\n")
         for k, w in zip(k_super, weights):
