@@ -4,7 +4,7 @@ import pytest
 from unfoldfs.geometry import (
     Structure, read_poscar, reciprocal, read_transmat,
     resolve_transform, matrix_denominator_lcm, candidate_g_vectors,
-    common_symmetry_ops,
+    common_symmetry_ops, periodic_delta,
 )
 from tests.conftest import (
     DATA_DIR, FIXTURE_POSCAR, FIXTURE_PRIMCELL, FIXTURE_TRANSMAT,
@@ -435,3 +435,128 @@ def test_candidate_g_vectors_error_message_reports_range_and_expected_count():
     assert "候选 G 数 4" in msg
     assert "期望 2" in msg
     assert "搜索区间" in msg
+
+
+# ------------------------------------------------------------------ 动量作用公式
+# (C2) SymmetryOps.apply 的动量作用必须是 **R^-1**, 不是 R^T。
+# 判据: **笛卡尔几何真值**(与分数基的行/列约定无关):
+#   分数基下的旋转 R(spglib 的列向量约定 x' = R x)对应笛卡尔旋转
+#   Q = A^-1 · R^T · A(行向量作用 r' = r·Q); 倒空间随之 k' = k·Q。
+# 分数基**不是**正交阵 ⇒ "R 的转置 = R 的逆"不成立。
+
+def _fixture_ops():
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    sc = read_poscar(str(FIXTURE_POSCAR))
+    tr = resolve_transform(sc, prim, read_transmat(str(FIXTURE_TRANSMAT)))
+    return prim, tr, common_symmetry_ops(prim, tr.m_eff)
+
+
+def test_symmetry_ops_apply_matches_the_cartesian_geometry_truth():
+    """apply() 的动量作用 = k·R^-1(笛卡尔几何真值裁决)。"""
+    prim, _tr, ops = _fixture_ops()
+    a = np.asarray(prim.lattice, dtype=float)
+    b = reciprocal(a)
+    b_inv = np.linalg.inv(b)
+    ks = [np.array([0.1, 0.2, 0.3]), np.array([0.0, 0.0, 0.0]),
+          np.array([0.5, 0.25, 0.75]), np.array([1 / 3, 2 / 3, 1 / 3])]
+    n_checked = 0
+    for i in range(ops.rotations.shape[0]):
+        r = np.asarray(ops.rotations[i])
+        q = np.linalg.inv(a) @ r.T @ a            # 笛卡尔旋转(行向量作用)
+        assert np.allclose(q @ q.T, np.eye(3), atol=1e-8), "Q 必须是正交阵"
+        for k in ks:
+            truth = np.mod((k @ b) @ q @ b_inv, 1.0)
+            got = ops.apply(k, i)
+            # 容差 1e-6: spglib 的平移代表元带 ~3e-8 残差(apply 含 +t,
+            # 而平移不改变倒空间的 k —— 这一项残差是唯一的偏差来源)。
+            # 比较必须用**周期距离**: 0.99999997 与 0.0 是同一个点
+            assert periodic_delta(got, truth).max() < 1e-6, (
+                f"op{i}: apply 与笛卡尔几何真值不符\n"
+                f"  真值 {truth.tolist()}\n  实得 {got.tolist()}")
+            n_checked += 1
+    assert n_checked >= 12 * 4
+
+
+def test_symmetry_ops_apply_is_not_the_transpose_formula():
+    """反例: 旧公式 k·R^T 在**非正交分数基**下与真值不符(判别力)。
+
+    若哪天有人把 apply 改回 R^T(或 R), 这条测试会立刻抓住 ——
+    48 个样本里只有 16 个(R^T)/32 个(R)与真值一致。
+    """
+    prim, _tr, ops = _fixture_ops()
+    a = np.asarray(prim.lattice, dtype=float)
+    b = reciprocal(a)
+    b_inv = np.linalg.inv(b)
+    ks = [np.array([0.1, 0.2, 0.3]), np.array([0.5, 0.25, 0.75]),
+          np.array([1 / 3, 2 / 3, 1 / 3]), np.array([0.2, 0.4, 0.6])]
+    n_rt, n_r, n_total = 0, 0, 0
+    for i in range(ops.rotations.shape[0]):
+        r = np.asarray(ops.rotations[i])
+        q = np.linalg.inv(a) @ r.T @ a
+        for k in ks:
+            truth = np.mod((k @ b) @ q @ b_inv, 1.0)
+            n_total += 1
+            n_rt += int(periodic_delta(np.mod(k @ r.T, 1.0), truth).max() < 1e-6)
+            n_r += int(periodic_delta(np.mod(k @ r, 1.0), truth).max() < 1e-6)
+    assert n_total >= 12 * 4
+    # 转置写法必然与真值大面积不符(否则这条测试没有判别力)
+    assert n_rt < n_total
+    assert n_r < n_total
+
+
+def test_rotation_inverse_is_exact_for_unimodular_matrices():
+    """整数阵的逆必须**精确**是整数阵(下游全是整数性判据)。"""
+    from unfoldfs.geometry import rotation_inverse
+    r = np.array([[1, 0, 0], [1, -1, 0], [0, 0, 1]])
+    inv = rotation_inverse(r)
+    assert inv.dtype.kind == "i"
+    assert np.array_equal(inv @ r, np.eye(3, dtype=int))
+
+
+# ------------------------------------------------------------------ POSCAR 格式
+
+def test_read_poscar_rejects_the_vasp4_format_with_a_clear_message(tmp_path):
+    """VASP-4 格式(第 6 行是原子数, 没有元素符号行)必须给出**可操作**的报错。
+
+    旧实现会掉进 ``int("Direct")`` 的 ValueError, 用户完全看不懂。
+    """
+    text = FIXTURE_PRIMCELL.read_text(encoding="utf-8").splitlines()
+    v4 = text[:5] + text[6:]          # 去掉元素符号行 -> VASP-4 格式
+    path = tmp_path / "POSCAR_v4"
+    path.write_text("\n".join(v4) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError) as excinfo:
+        read_poscar(str(path))
+    msg = str(excinfo.value)
+    assert "VASP-4" in msg
+    assert "VASP-5" in msg
+    assert "元素符号" in msg
+
+
+# ------------------------------------------------------------------ 对称操作剔除项
+
+def test_common_symmetry_ops_detailed_reports_the_dropped_operations():
+    """被剔除的对称操作必须**带着原因**返回(spec §7: info 里要列出)。"""
+    from unfoldfs.geometry import common_symmetry_ops_detailed
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    # 换一个与 C3 不相容的超胞(几何真值: 只剩 4 个操作)
+    m_bad = np.array([[2, 1, 0], [0, 2, 0], [0, 0, 1]])
+    ops, dropped = common_symmetry_ops_detailed(prim, m_bad)
+    assert ops.rotations.shape[0] == 4
+    assert len(dropped) == 8
+    for _r, _t, why in dropped:
+        assert why and "M^-T" in why
+
+
+def test_pyproject_requires_a_spglib_with_the_dict_api():
+    """I2: 代码用 spglib **>= 2.0 的 dict API**(sym["rotations"]),
+    依赖声明必须一致 —— 否则"装得上、跑起来炸"(TypeError: tuple indices...)。"""
+    import pathlib
+    import re
+    root = pathlib.Path(__file__).resolve().parent.parent
+    text = (root / "pyproject.toml").read_text(encoding="utf-8")
+    m = re.search(r'"spglib\s*([><=!~][^"]*)"', text)
+    assert m, "pyproject.toml 里没有 spglib 的依赖声明"
+    spec = m.group(1)
+    assert "2.0" in spec, (
+        f"spglib 的依赖声明是 {spec!r}, 但代码用的是 >= 2.0 的 dict API "
+        "(sym['rotations']) —— 声明与实现不一致")

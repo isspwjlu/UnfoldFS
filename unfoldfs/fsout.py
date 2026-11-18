@@ -208,10 +208,14 @@ def select_fermi_energy(dos_ef: float, band: BandData, mode: str = "auto",
     取了带隙中央的 DOSCAR E_F ⇒ 费米面是空的)。真正的判据是"该带的占据数
     在 k 上**跨过** 0.5"(见 ``has_fermi_crossing``)。
 
-    **只有 ``auto`` 与 ``vbm`` 需要 EIGENVAL**: 数值与 ``doscar`` 模式完全不
-    碰 EIGENVAL —— 用户明明白白给了 E_F, 不该被一个用不上的 EIGENVAL 挡住。
-    ``auto`` 模式若 EIGENVAL 里没有占据态(VBM 不可得), 退化到 DOSCAR 的 E_F
-    并给出明确 warning(不静默)。
+    **E_F 的选取**只有 ``auto`` 与 ``vbm`` 需要 EIGENVAL 的**占据数**: 数值与
+    ``doscar`` 模式**不使用**占据数 —— 用户明明白白给了 E_F, 不该被一个用不上的
+    占据数挡住。``auto`` 模式若 EIGENVAL 里没有占据态(VBM 不可得), 退化到
+    DOSCAR 的 E_F 并给出明确 warning(不静默)。
+
+    ⚠ **但反折叠本身始终需要 EIGENVAL 的带能量**(PROCAR 里没有能量) ⇒
+    ``unfold`` 命令整体仍然要求 EIGENVAL 存在; 缺文件时 CLI 给出按模式区分的
+    可操作报错(见 ``cli._read_eigenval_needed``), 而不是裸的 OSError。
     """
     if isinstance(mode, str):
         key = mode.strip().lower()

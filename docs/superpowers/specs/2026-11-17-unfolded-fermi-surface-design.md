@@ -1,7 +1,27 @@
 # 设计规格：超胞反折叠费米面计算工具（unfoldfs）
 
+> ⚠ **本文档是历史设计稿（2026-11-17），不是实现的权威。**
+> **实现与文档的权威是 [`docs/algorithms.md`](../../algorithms.md)**（算法、约定、
+> 实测数字）与 [`docs/formats.md`](../../formats.md)（输出文件的逐字段规范）。
+> 本 spec 的若干条已被后续裁定（Ruling）取代，逐条指针见下表。
+>
+> | spec 条目 | 现状 | 权威出处 |
+> |---|---|---|
+> | §2 术语（倒空间用 `M⁻¹`） | 已被 **Ruling 8** 取代：倒空间用 **`M⁻ᵀ`**，且对称操作的动量作用是 **`k·R⁻¹`**（不是 `k·Rᵀ`） | algorithms.md §1.1 / §1.2a |
+> | §3.2 CLI 列出的 `[--shift 0 0 0]` | **未实现**（CLI 无此参数，`GridSpec.shift` 恒为 0） | algorithms.md §3.1 |
+> | §4.1 `grid_map.npz` 的键名 | 键名已改（`ir_K`→`ir_k_prim`、`M`→`m_eff`、`Gset`→`gset`，另有 `k_super`；`M_inv` 不存而是重算）；另新增 `dropped_*`（被剔除的对称操作） | `unfoldfs/grid.py` 的 `save_grid_map` |
+> | §4.2 `unfolded.npz` 的键名 | 中间产物改名为 **`A(k,E).npz`**，键名是 `band_e`（非 `band_E`）、无 `is_metal`（改用 `has_fermi_crossing`） | algorithms.md §13 |
+> | §5.1 公共对称集 S | 旋转判据仍是 `M⁻ᵀ·R·Mᵀ ∈ Z³`；平移不参与筛选 | algorithms.md §2 |
+> | §5.2 网格与约化 | 全局 LCM 是**过约束**（**Ruling 21**：只上报未改），逃生口是 `unfoldfs gen --grid` | algorithms.md §14 第 1 条 |
+> | §5.5 费米能级处理 | 金属判据改为**费米穿越**（**Ruling 27**：`has_fermi_crossing`，不是"有分数占据"）；`FS.grd` 已删除（**Ruling 17**） | algorithms.md §9.2 / §13 |
+> | §7 错误处理 | "被剔除的对称操作在 `info` 中列出"**已实现**（`保留 N / 剔除 M（原因: …）`） | `unfoldfs/cli.py` 的 `cmd_info` |
+> | §8 测试策略 | "A(k',E) 对称不变"这条测试**已写**，但实测**为假**（当前是 xfail 的回归锁）：展开谱权重在点群下不协变 | algorithms.md §15 |
+> | §8 验收 | "与 VASPKIT 282 逐条对照"**未做**（vaspkit 262/282 与本方法没有接口）；验收基准是与已验证原型 `unfold_procar.py` 的全路径对照 | algorithms.md §11.1 / §11.3 |
+>
+> 其余部分（背景、目标、非目标、模块边界、算法推导）仍是有效的设计依据。
+
 - 日期：2026-11-17
-- 状态：待评审
+- 状态：**历史设计稿**（实现见 `docs/algorithms.md`）
 - 目标平台：master 服务器 (210.73.16.15)，Python 3.9 (anaconda3)，VASP 6.6.0
 - 现状：已有原型脚本在 `F:\cc-haha_projects\unfold_band_fs\`，本 spec 描述将其重构为可复用工具
 
@@ -103,7 +123,7 @@ POSCAR(超胞) + PRIMCELL.vasp + TRANSMAT.in
 
 ```bash
 unfoldfs gen    --supercell POSCAR --primcell PRIMCELL.vasp --transmat TRANSMAT.in \
-                 --resolution 0.02 --grid-type gamma [--shift 0 0 0] --outdir run/
+                 --resolution 0.02 --grid-type gamma --outdir run/   # [--shift]: 未实现
 unfoldfs unfold --dir run/ --supercell POSCAR --primcell PRIMCELL.vasp --transmat TRANSMAT.in \
                  [--ef auto|vbm|<数值>] [--delta 0.05] [--sigma 0.06] --outdir fs/
 unfoldfs info   --dir run/

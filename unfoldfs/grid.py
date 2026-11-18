@@ -125,18 +125,32 @@ class _PeriodicIndex:
         return out
 
 
-def filter_ops_by_grid(ops: SymmetryOps, grid: np.ndarray,
-                       tol: Optional[float] = None) -> SymmetryOps:
-    """只保留把网格映射到自身的操作(平移也必须落在网格上)。"""
+def filter_ops_by_grid_detailed(ops: SymmetryOps, grid: np.ndarray,
+                                 tol: Optional[float] = None):
+    """只保留把网格映射到自身的操作 —— 并报告被剔除的操作与原因。
+
+    返回 (保留的 ops, [(旋转, 平移, 原因), ...])。
+    """
     index = _PeriodicIndex(grid, tol=tol)
     keep_r, keep_t = [], []
+    dropped = []
     for i in range(ops.rotations.shape[0]):
         if np.all(index.find(ops.apply(grid, i)) >= 0):
             keep_r.append(ops.rotations[i])
             keep_t.append(ops.translations[i])
+        else:
+            dropped.append((ops.rotations[i], ops.translations[i],
+                            "该操作不把当前网格映射到自身(平移没落在网格上)"))
     if not keep_r:
         raise ValueError("没有操作保持该网格不变, 请调整网格点数/类型")
-    return SymmetryOps(np.array(keep_r), np.array(keep_t))
+    return SymmetryOps(np.array(keep_r), np.array(keep_t)), dropped
+
+
+def filter_ops_by_grid(ops: SymmetryOps, grid: np.ndarray,
+                       tol: Optional[float] = None) -> SymmetryOps:
+    """只保留把网格映射到自身的操作(平移也必须落在网格上)。"""
+    kept, _dropped = filter_ops_by_grid_detailed(ops, grid, tol=tol)
+    return kept
 
 
 def decompose_grid(grid: np.ndarray, ops: SymmetryOps,
@@ -254,6 +268,8 @@ class GridMap:
     b_prim: np.ndarray
     b_super: np.ndarray
     gset: np.ndarray            # (detM,3) 候选折叠矢量
+    # 被剔除的对称操作 [(旋转, 平移, 原因), ...] —— 供 `info` 打印
+    dropped: Tuple[Tuple[np.ndarray, np.ndarray, str], ...] = ()
 
     @property
     def n_ir(self) -> int:
@@ -264,11 +280,6 @@ class GridMap:
         return int(self.k_super.shape[0])
 
     @property
-    def ir_k_super(self) -> np.ndarray:
-        """各 IR 点的超胞像(= k_super[ir_to_k])。"""
-        return self.k_super[self.ir_to_k]
-
-    @property
     def k_weight(self) -> np.ndarray:
         """每个超胞 k 折到的满网格点数(= KPOINTS 里写出的权重)。"""
         return np.bincount(self.full_to_k, minlength=self.k_super.shape[0])
@@ -276,7 +287,9 @@ class GridMap:
 
 def build_grid_map(spec: GridSpec, grid: np.ndarray, ops: SymmetryOps,
                    transform: Transform, b_prim: np.ndarray, b_super: np.ndarray,
-                   tol: Optional[float] = None) -> GridMap:
+                   tol: Optional[float] = None,
+                   dropped: Tuple[Tuple[np.ndarray, np.ndarray, str], ...] = ()
+                   ) -> GridMap:
     """组装 GridMap: 轨道分解 + 超胞 k 去重 + 索引映射 + 候选折叠矢量。
 
     grid  : 原胞分数坐标的满网格点(primitive_grid_points 的输出)
@@ -312,6 +325,7 @@ def build_grid_map(spec: GridSpec, grid: np.ndarray, ops: SymmetryOps,
         b_prim=b_prim,
         b_super=b_super,
         gset=candidate_g_vectors(transform.m_eff),
+        dropped=tuple(dropped),
     )
 
 
@@ -368,6 +382,11 @@ def save_grid_map(path: str, grid_map: GridMap) -> None:
         b_prim=grid_map.b_prim,
         b_super=grid_map.b_super,
         gset=grid_map.gset,
+        dropped_rotations=np.array([d[0] for d in grid_map.dropped],
+                                   dtype=int).reshape(len(grid_map.dropped), 3, 3),
+        dropped_translations=np.array([d[1] for d in grid_map.dropped],
+                                      dtype=float).reshape(len(grid_map.dropped), 3),
+        dropped_reasons=np.array([d[2] for d in grid_map.dropped]),
     )
 
 
@@ -378,6 +397,11 @@ def load_grid_map(path: str) -> GridMap:
     tr = Transform(m_eff, np.linalg.inv(m_eff.astype(float)))
     spec = GridSpec(tuple(int(x) for x in d["spec_p"]), str(d["spec_type"]),
                      tuple(float(x) for x in d["spec_shift"]))
+    dropped = []
+    if "dropped_rotations" in d.files:
+        for r, t, why in zip(d["dropped_rotations"], d["dropped_translations"],
+                             d["dropped_reasons"]):
+            dropped.append((r, t, str(why)))
     return GridMap(
         spec=spec,
         ir_k_prim=d["ir_k_prim"],
@@ -393,4 +417,5 @@ def load_grid_map(path: str) -> GridMap:
         b_prim=d["b_prim"],
         b_super=d["b_super"],
         gset=d["gset"],
+        dropped=tuple(dropped),
     )

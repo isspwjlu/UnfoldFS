@@ -345,3 +345,95 @@ def test_expand_on_the_real_unfold_pipeline():
     a = build_spectral_function(exp, e_grid, 0.2)
     assert a.shape == (gm.spec.n_points, e_grid.size)
     assert np.all(np.isfinite(a))
+
+
+# ------------------------------------------------------------------ 点群协变性
+# (C1) spec §8 要求: **扩展后的 A(k',E) 在每个对称操作下数值不变**(阈值 1e-8)。
+# 实测: 该性质**为假** —— 谱权重在点群下不协变(最大相对偏差 ~1.0)。
+# 这里把这条要求**原样写成测试**: 它现在是红的(xfail), 作为回归锁留着。
+
+def _point_group_deviation(gm, grid, a):
+    """每个对称操作下 A(k,E) 与 A(k',E) 的最大相对偏差。"""
+    from unfoldfs.geometry import periodic_distance, rotation_inverse
+    devs = {}
+    for o in range(gm.ops.rotations.shape[0]):
+        r = gm.ops.rotations[o]
+        t = gm.ops.translations[o]
+        img = np.mod(grid @ rotation_inverse(r) + t, 1.0)
+        d = periodic_distance(grid, img)
+        j = d.argmin(axis=1)
+        on = np.nonzero(d[np.arange(grid.shape[0]), j] < 1e-6)[0]
+        rel = [np.abs(a[i] - a[j[i]]).max()
+               / max(a[i].max(), a[j[i]].max(), 1e-300) for i in on]
+        devs[o] = float(max(rel)) if rel else 0.0
+    return devs
+
+
+def _fixture_pipeline_spectrum():
+    """fixture 的真实 PROCAR -> unfold -> 扩展 -> A(k,E)(与端到端测试同口径)。"""
+    prim, sc, tr = _fixture_geometry()
+    gm, grid = _grid_map()
+    band = read_eigenval(str(FIXTURE_EIGENVAL))
+    procar = read_procar(str(FIXTURE_PROCAR))
+    copies = build_atom_copies(prim, sc, tr)
+    n_k = gm.n_k
+    band2 = replace(band, kpoints=gm.k_super.copy(),
+                     energies=np.repeat(band.energies[:1], n_k, axis=0))
+    procar2 = replace(procar, kpoints=gm.k_super.copy(),
+                      coeffs=np.repeat(procar.coeffs[:1], n_k, axis=0),
+                      weights=np.repeat(procar.weights[:1], n_k, axis=0))
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        res = unfold_supercell(band2, procar2, tr, copies, tr.m_eff,
+                                prim.lattice, prim.positions @ prim.lattice,
+                                reciprocal(prim.lattice),
+                                reciprocal(sc.lattice), gm.k_super)
+    exp = expand_to_full_grid(res, gm)
+    a = build_spectral_function(exp, np.linspace(-20.0, 10.0, 61), 0.2)
+    return gm, grid, a
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="C1(已知缺陷, 未修): 展开后的 A(k,E) 在晶体点群下**不**协变 —— "
+           "谱权重在对称相关点之间不一致(实测最大相对偏差 ~1.0, 即一个谱峰被"
+           "映到 0)。机制与实测见 docs/algorithms.md §14 与 §15。"
+           "修好之后请把本条改成普通断言(并删掉下面两条锁)。")
+def test_expanded_spectral_function_is_invariant_under_the_point_group():
+    """spec §8: 扩展后 A(k',E) 在每个对称操作下数值不变(<= 1e-8)。"""
+    gm, grid, a = _fixture_pipeline_spectrum()
+    devs = _point_group_deviation(gm, grid, a)
+    assert devs, "没有可比的对称操作"
+    worst = max(devs.values())
+    assert worst <= 1e-8, (
+        f"A(k,E) 在点群下不协变: 最大相对偏差 {worst:.3e} "
+        f"(逐操作: { {k: f'{v:.3e}' for k, v in devs.items()} })")
+
+
+def test_point_group_covariance_defect_stays_within_the_documented_band():
+    """把已知缺陷的**量级**锁住: fixture 上 12 个操作的偏差都是 ~1.0。
+
+    这条锁的是"缺陷还在、且没有变本加厉" —— 缺陷若被修好, 上面那条 xfail 会
+    变成 XPASS(strict) 而报错, 这条也会失败 ⇒ 两者一起提醒人更新文档。
+    """
+    gm, grid, a = _fixture_pipeline_spectrum()
+    devs = _point_group_deviation(gm, grid, a)
+    worst = max(devs.values())
+    assert worst >= 0.5, (
+        f"协变性偏差只有 {worst:.3e} —— 缺陷可能被修好了(或数据变了), "
+        "请更新 docs/algorithms.md §14/§15 与本文件的 xfail 标记")
+    assert worst <= 1.0 + 1e-9
+
+
+def test_the_symmetry_invariance_test_is_still_present():
+    """回归锁: spec §8 要求的那条对称不变性测试不能被悄悄删掉。
+
+    删掉它 = 取消了对"费米面存在对称性破缺"的公开披露 ⇒ 必须变红。
+    """
+    import pathlib
+    import re
+    src = pathlib.Path(__file__).read_text(encoding="utf-8")
+    # 必须匹配**行首**的函数定义(本断言自身的字符串不算)
+    found = re.search(r"^def test_expanded_spectral_function_"
+                      r"is_invariant_under_the_point_group\(", src, re.M)
+    assert found, "对称不变性测试被删掉了 —— 必须保留它作为回归锁"

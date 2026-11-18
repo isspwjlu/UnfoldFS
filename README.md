@@ -32,7 +32,7 @@ python -m unfoldfs.cli info --help
 | Python | **≥ 3.9** | 开发机实测 3.11.7；服务器 master 实跑用的是 3.9.13 |
 | numpy | ≥ 1.20 | |
 | scipy | ≥ 1.6 | 周期 KD-tree（网格点匹配） |
-| spglib | ≥ 1.15 | 原胞点群（spglib ≥ 2.0 的 dict API） |
+| spglib | **≥ 2.0** | 原胞点群（代码用 **spglib ≥ 2.0 的 dict API**：`sym["rotations"]`；1.x 的 tuple API 会直接 `TypeError`） |
 | VASP | **6.6.0**（实测） | 只用来产生输入（`EIGENVAL` / `PROCAR` / `DOSCAR`） |
 | VESTA 3.5.8 / XCrySDen 1.5.60 / FermiSurfer 2.2.1 | 可选 | **消费方**，用来打开输出的费米面文件 |
 
@@ -40,6 +40,11 @@ python -m unfoldfs.cli info --help
 
 > 服务器 master 的实测环境：Python 3.9.13（numpy 1.23.5 / scipy 1.13.1 /
 > spglib 2.0.2）、VASP `vasp.6.6.0 06Mar2026`。
+>
+> ⚠ **服务器上装本包要注意 setuptools**：本项目的构建要求 `setuptools>=77`，
+> 而 master 的 anaconda3 是 **67.6.1** ⇒ 要么先 `pip install -U setuptools`，
+> 要么允许 pip 联网（**默认的 build isolation 会自动拉一个新 setuptools**，
+> 可行）；`pip install -e . --no-build-isolation` 在没升级 setuptools 时会失败。
 
 ---
 
@@ -88,7 +93,7 @@ unfoldfs unfold --dir DIR [--supercell SUPERCELL] [--primcell PRIMCELL] [--trans
 
 | 参数 | 必填 | 默认 | 说明 |
 |---|---|---|---|
-| `--dir` | ✔ | — | VASP 计算目录（须含 `EIGENVAL` / `PROCAR` / `DOSCAR` / `grid_map.npz`） |
+| `--dir` | ✔ | — | VASP 计算目录（须含 `EIGENVAL` / `PROCAR` / `grid_map.npz`；**`DOSCAR` 仅 `--ef auto\|doscar` 需要**） |
 | `--supercell` | | `<dir>/POSCAR` | |
 | `--primcell` | | `<dir>/PRIMCELL.vasp` | |
 | `--transmat` | | `<dir>/TRANSMAT.in` | |
@@ -124,8 +129,9 @@ unfoldfs unfold --dir DIR [--supercell SUPERCELL] [--primcell PRIMCELL] [--trans
 unfoldfs info --dir DIR [--grid-map GRID_MAP]
 ```
 
-打印网格规格、满网格点数、不可约点数、实际计算的 k 点数、朴素超胞网格点数
-（∏(P_i/M_i)）、相对原胞满网格的比例、`det(M)`、KPOINTS 权重和。
+打印网格规格、满网格点数、不可约点数、实际计算的 k 点数、**对称操作的
+保留/剔除数与原因**、朴素超胞网格点数（∏(P_i/M_i)；算不出来时给**具体原因**）、
+相对原胞满网格的比例、`det(M)`、KPOINTS 权重和。
 
 ---
 
@@ -185,6 +191,7 @@ unfoldfs unfold --dir run/ --outdir fs/ --ef vbm
 ```
 
 ```
+（节选 —— 实际输出还有"提示:"开头的 stderr 行与"估计电子数"等行）
 相位约定      : s1 = -1, s2 = +1 (单 G 主导度 0.8936)
 VBM / CBM     : -1.490480 / 0.131685 eV
 E_F           : -1.440480 eV  (--ef vbm, --delta 0.05)
@@ -267,6 +274,7 @@ unfoldfs unfold --dir run/ --ef auto --outdir fs/
 ```
 
 ```
+（节选 —— 实际输出还有"估计电子数 / 已写出 / 已复制"几行）
 相位约定      : s1 = +1, s2 = -1 (单 G 主导度 0.9035)
 VBM / CBM     : -1.568592 / -1.359436 eV (金属: 表观值, 有限 k 网格的采样假象)
 E_F           : -1.377658 eV  (--ef auto, --delta 0.05)
@@ -276,6 +284,10 @@ E_F           : -1.377658 eV  (--ef auto, --delta 0.05)
 已写出        : fs/A(k,E).npz
 已写出        : fs/FS.bxsf
 ```
+
+> ⚠ **"费米面非空"只说明"这个能量上有态"，不等于"等值面的形状可信"** ——
+> 展开谱权重在点群下不协变（对称相关点的谱函数最大差 **100 %**），
+> 见 §7 第 8 条与 [`docs/algorithms.md`](docs/algorithms.md) §15。
 
 > ⚠ **`band.N` 的编号是能量升序**：`band.1` 是最低的深带（**不跨** E_F：
 > 绝对能量 −16.2163 … −14.1675 eV，相对 E_F 是 −14.7559 … −12.7071）。
@@ -356,6 +368,14 @@ VASPKIT 的能带反折叠与费米面两个模块**没有交点**：
    （相对差 1.55e-4 < 1e-3 ⇒ 不可复现），6×6×1 只有 **1/36** 个网格点超过
    50 %·A_max ⇒ **E_F 的选取已修对**（§4b），但**费米面的形状**仍受 k 采样
    限制 —— 要定量形状必须把超胞 BZ 采得更密。
+8. ⚠ **费米面的形状有对称性破缺（实测最大相对偏差 ~1.0）**：展开后的谱权重
+   `A(k,E)` 在晶体点群下**不协变** —— 对称相关的两个 k 点，谱函数可以差到
+   **100 %**（一个谱峰被映到 0）。**能带能量不受影响**（对称相关点的带能量
+   吻合到 8e-6 eV），受影响的只是**权重在 k 上的分配**。
+   ⇒ **能量、带的连接、费的拓扑（有几个口袋）、E_F 的选取是可靠的；
+   等值面的形状与对称性不是** —— 不要用本工具的费米面图去量"各向异性"、
+   "口袋面积"、"对称性破缺"这类结论。
+   实测数字、已排除的可能与机制分析 → [`docs/algorithms.md`](docs/algorithms.md) §15。
 
 完整的限制清单与全部实测数字 → [`docs/algorithms.md`](docs/algorithms.md) §14。
 

@@ -280,12 +280,18 @@ BXSF / FermiSurfer 的网格是**规则**的，无法留空，故按下面规则
 
 ## 7. 费米能（E_F）选取
 
-| 模式 | 语义 | 需要 EIGENVAL？ |
+| 模式 | 语义 | E_F 的选取需要 EIGENVAL 的**占据数**？ |
 |---|---|---|
 | `auto`（默认） | **先判费米穿越**（金属），再看带隙（见下） | 是（不可用时退化到 DOSCAR 的 E_F 并 warning） |
 | `vbm` | 总是 VBM + 偏移 | 是 |
 | `doscar` | 总是 DOSCAR 的 `E_F` | **否** |
 | 数值 | 直接当作 E_F（绝对值） | **否** |
+
+> ⚠ **但 `unfold` 命令整体仍然要求 EIGENVAL 存在** —— 反折叠要用它的**带能量**
+> （PROCAR / DOSCAR 里都没有能量）。准确的说法是"**E_F 的选取**只有 `auto` 与
+> `vbm` 需要占据数"，不是"数值/`doscar` 模式完全不碰 EIGENVAL"。
+> EIGENVAL 缺失时 CLI 给**按模式区分**的可操作报错（数值/`doscar` 说缺的是
+> 带能量，`auto`/`vbm` 说缺的是占据数），不是裸的 `[Errno 2]`。
 
 * **VBM/CBM** 由 EIGENVAL 的占据数给出：占据判据为 `occ > 0.5`，
   VBM = 占据态最高能量，CBM = 未占据态最低能量。
@@ -313,10 +319,11 @@ BXSF / FermiSurfer 的网格是**规则**的，无法留空，故按下面规则
   gap = `1.6116 eV`（明确的半导体），但若按"有分数占据 ⇒ 金属"判，
   `auto` 会取 DOSCAR 的 E_F = `-1.920079 eV` —— 它落在**带隙中央**
   ⇒ 画出来的费米面是空的。
-* **只有 `auto` 与 `vbm` 会去读 EIGENVAL**：数值与 `doscar` 模式完全不碰
-  EIGENVAL —— 用户明明白白给了 E_F，不该被一个用不上的 EIGENVAL 挡住。
-  `auto` 模式若 EIGENVAL 里没有占据态（VBM 不可得）⇒ 退化到 DOSCAR 的
-  `E_F` 并给出明确 warning（不静默）。
+* **E_F 的选取**只有 `auto` 与 `vbm` 需要 EIGENVAL 的**占据数**：数值与
+  `doscar` 模式**不使用**占据数 —— 用户明明白白给了 E_F，不该被一个用不上的
+  占据数挡住。`auto` 模式若 EIGENVAL 里没有占据态（VBM 不可得）⇒ 退化到
+  DOSCAR 的 `E_F` 并给出明确 warning（不静默）。
+  （**带能量**任何模式都要 —— 见本节开头的方框。）
 * **`band.N` 的编号是能量升序**：`band.1` 是**最低的深带**（**不是**"第一条
   穿过 E_F 的带"）。实测（1T-TaS2，12×12×1）跨 E_F 的是 **band.5 – band.14**。
 
@@ -444,10 +451,16 @@ OUTCAR: ZVAL   =  14.00  6.00
 EIGENVAL: (nk, nbands) = (9, 49)   分数占据 6 / 441
   band 39  E= -1.5171.. -1.4905  occ= 0.9913..1.0174   <-- 唯一的分数占据(带边)
 VBM = -1.490480   CBM = 0.131685   gap = 1.622165 eV
-is_metal(gap_tol=0.05) = False
 DOSCAR E_F = -1.32951378                 <-- 落在带隙里
 select_fermi_energy(auto) = -1.440480    <-- = VBM + delta(0.05)
 ```
+
+> ⚠ 上面这段是 **Python 层的检查**(直接调 `fsout.band_edges` /
+> `fsout.select_fermi_energy` 打的), **不是 CLI 的输出** ——
+> `unfoldfs unfold` 打印的是 `相位约定 / VBM / CBM / E_F / 已写出` 那几行。
+> `is_metal(...)` 是 `fsout` 的**公开 API**(保留给二次分析), 生产路径走的是
+> `has_fermi_crossing`（Ruling 20/27）, CLI 从不调用 `is_metal`。
+> `docs/algorithms.md §12.4` 里那一行同理。
 
 | 量 | 半核势（ZVAL=6，§10） | 标准势（ZVAL=14，本节） |
 |---|---|---|
@@ -549,6 +562,8 @@ Reciprocal lattice
 `Mo_sv` 势 + `--grid 6 6 1`（简报要求的网格）：
 
 ```
+（**Python 层检查**的转录, **不是 CLI 的输出** —— CLI 打印的是
+"相位约定 / VBM / CBM / E_F / 已写出" 那几行）
 EIGENVAL 头 : 234      4    129      <-- NELECT=234 (9x14+18x6), NKPT=4, NBANDS=129
 占据带数 = 117            CLI 的估计也是 117 => 正好相等
 VBM = -1.510947  CBM = 0.102175  gap = 1.613122 eV

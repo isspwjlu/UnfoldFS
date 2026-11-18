@@ -27,10 +27,11 @@ import pytest
 
 from unfoldfs import cli
 from unfoldfs.fsout import read_bxsf, read_cube, read_fermisurfer_band
-from unfoldfs.geometry import (common_symmetry_ops, read_poscar,
+from unfoldfs.geometry import (common_symmetry_ops_detailed, read_poscar,
                                read_transmat, reciprocal, resolve_transform)
-from unfoldfs.grid import (GridSpec, build_grid_map, filter_ops_by_grid,
-                           load_grid_map, primitive_grid_points, save_grid_map,
+from unfoldfs.grid import (GridSpec, build_grid_map,
+                           filter_ops_by_grid_detailed, load_grid_map,
+                           primitive_grid_points, save_grid_map,
                            write_kpoints)
 from tests.conftest import FIXTURE_EIGENVAL
 
@@ -196,9 +197,11 @@ def _write_grid_map(directory, spec=_SPEC):
     tr = resolve_transform(sc, prim,
                            read_transmat(os.path.join(directory, "TRANSMAT.in")))
     grid = primitive_grid_points(spec)
-    ops = filter_ops_by_grid(common_symmetry_ops(prim, tr.m_eff), grid)
+    all_ops, dropped = common_symmetry_ops_detailed(prim, tr.m_eff)
+    ops, dropped_grid = filter_ops_by_grid_detailed(all_ops, grid)
     gm = build_grid_map(spec, grid, ops, tr, reciprocal(prim.lattice),
-                        reciprocal(sc.lattice))
+                        reciprocal(sc.lattice),
+                        dropped=tuple(dropped) + tuple(dropped_grid))
     save_grid_map(os.path.join(directory, "grid_map.npz"), gm)
     return gm
 
@@ -770,3 +773,97 @@ def test_all_sources_parse_under_python_39():
     assert files
     for path in files:
         ast.parse(path.read_text(encoding="utf-8"), feature_version=(3, 9))
+
+
+# ------------------------------------------------------------------ I1/I3/I5
+
+def test_unfold_without_eigenval_gives_an_actionable_message(tmp_path, mini_run,
+                                                              capsys):
+    """I1: EIGENVAL 缺失时的报错必须说清"缺的是哪一部分"。
+
+    旧实现直接让 FileNotFoundError 冒到顶层 -> 用户看到
+    "[Errno 2] No such file or directory: ...EIGENVAL", 完全不知道
+    EIGENVAL 是干什么用的(E_F 的选取不需要它, 但**带能量**只有它有)。
+    """
+    run = str(mini_run)
+    os.remove(os.path.join(run, "EIGENVAL"))
+    rc = cli.main(["unfold", "--dir", run, "--ef", "-3.5",
+                   "--outdir", str(tmp_path / "fs")])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "EIGENVAL" in err
+    assert "带能量" in err
+    assert "Errno" not in err          # 不能是裸的 OSError
+    assert "Traceback" not in err
+
+
+def test_unfold_without_eigenval_in_auto_mode_says_the_ef_selection_needs_it(
+        tmp_path, mini_run, capsys):
+    """I1: --ef auto/vbm 的 E_F 选取**确实**需要 EIGENVAL 的占据数。
+
+    这两种模式的报错要说清"缺的是占据数", 与数值模式的"缺带能量"区分开。
+    """
+    run = str(mini_run)
+    os.remove(os.path.join(run, "EIGENVAL"))
+    rc = cli.main(["unfold", "--dir", run, "--ef", "auto",
+                   "--outdir", str(tmp_path / "fs")])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "EIGENVAL" in err
+    assert "占据数" in err
+    assert "Traceback" not in err
+
+
+def test_unfold_rejects_a_grid_map_that_does_not_match_the_structure(
+        tmp_path, mini_run, capsys):
+    """I3: grid_map 与 POSCAR/TRANSMAT 不自洽时必须**立刻**报错。
+
+    旧实现没有守卫, 错误发生在最贵的相位约定择优之后, 而且是一条看不懂的
+    ``IndexError: index 9 is out of bounds``。
+    """
+    import dataclasses
+    run = str(mini_run)
+    gm = load_grid_map(os.path.join(run, "grid_map.npz"))
+    wrong_m = np.diag([2, 1, 1])          # 与结构文件的 M=diag(3,1,1) 不符
+    tr = dataclasses.replace(
+        gm.transform, m_eff=wrong_m,
+        m_inv=np.linalg.inv(wrong_m.astype(float)))
+    save_grid_map(os.path.join(run, "grid_map.npz"),
+                  dataclasses.replace(gm, transform=tr))
+    rc = cli.main(["unfold", "--dir", run, "--outdir", str(tmp_path / "fs")])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "不自洽" in err
+    assert "Traceback" not in err
+    assert "IndexError" not in err
+
+
+def test_info_lists_the_dropped_symmetry_operations(mini_run, capsys):
+    """I5: info 必须列出被剔除的对称操作及原因(spec §7)。"""
+    rc = cli.main(["info", "--dir", str(mini_run)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "对称操作" in out
+    assert "保留" in out and "剔除" in out
+    assert "原因:" in out                # 剔除原因必须写出来
+
+
+def test_naive_supercell_count_gives_a_reason_for_each_failure_mode():
+    """M2: "算不出来"的三种原因必须分开给, 不能一律报"不是对角的"。"""
+    from unfoldfs.cli import _naive_supercell_count
+    # 1) 对角但 P_i 不是 M_ii 的整数倍 -> 第三条消息
+    n, why = _naive_supercell_count((6, 6, 1), np.diag([4, 3, 1]))
+    assert n is None
+    assert "整数倍" in why
+    # 2) 非对角 -> 第一条消息
+    n, why = _naive_supercell_count((6, 6, 1), np.array([[1, 1, 0], [0, 3, 0],
+                                                          [0, 0, 1]]))
+    assert n is None
+    assert "对角" in why
+    # 3) 对角元不是整数 -> 第二条消息
+    n, why = _naive_supercell_count((6, 6, 1), np.diag([2.5, 3.0, 1.0]))
+    assert n is None
+    assert "整数" in why
+    # 正常情形
+    n, why = _naive_supercell_count((6, 6, 1), np.diag([3, 3, 1]))
+    assert n == 4 and why == ""

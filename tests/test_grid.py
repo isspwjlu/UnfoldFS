@@ -197,7 +197,6 @@ def test_decompose_grid_partitions_grid_into_orbits():
     prim, m, ops = _fixture_ops()
     ops = filter_ops_by_grid(ops, grid)
     ir_idx, mult, full_to_ir, rot = decompose_grid(grid, ops)
-    n = grid.shape[0]
     assert len(ir_idx) == len(mult)
     assert set(full_to_ir.tolist()) == set(range(len(ir_idx)))
     for k in range(len(ir_idx)):

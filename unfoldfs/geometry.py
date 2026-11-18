@@ -8,12 +8,20 @@
     -> k        k_prim = k_sc @ (m_eff^-1)^T   (分数坐标换基)
   * 分数坐标: 原胞/超胞各自基底下的无量纲坐标, 行向量写法 k @ M
   * spglib 的对称操作按**列向量**约定存储: x' = R x + t
-    (故对行向量 k 的作用为 k @ R.T + t);
+    (故对**直接空间**的行向量作用是 x' = x @ R.T + t);
+    **倒空间**的分数基算符的伴随是 **R^-1**(不是 R.T!) —— 分数基不是正交阵,
+    "R 的转置 = R 的逆"在这里不成立:
+        k' = k @ R^-1   (行向量约定)
+    笛卡尔几何真值(12 个操作 × 多个 k)裁决: k@R^-1 与真值 48/48 一致,
+    k@R.T 只有 16/48、k@R 只有 32/48 —— 见 tests/test_geometry.py 的
+    `test_symmetry_ops_apply_matches_the_cartesian_geometry_truth` 与
+    docs/algorithms.md §1.2。
     超胞基底下的旋转 = M^-T R M^T, 整数性判据即 M^-T R M^T ∈ Z³
     (行向量约定下才是 M R M^-1; 对称 M 时两者恒等)
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from fractions import Fraction
 from typing import Tuple
@@ -33,13 +41,28 @@ class Structure:
 
 
 def read_poscar(path: str) -> Structure:
-    """读 POSCAR/PRIMCELL.vasp -> Structure(分数坐标)。"""
+    """读 POSCAR/PRIMCELL.vasp -> Structure(分数坐标)。
+
+    **只支持 VASP-5 格式**(第 6 行是元素符号、第 7 行是各元素的原子数)。
+    VASP-4 格式(没有元素符号行, 第 6 行直接是原子数)在这里给出明确报错 ——
+    否则它会掉进 ``int("Direct")`` 这种看不懂的 ValueError。
+    """
     with open(path) as fh:
         lines = [ln.rstrip() for ln in fh]
+    if len(lines) < 8:
+        raise ValueError(
+            f"{os.path.basename(path)} 被截断: 只有 {len(lines)} 行, "
+            "至少需要 8 行(晶格 3 行 + 缩放 + 元素符号 + 原子数 + 坐标模式)")
     scale = float(lines[1].split()[0])
     lattice = np.array(
         [[float(x) for x in lines[i].split()[:3]] for i in (2, 3, 4)]
     ) * scale
+    if _looks_like_counts(lines[5]):
+        raise ValueError(
+            f"{os.path.basename(path)} 看起来是 **VASP-4 格式**(第 6 行是原子数"
+            "计数, 没有元素符号行) —— 本工具只支持 **VASP-5 格式**: "
+            "第 6 行必须是元素符号(如 'Mo S'), 第 7 行才是各元素的原子数。"
+            "请在 POSCAR 里补上元素符号行(VASP-5 格式)。")
     symbols = lines[5].split()
     counts = [int(x) for x in lines[6].split()]
     mode = lines[7].strip()
@@ -56,6 +79,19 @@ def read_poscar(path: str) -> Structure:
             species.append(sym)
             idx += 1
     return Structure(lattice, np.array(positions), tuple(species))
+
+
+def _looks_like_counts(line: str) -> bool:
+    """该行是不是"原子数计数"行(VASP-4 格式的第 6 行)。"""
+    parts = line.split()
+    if not parts:
+        return False
+    try:
+        for p in parts:
+            int(p)
+    except ValueError:
+        return False
+    return True
 
 
 def reciprocal(lattice: np.ndarray) -> np.ndarray:
@@ -114,6 +150,27 @@ def resolve_transform(sc: Structure, prim: Structure, m: np.ndarray) -> Transfor
     )
 
 
+def periodic_delta(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """逐点周期距离: (n,3) x (n,3) -> (n,)。
+
+    周期距离 = min(|Δ|, 1-|Δ|): 0.99999997 与 0.0 的距离是 3e-8 而不是 1。
+    (spglib 的平移代表元带 ~3e-8 残差, 且取模后 0.99999997 与 0.0 是同一个点
+    —— 用非周期距离会选错候选。)
+    """
+    a = np.atleast_2d(np.asarray(a, dtype=float))
+    b = np.atleast_2d(np.asarray(b, dtype=float))
+    d = np.abs(a - b)
+    d = np.minimum(d, 1.0 - d)
+    return np.linalg.norm(d, axis=1)
+
+
+def periodic_distance(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """两组分数坐标点之间的周期距离(L2): (n,3) x (m,3) -> (n,m)。"""
+    d = np.abs(np.atleast_2d(a)[:, None, :] - np.atleast_2d(b)[None, :, :])
+    d = np.minimum(d, 1.0 - d)
+    return np.linalg.norm(d, axis=2)
+
+
 def matrix_denominator_lcm(m_eff: np.ndarray) -> int:
     """comm(M_eff^-1): 使 M_eff^-1 所有元素分母整除的最小正整数。"""
     inv = np.linalg.inv(np.asarray(m_eff, dtype=float))
@@ -169,14 +226,38 @@ class SymmetryOps:
     translations: np.ndarray
 
     def apply(self, k_prim: np.ndarray, op_index: int) -> np.ndarray:
+        """对称操作作用到**原胞分数坐标**的 k 上(行向量约定)。
+
+        k' = k @ R^-1 + t
+
+        ⚠ 倒空间的伴随是 **R^-1**, 不是 R.T: 分数基下的算符不是正交阵,
+        "R 的转置 = R 的逆"只对笛卡尔正交阵成立。笛卡尔几何真值裁决
+        (12 个操作 × 多个 k): k@R^-1 一致 48/48, k@R.T 只有 16/48。
+        见 docs/algorithms.md §1.2 与 tests/test_geometry.py 的回归测试。
+        """
         r = self.rotations[op_index]
         t = self.translations[op_index]
-        return np.mod(k_prim @ r.T + t, 1.0)   # r 以列向量约定存储 -> 转置
+        return np.mod(k_prim @ rotation_inverse(r) + t, 1.0)
 
 
-def common_symmetry_ops(prim: Structure, m_eff: np.ndarray,
-                        symprec: float = 1e-5) -> SymmetryOps:
-    """原胞对称操作中, 同时也是超胞对称的那些。
+def rotation_inverse(r: np.ndarray) -> np.ndarray:
+    """整数阵 R 的**精确**逆(仍是整数阵)。
+
+    R 是幺模整数阵(对称操作的旋转部分)⇒ R^-1 也是整数阵, 故用
+    "浮点 inv 再取整"求它是精确的(不是近似)。不用 ``np.linalg.inv`` 直接返回
+    浮点: 大分量下会丢精度, 而这里的下游全是整数性判据。
+    """
+    r_int = np.asarray(r)
+    inv = np.round(np.linalg.inv(r_int.astype(float))).astype(int)
+    if not np.allclose(inv @ r_int, np.eye(3, dtype=int), atol=1e-6):
+        raise ValueError(
+            f"R 不是幺模整数阵, 求不出整数逆: R={r_int.tolist()}")
+    return inv
+
+
+def common_symmetry_ops_detailed(prim: Structure, m_eff: np.ndarray,
+                                 symprec: float = 1e-5):
+    """原胞对称操作中, 同时也是超胞对称的那些 —— 并报告**被剔除**的操作。
 
     判据 (行约定):  M^-T R M^T 为整数矩阵 (该旋转把超胞晶格映到自身)。
     spglib 的 R 是列向量约定 (x' = R x), 故超胞基底下的旋转是 M^-T R M^T;
@@ -186,6 +267,9 @@ def common_symmetry_ops(prim: Structure, m_eff: np.ndarray,
     (1,0,0)), 换基底后 t·M^-1 未必是整数 —— 用它筛选会误删操作, 得到不成群的
     集合 (C3 在内而 C3^2 不在)。平移只需是原胞晶格平移 (spglib 已保证),
     而 A(k,E) 对整个原胞点群不变。
+
+    返回 (ops, dropped): dropped 是 [(旋转, 平移, 原因), ...], 供 `info`
+    打印"保留 N / 剔除 M(原因: …)"(spec §7)。
     """
     import spglib
 
@@ -198,15 +282,25 @@ def common_symmetry_ops(prim: Structure, m_eff: np.ndarray,
     m = np.asarray(m_eff, dtype=float)
     inv = np.linalg.inv(m)
     keep_r, keep_t = [], []
+    dropped = []
     for r, t in zip(rotations, translations):
         r_sc = inv.T @ r.astype(float) @ m.T
         if not np.allclose(r_sc, np.round(r_sc), atol=1e-6):
+            dropped.append((r.astype(int), _harden_translation(t),
+                            "M^-T·R·M^T 在超胞基底非整数 —— 该旋转不保持超胞晶格"))
             continue        # 旋转在超胞基底非整数 -> 该操作不保持超胞晶格
         keep_r.append(r.astype(int))
         keep_t.append(_harden_translation(t))
     if not keep_r:
         raise ValueError("未找到任何公共对称操作")
-    return SymmetryOps(np.array(keep_r), np.array(keep_t))
+    return SymmetryOps(np.array(keep_r), np.array(keep_t)), dropped
+
+
+def common_symmetry_ops(prim: Structure, m_eff: np.ndarray,
+                        symprec: float = 1e-5) -> SymmetryOps:
+    """原胞对称操作中, 同时也是超胞对称的那些(只返回保留的操作)。"""
+    ops, _dropped = common_symmetry_ops_detailed(prim, m_eff, symprec)
+    return ops
 
 
 def _harden_translation(t: np.ndarray, tol: float = 1e-8) -> np.ndarray:
