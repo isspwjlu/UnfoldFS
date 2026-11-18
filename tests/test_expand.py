@@ -102,6 +102,33 @@ def _candidate_to_grid(gm, grid=None):
     return out
 
 
+def _with_bz_copies(res, n_copies=2, shift=0.0):
+    """给展开结果追加 (n_copies-1) 份**超胞 BZ 副本**的行。
+
+    副本 = 同一个超胞 k 在原胞第一布里渊区里的另一个 BZ 副本(K 相差一个
+    超胞倒格矢)⇒ 它的候选落在**同一批**原胞网格点上 ⇒ 每个网格点因此收到
+    多个源(多源求和的物理来源)。
+
+    ``shift``: 副本的带能量整体平移多少 eV(用来测"按能量对齐"的合并口径)。
+    """
+    if n_copies == 1:
+        return res
+    e_copies = []
+    for _ in range(n_copies - 1):
+        e2 = np.asarray(res.energies, dtype=float).copy()
+        v2 = np.asarray(res.valid, dtype=bool).copy()
+        finite = np.isfinite(e2) & v2
+        e2[finite] += float(shift)
+        e_copies.append(e2)
+    return replace(
+        res,
+        k_cand=np.concatenate([res.k_cand] * n_copies, axis=0),
+        energies=np.concatenate([res.energies] + e_copies, axis=0),
+        weights=np.concatenate([res.weights] * n_copies, axis=0),
+        valid=np.concatenate([res.valid] * n_copies, axis=0),
+    )
+
+
 # ------------------------------------------------------------------ 扩展
 
 def test_expand_takes_the_band_block_of_the_covering_candidate():
@@ -168,6 +195,92 @@ def test_expand_preserves_total_weight():
     exp = expand_to_full_grid(res, gm)
     assert exp.band_w.sum() == pytest.approx(res.weights[res.valid].sum(),
                                              rel=1e-12)
+
+
+# ------------------------------------------------- 多源求和(修复轮 8)
+#
+# 原胞的谱函数是**所有**落到同一个原胞 k' 的超胞态的投影之和: 每个超胞 k
+# 点 K 各贡献一份(经由自己的 G 分量 G_K = k'·Mᵀ − K)。当超胞 k 列表覆盖了
+# 原胞第一布里渊区里的**多个超胞 BZ 副本**时, 同一个原胞 k' 会被 det(M) 个
+# 超胞 k 覆盖 —— 只取其中一个就丢掉 (n_k−1)/n_k 的谱权重。
+
+def test_expand_sums_the_sources_that_land_on_the_same_grid_point():
+    """多源: 同一网格点被多个源覆盖时, 各源的带按能量对齐后权重相加。"""
+    gm, grid = _grid_map()
+    single = _synthetic_unfolded(gm)
+    multi = _with_bz_copies(single, n_copies=2)
+    exp1 = expand_to_full_grid(single, gm)
+    exp2 = expand_to_full_grid(multi, gm)
+
+    # 带(能量与条数)不变 —— 多源只是把**同一批带**的权重加起来
+    assert exp2.band_e.shape == exp1.band_e.shape
+    assert np.array_equal(exp2.band_e, exp1.band_e)
+    assert np.array_equal(exp2.valid, exp1.valid)
+    assert np.allclose(exp2.band_w, 2.0 * exp1.band_w)
+    # 权重和随源数线性增长(而不是被截断在一个源上)
+    assert exp2.band_w.sum() == pytest.approx(2.0 * exp1.band_w.sum(), rel=1e-12)
+    three = expand_to_full_grid(_with_bz_copies(single, n_copies=3), gm)
+    assert three.band_w.sum() == pytest.approx(3.0 * exp1.band_w.sum(),
+                                               rel=1e-12)
+
+
+def test_expand_merges_the_bands_of_two_sources_by_energy():
+    """两个源的带按**能量**对齐: 能量差 <= merge_tol 的带合并(权重相加)。"""
+    gm, grid = _grid_map()
+    single = _synthetic_unfolded(gm)
+    exp1 = expand_to_full_grid(single, gm)
+    # 副本的带能量整体平移 1e-9 eV(远小于 merge_tol=1e-6)⇒ 仍然同一条带
+    near = expand_to_full_grid(_with_bz_copies(single, n_copies=2, shift=1e-9),
+                                gm)
+    assert near.band_e.shape == exp1.band_e.shape
+    assert np.allclose(near.band_e, exp1.band_e)
+    assert np.allclose(near.band_w, 2.0 * exp1.band_w)
+    # 平移 1e-3 eV(远大于 merge_tol)⇒ 是**不同的**带, 不能合并
+    far = expand_to_full_grid(_with_bz_copies(single, n_copies=2, shift=1e-3),
+                               gm)
+    assert far.band_e.shape[1] == 2 * exp1.band_e.shape[1]
+    assert far.band_w.sum() == pytest.approx(2.0 * exp1.band_w.sum(), rel=1e-12)
+
+
+def test_expand_multi_source_keeps_the_band_energies_of_each_source():
+    """多源合并**不改带能量**: 合并后的能量是源 0 的能量(按能量对齐)。"""
+    gm, grid = _grid_map()
+    single = _synthetic_unfolded(gm)
+    multi = _with_bz_copies(single, n_copies=2, shift=1e-9)
+    exp = expand_to_full_grid(multi, gm)
+    mapping = _candidate_to_grid(gm)
+    for (k, j), i in mapping.items():
+        v = single.valid[k, j]
+        e_src = np.asarray(single.energies[k, j])[v]
+        e_out = exp.band_e[i][exp.valid[i]]
+        assert np.allclose(e_out, e_src, atol=1e-6)
+        # 权重 = 两个源的权重之和
+        w_src = np.asarray(single.weights[k, j])[v]
+        assert np.allclose(exp.band_w[i][exp.valid[i]], 2.0 * w_src)
+
+
+def test_expand_multi_source_keeps_the_spectrum_covariant():
+    """多源求和与点群对称化是**两道正交的处理**: 对称化后仍须协变。"""
+    gm, grid, _ = _fixture_pipeline_spectrum()
+    res = _synthetic_unfolded(gm)
+    multi = _with_bz_copies(res, n_copies=2)
+    exp = expand_to_full_grid(multi, gm)
+    a = build_spectral_function(exp, np.linspace(-20.0, 10.0, 61), 0.2)
+    devs = _point_group_deviation(gm, grid, symmetrize_spectral_function(a, gm))
+    assert devs, "没有可比的对称操作"
+    worst = max(devs.values())
+    assert worst <= 1e-8, (
+        f"多源求和后对称化的 A(k,E) 仍不协变: 最大相对偏差 {worst:.3e}")
+
+
+def test_expand_rejects_fewer_k_points_than_the_grid_map():
+    """展开结果的 k 数少于 grid_map.k_super 时必须报错(会静默漏掉网格点)。"""
+    gm, grid = _grid_map()
+    res = _synthetic_unfolded(gm)
+    bad = replace(res, energies=res.energies[:-1], weights=res.weights[:-1],
+                  valid=res.valid[:-1], k_cand=res.k_cand[:-1])
+    with pytest.raises(ValueError, match="k"):
+        expand_to_full_grid(bad, gm)
 
 
 def test_expand_rejects_a_deliberately_wrong_candidate_index(monkeypatch):
