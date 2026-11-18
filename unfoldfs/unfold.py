@@ -10,8 +10,14 @@
 1. **不可**假设同一原胞原子的各副本复值相同 —— 实测同一 (k, 带, 轨道) 上
    9 个副本可取 3 个不同值(按 (m+n) mod 3 分组), 故必须做**相位还原**的副本
    平均, 不能取单个副本、也不能假设副本相等;
-2. 相位符号约定 (s1, s2) 由 4 种组合的「单 G 主导度」自动择优(原型实测
-   主导度 0.85~1.0, 非主导候选的权重掉到 ~1e-33)。
+2. 相位符号约定 (s1, s2) 的两个符号**物理地位不同**(修复轮 9):
+   * **s1(副本相位)由物理唯一确定 = −1** —— 副本相位必须抵消超胞 Bloch
+     因子 ``e^{+iK·R_T}``(把超胞态投影到原胞 Bloch 态时, 每个副本带
+     ``e^{−i(k'−K)·T·A}``)。实测「单 G 主导度」对 s1 几乎没有分辨力
+     (四个约定只差 ~1e-3), 而选错 s1 会让 55%~65% 的 (k,带) 换候选归属
+     ⇒ 整张费米面错形 ⇒ **s1 不能靠打分定**;
+   * **s2(Bloch character 符号)是真正的约定** —— 在 s1 固定后的两个候选
+     里按「单 G 集中度」择优(实测相对差 2.0%~2.1%, 有判别力)。
 
 **两种模式(权重定义不同, 不可混用)**:
 
@@ -58,6 +64,32 @@ __all__ = [
 
 # 相位符号约定的 4 种组合 (s1 作用于副本平移项, s2 作用于原胞 k 相位项)
 CONVENTIONS: Tuple[Tuple[int, int], ...] = ((1, 1), (1, -1), (-1, 1), (-1, -1))
+
+# ---------------------------------------------------------------- 相位符号的物理地位
+#
+# 修复轮 9 的实测结论: **两个符号的物理地位完全不同**, 必须分开处理。
+#
+# * ``s1``(副本相位 ``exp(s1·i·(k'−K)·T)`` 的符号)由**物理唯一确定**:
+#   把超胞态 ψ_K 投影到原胞 Bloch 态 |k'⟩ 时, 每个超胞原子
+#   R_j = r_i + T·A 带相位 ``e^{i(K−k')·R_j}``(超胞 Bloch 因子 e^{+iK·R}
+#   与原胞 Bloch character e^{−ik'·r} 合成的); 把它拆成"原子项"
+#   ``e^{i(K−k')·r_i}`` 与"副本项" ``e^{i(K−k')·(T·A)} = e^{−i(k'−K)·(T·A)}``
+#   ⇒ **s1 = −1**, 唯一解。
+#
+#   ⇒ s1 **不靠打分**: 实测"单 G 集中度"对 s1 几乎没有分辨力
+#   (1T-TaS₂ 的 √3×√3 R30° 超胞 48×48×1: 四个约定
+#   0.7653/0.7723/0.7701/0.7680(全网格)与 0.6728/0.6885/0.6873/0.6733
+#   (原型口径), 差 ~1e-3), 而选错 s1 会让 **55%~65% 的 (k,带) 换候选
+#   归属** ⇒ 整张费米面错形(实测 Pearson 0.1556 vs 0.9941, 带能量最近
+#   距离 0.154 eV vs 2.05e-05 eV)⇒ **打分分辨不出对错, 必须靠物理**。
+#
+# * ``s2``(原胞 Bloch character ``exp(s2·i·k'·r_i)`` 的符号)是**真正的约定**:
+#   e^{+ik·r} 与 e^{−ik·r} 互为共轭, 投影本身定不出哪一个 ⇒ 只能靠
+#   "态应当集中在唯一一个候选上"(单 G 集中度)来分辨。
+#   实测三组真实数据上, s1 固定之后两个候选的集中度相对差
+#   **2.13% / 1.91% / 2.04%** ⇒ 这一步**有判别力**(比旧判据的噪声
+#   量级 1e-3 大 20 倍)。
+PHASE_COPY_SIGN = -1
 
 # 单 G 主导度下限: 低于此值说明态没有被集中到唯一一个候选 G 上 -> 展开不可信
 MIN_DOMINANCE = 0.5
@@ -112,6 +144,10 @@ class DominanceReport:
         margin / margin_rel     winner - runner_up 及其相对值
         degenerate              margin_rel < MIN_CONVENTION_MARGIN_REL
                                -> 选择由噪声驱动(已告警)
+
+    ⚠ 修复轮 9: winner / runner-up 的比较**只在两个 s1 = −1 的候选之间**
+    (s1 由物理唯一确定, 见 ``PHASE_COPY_SIGN``)⇒ margin 描述的是
+    "s2 有没有选对", 而不是"整个约定有没有选对"。
     """
 
     mean: float = float("nan")
@@ -351,26 +387,42 @@ def _evaluate_conventions(samples: List[Tuple[np.ndarray, np.ndarray]],
 
 
 def _choose_convention(scores: np.ndarray) -> Tuple[int, int, DominanceReport]:
-    """从 4 种约定里择优, 并做三项检查。
+    """在 4 种相位约定里择优 —— **s1 物理唯一解, s2 由集中度定**。
 
-    1. 主导度 < MIN_DOMINANCE -> 抛错: 展开没有把态集中到唯一一个候选 G 上,
-       此时的谱函数不可信;
-    2. 4 种约定给不出区分(主导度完全相同) -> 抛错: 相位约定本身没有意义;
-    3. winner 与 runner-up 的相对差 < MIN_CONVENTION_MARGIN_REL -> **告警**:
-       选择落在退化区(噪声驱动), 必须让用户看见而不是静默接受。
+    修复轮 9(实测依据见 ``PHASE_COPY_SIGN`` 的注释):
+
+    * **s1(副本相位符号)= PHASE_COPY_SIGN = −1**, 由超胞 Bloch 因子物理
+      唯一确定, **不靠打分** —— 实测"单 G 集中度"对 s1 的分辨力只有 ~1e-3
+      (四个约定 0.7653/0.7723/0.7701/0.7680), 而选错 s1 会让 55%~65% 的
+      (k,带) 换候选归属 ⇒ 整张费米面错形(Pearson 0.1556 vs 0.9941);
+    * **s2(Bloch character 符号)** 在剩下的两个候选里按**单 G 集中度**
+      择优 —— 实测相对差 2.13% / 1.91% / 2.04%(三组真实数据)⇒ 有判别力。
+
+    三项检查:
+
+    1. winner 集中度 < MIN_DOMINANCE -> 抛错: 展开没有把态集中到唯一一个
+       候选 G 上, 此时的谱函数不可信;
+    2. 两个 s1=−1 的候选给不出区分(完全相同) -> 抛错: 相位约定没有意义;
+    3. winner 与 runner-up 的相对差 < MIN_CONVENTION_MARGIN_REL -> **告警**,
+       且告警必须说明**后果**: 退化区里选出的约定由噪声主导, 而选错约定
+       会让整张费米面错形(不是"不可复现"那么轻)。
     """
     scores = np.asarray(scores, dtype=float)
-    order = np.argsort(-scores, kind="stable")
-    best, second, worst = int(order[0]), int(order[1]), int(order[-1])
+    # 只有 s1 = PHASE_COPY_SIGN 的两个约定是物理上可能的候选
+    cand = [i for i, (s1, _s2) in enumerate(CONVENTIONS)
+            if s1 == PHASE_COPY_SIGN]
+    # 稳定排序: 分数相同时取 CONVENTIONS 里靠前的那个(确定性)
+    order = sorted(cand, key=lambda i: (-scores[i], i))
+    best, second = order[0], order[1]
     s1, s2 = CONVENTIONS[best]
     if scores[best] < MIN_DOMINANCE:
         raise ValueError(
             f"单 G 主导度 {scores[best]:.4f} < {MIN_DOMINANCE} —— "
             "展开没有把态集中到唯一一个候选 G 上, 相位约定/副本平均不可信")
-    if scores[best] - scores[worst] <= 1e-12:
+    if scores[best] - scores[second] <= 1e-12:
         raise ValueError(
-            "4 种相位约定没有区分度(主导度完全相同) —— 相位约定无法确定, "
-            "展开结果没有意义")
+            f"s1={PHASE_COPY_SIGN:+d} 的两个相位约定没有区分度(主导度完全"
+            "相同) —— 相位约定无法确定, 展开结果没有意义")
     margin = float(scores[best] - scores[second])
     margin_rel = margin / scores[best] if scores[best] > 0 else 0.0
     degenerate = bool(margin_rel < MIN_CONVENTION_MARGIN_REL)
@@ -387,8 +439,12 @@ def _choose_convention(scores: np.ndarray) -> Tuple[int, int, DominanceReport]:
             f"相位约定择优落在退化区: winner=({s1:+d},{s2:+d}) 主导度 "
             f"{scores[best]:.6f}, runner-up 主导度 {scores[second]:.6f}, "
             f"相对差仅 {margin_rel:.2e} < {MIN_CONVENTION_MARGIN_REL:.0e} —— "
-            "选出的约定由噪声主导(换一批采样就可能换一个约定), 结果不可复现; "
-            "请检查展开输入或扩大采样",
+            "选出的约定由噪声主导(换一批采样就可能换一个约定)。"
+            "⚠ 后果**不是**'可复现性'问题: 实测选错相位约定会让 55%~65% 的 "
+            "(k,带) 换候选归属 ⇒ **整张费米面错形**(实测 Pearson 0.16 vs "
+            "0.99, 带能量最近距离 0.154 eV vs 2.05e-05 eV) ⇒ 本次结果的"
+            "能带归属与费米面形状**都不可信**; 请加密网格(超胞 BZ 至少被 "
+            "4×4 个点采样)或人工核对候选归属",
             UserWarning, stacklevel=3)
     return int(s1), int(s2), report
 
@@ -399,11 +455,15 @@ def select_phase_convention(k_super_frac: np.ndarray, coeffs: np.ndarray,
                             a_prim: np.ndarray, prim_cart: np.ndarray,
                             b_prim: np.ndarray, b_super: np.ndarray
                             ) -> Tuple[int, int, float]:
-    """在 4 种 (s1, s2) 相位约定里选「单 G 主导度」最高的那个。
+    """在 4 种 (s1, s2) 相位约定里择优 —— **s1 物理唯一解, s2 靠集中度定**。
 
     返回 (s1, s2, 主导度)。主导度 < 0.5 视为失败(抛错): 展开没有把态集中到
-    唯一一个候选 G 上, 此时的谱函数不可信。4 种约定给不出区分时同样抛错 ——
-    那说明相位约定本身没有意义。
+    唯一一个候选 G 上, 此时的谱函数不可信。两个 s1=−1 的候选给不出区分时同样
+    抛错 —— 那说明相位约定本身没有意义。
+
+    判据的物理依据与实测依据见 ``_choose_convention`` 与 ``PHASE_COPY_SIGN``
+    的注释(以及 docs/algorithms.md §7.2): ``s1`` 由超胞 Bloch 因子唯一确定,
+    ``s2`` 由"态应当集中在唯一一个候选上"分辨。
 
     口径: **单个 k**、该 k 的全部带(能量非有限的带不参与统计)。
     生产路径(``unfold_supercell``)用的是原型口径 —— 首 min(4, n_k) 个 k ×
@@ -522,6 +582,11 @@ def unfold_supercell(band: BandData, procar: ProcarData, tr: Transform,
     原型 ``unfold_procar.py`` 就是这么选的; 用"全部 k × 全部带"择优在 fixture 上
     会选出**不同**的约定(164/240 个 (k,带) 的候选归属改变 -> 费米面改变)。
     选定约定后只做**一次**全量权重 pass。
+
+    ⚠ **判据本身**(修复轮 9): ``s1`` 由物理唯一确定(``PHASE_COPY_SIGN``),
+    ``s2`` 按单 G 集中度择优 —— 旧的"四个约定里取集中度最大"分辨不出对错
+    (四个分数只差 ~1e-3, 而选错会让 55%~65% 的 (k,带) 换候选归属 =>
+    整张费米面错形)。见 ``_choose_convention``。
 
     **det(M) == 1 时走直通分支**(见 ``_unfold_primitive_direct``): 不做展开,
     权重是轨道投影 Σ_{ion,lm}|c|²; 相位约定择优与它的守卫整体跳过。

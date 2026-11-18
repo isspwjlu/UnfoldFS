@@ -14,9 +14,9 @@ import pytest
 
 from unfoldfs.geometry import (candidate_g_vectors, read_poscar, read_transmat,
                                reciprocal, resolve_transform)
-from unfoldfs.unfold import (CONVENTIONS, build_atom_copies, candidate_g_for_k,
-                             select_phase_convention, unfold_at_k,
-                             unfold_supercell)
+from unfoldfs.unfold import (CONVENTIONS, _choose_convention, build_atom_copies,
+                             candidate_g_for_k, select_phase_convention,
+                             unfold_at_k, unfold_supercell)
 from unfoldfs.vaspio import BandData, ProcarData, read_eigenval, read_procar
 from tests.conftest import (FIXTURE_EIGENVAL, FIXTURE_POSCAR,
                             FIXTURE_PRIMCELL, FIXTURE_PROCAR, FIXTURE_TRANSMAT)
@@ -290,10 +290,82 @@ def test_unfold_at_k_wrong_phase_convention_lowers_dominance():
 
 # ------------------------------------------------------------------ 相位约定择优
 
-def test_select_phase_convention_returns_the_max_dominance_convention():
+# 修复轮 9: 1T-TaS2 的 √3×√3 R30° 超胞(48×48×1)上实测的四个约定的
+# "单 G 集中度"(顺序同 CONVENTIONS = ((+1,+1), (+1,−1), (−1,+1), (−1,−1))):
+#   首 4 个 k × 首 40 条带(原型口径): 0.672758 / 0.688498 / 0.687306 / 0.673284
+#   全部 768 个 k × 40 条带          : 0.765324 / 0.772271 / 0.770052 / 0.768046
+# 两个采样口径下四个分数都只差 ~1e-3 ⇒ "取最大"是**噪声**决定的;
+# 而选错约定的后果是**整张费米面错形**(实测 Pearson 0.1556 vs 0.9941,
+# 带能量最近距离 0.154 eV vs 2.05e-05 eV) —— 不是"可复现性"问题。
+_SQRT3_SCORES_FIRST4 = (0.672758, 0.688498, 0.687306, 0.673284)
+_SQRT3_SCORES_FULL = (0.765324, 0.772271, 0.770052, 0.768046)
+
+
+@pytest.mark.parametrize("scores", [_SQRT3_SCORES_FIRST4, _SQRT3_SCORES_FULL])
+def test_choose_convention_is_not_decided_by_noise_level_score_gaps(scores):
+    """四个约定的分数只差 ~1e-3 时, 择优**不能**由噪声决定。
+
+    旧判据("取单 G 集中度最大")在这两个实测分数向量上都选 (+1,−1) ✗ ——
+    而那正是让整张费米面错形的那个约定(实测 Pearson 0.1556 vs 0.9941)。
+    新判据必须给出 (−1,+1)。
+    """
+    arr = np.asarray(scores, dtype=float)
+    s1, s2, rep = _choose_convention(arr)
+    assert (s1, s2) == (-1, 1)
+    # 旧判据(= 全体取最大)选的是错的 —— 这正是本条测试要锁住的东西
+    assert CONVENTIONS[int(arr.argmax())] == (1, -1)
+    # 四个分数仍然全部报告出来(诊断用)
+    assert len(rep.scores) == 4
+    assert rep.scores[2] == pytest.approx(arr[2])
+    assert rep.scores[3] == pytest.approx(arr[3])
+
+
+def test_choose_convention_pins_the_copy_phase_sign_by_physics():
+    """副本相位的符号 (s1) 由**物理**唯一确定, 不由分数决定。
+
+    副本相位 ``exp(s1·i·(k'−K)·T)`` 必须抵消**超胞 Bloch 因子**
+    ``e^{+iK·R_T}``(把超胞态投影到原胞 Bloch 态 |k'⟩ 时, 每个超胞原子
+    R_j = r_i + T·A 带相位 e^{i(K−k')·R_j}; 副本项 = e^{−i(k'−K)·(T·A)})
+    ⇒ s1 = −1。**即使某个 s1=+1 的约定分数最高, 也不能选它。**
+    """
+    arr = np.array([0.90, 0.95, 0.70, 0.60])     # (+1,-1) 的分数最高
+    s1, s2, _ = _choose_convention(arr)
+    assert s1 == -1
+    assert s2 == 1                              # s1=-1 的两个候选里分数高的
+
+
+def test_single_g_concentration_cannot_discriminate_the_copy_phase_sign():
+    """为什么 s1 必须靠物理而不是靠打分: 集中度**看不见** s1。
+
+    fixture 上 (−1,+1) 与 (+1,−1) 的单 G 集中度只差 ~1e-3, 但两者的候选
+    归属在 164/240 个 (k,带) 上不同 ⇒ "取最大"分不出对错, 而选错的后果是
+    整张费米面错形(见上面的真实数据)。
+    """
     fx = _fixture()
     doms = {}
-    for s1, s2 in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+    assign = {}
+    for conv in CONVENTIONS:
+        dom_rows, assign_rows = [], []
+        for ik in range(fx["band"].kpoints.shape[0]):
+            _, _, w = _unfold(fx, fx["band"].kpoints[ik],
+                              fx["procar"].coeffs[ik], conv[0], conv[1])
+            dom_rows.append(_dominance(w).mean())
+            assign_rows.append(w.argmax(axis=0))
+        doms[conv] = float(np.mean(dom_rows))
+        assign[conv] = assign_rows
+    # 分数几乎相同
+    assert abs(doms[(-1, 1)] - doms[(1, -1)]) < 1e-3
+    # 但归属差了一大半
+    diff = sum(int((assign[(1, -1)][ik] != assign[(-1, 1)][ik]).sum())
+               for ik in range(len(assign[(1, -1)])))
+    assert diff == 164
+
+
+def test_select_phase_convention_picks_the_best_of_the_two_physical_candidates():
+    """s1 由物理定(=−1); s2 在两个 s1=−1 的候选里按集中度择优。"""
+    fx = _fixture()
+    doms = {}
+    for s1, s2 in CONVENTIONS:
         _, _, w = _unfold(fx, fx["band"].kpoints[1], fx["procar"].coeffs[1],
                           s1, s2)
         doms[(s1, s2)] = float(_dominance(w).mean())
@@ -301,7 +373,8 @@ def test_select_phase_convention_returns_the_max_dominance_convention():
         fx["band"].kpoints[1], fx["procar"].coeffs[1],
         fx["band"].energies[1], fx["tr"], fx["copies"], fx["m_eff"],
         fx["a_prim"], fx["prim_cart"], fx["b_prim"], fx["b_super"])
-    assert (s1, s2) == max(doms, key=doms.get)
+    assert s1 == -1
+    assert (s1, s2) == max({(-1, 1), (-1, -1)}, key=doms.get)
     assert dominance == pytest.approx(doms[(s1, s2)], rel=1e-9)
 
 
@@ -520,18 +593,39 @@ def test_unfold_supercell_convention_choice_changes_candidate_assignment():
 def test_unfold_supercell_reports_convention_margin_and_flags_degenerate_choice():
     """winner 与 runner-up 的 margin 必须随结果输出(评审 Important 2)。
 
-    fixture 上两个"好"约定只差 0.1% —— 落在退化区, 选择是噪声驱动的,
-    必须**可见**(告警), 不能静默。
+    修复轮 9 之后, 判据只在**两个 s1=−1 的候选**之间比较 ⇒ fixture 上的
+    相对差是 **2.1%**(旧判据是 0.01%: 那时比较的是四个约定, 而"集中度"
+    对 s1 根本没有分辨力)⇒ **不再落在退化区**, 选择不再由噪声驱动。
     """
     fx = _fixture()
-    with pytest.warns(UserWarning, match="退化"):
-        res = _unfold_supercell(fx, suppress_warnings=False)
+    res = _unfold_supercell(fx)
     rep = res.dominance_report
     assert rep.margin > 0
     assert rep.margin_rel == pytest.approx(rep.margin / rep.selection_score)
     assert rep.runner_up_score < rep.selection_score
+    assert rep.degenerate is False
+    assert rep.margin_rel > 1e-3
+    # 比较的确实是两个 s1=-1 的候选
+    assert rep.scores[CONVENTIONS.index((res.s1, res.s2))] == \
+        pytest.approx(rep.selection_score)
+    assert rep.scores[CONVENTIONS.index((-1, 1 if res.s2 == -1 else -1))] == \
+        pytest.approx(rep.runner_up_score)
+
+
+def test_choose_convention_warns_when_the_remaining_choice_is_degenerate():
+    """两个 s1=−1 的候选分数几乎相同 -> **必须告警**, 且告警要说明后果。
+
+    退化区不是"可复现性"问题: 选错相位约定会让 55%~65% 的 (k,带) 换候选
+    归属 ⇒ 整张费米面错形(实测 Pearson 0.16 vs 0.99)。
+    """
+    arr = np.array([0.600002, 0.60, 0.600001, 0.60])
+    with pytest.warns(UserWarning, match="退化") as rec:
+        s1, s2, rep = _choose_convention(arr)
+    assert (s1, s2) == (-1, 1)
     assert rep.degenerate is True
     assert rep.margin_rel < 1e-3
+    msg = str(rec[0].message)
+    assert "费米面" in msg and "错形" in msg
 
 
 def test_unfold_supercell_reports_per_state_dominance_distribution():
