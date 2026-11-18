@@ -7,6 +7,7 @@ fixture = 3x3x1 MoS2 超胞 (27 原子) + 原胞 (3 原子), M = diag(3,3,1), de
 """
 import warnings
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -16,9 +17,13 @@ from unfoldfs.geometry import (candidate_g_vectors, read_poscar, read_transmat,
 from unfoldfs.unfold import (CONVENTIONS, build_atom_copies, candidate_g_for_k,
                              select_phase_convention, unfold_at_k,
                              unfold_supercell)
-from unfoldfs.vaspio import read_eigenval, read_procar
+from unfoldfs.vaspio import BandData, ProcarData, read_eigenval, read_procar
 from tests.conftest import (FIXTURE_EIGENVAL, FIXTURE_POSCAR,
                             FIXTURE_PRIMCELL, FIXTURE_PROCAR, FIXTURE_TRANSMAT)
+
+# 超胞展开路径的**逐位**基线(det(M)=9 的 fixture): 由"修复轮 4"之前的
+# 代码生成, 用来锁住"新增 det(M)=1 直通分支后超胞路径逐位不变"。
+_GOLDEN_DET9 = Path(__file__).parent / "data" / "unfold_supercell_det9_golden.npz"
 
 
 def _fixture():
@@ -584,3 +589,137 @@ def test_candidate_g_for_k_is_robust_to_k_outside_the_first_bz():
         got = sorted(map(tuple, np.round(
             (np.mod(k_shift, 1.0) + g2) @ fx["tr"].m_inv.T, 9)))
         assert got == ref
+
+
+# ------------------------------------------------------------------ det(M)=1 直通模式
+#
+# det(M)=1 ⇒ "超胞"就是原胞, 没有折叠、没有多份副本。但工具原来的 Popescu
+# 路径在数学上**退化**: 候选 G 只有一个(g=0) ⇒ 4 种相位约定的主导度必然
+# 都是 1.0(完全相同)⇒ 择优守卫抛"4 种相位约定没有区分度", 工具连原胞
+# 都算不了。
+#
+# ⇒ det(M)=1 时**不做展开**, 直接用原胞的带能量与轨道投影权重
+#     w_n(k) = Σ_{ion,lm} |c_{ion,lm,n}(k)|²      (非相干和)
+# 与超胞展开模式的权重(Popescu 的**相干** G 投影)不是同一个定义。
+
+def _primitive_direct_fixture():
+    """det(M)=1 的合成数据: 原胞当超胞(TRANSMAT = 单位阵)。
+
+    PROCAR 的复投影系数是**已知**的 ⇒ 权重可以逐带逐 k 独立核对。
+    """
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    tr = resolve_transform(prim, prim, np.eye(3, dtype=int))
+    copies = build_atom_copies(prim, prim, tr)
+    k_list = np.array([[0.0, 0.0, 0.0], [0.25, 0.5, 0.0]])
+    n_k, n_band, n_ions, norb = 2, 3, 3, 9
+    rng = np.random.default_rng(20261118)
+    coeffs = (rng.normal(size=(n_k, n_band, n_ions, norb))
+              + 1j * rng.normal(size=(n_k, n_band, n_ions, norb)))
+    # 第 2 个 k 的带能量**故意乱序** ⇒ 用来验证"按能量升序 + 权重跟着重排"
+    energies = np.array([[-10.0, -4.0, 1.0], [1.0, -9.0, -3.0]])
+    band = BandData(kpoints=k_list.copy(), energies=energies,
+                    occupations=np.array([[1.0, 1.0, 0.0], [1.0, 0.0, 1.0]]),
+                    efermi=float("nan"))
+    procar = ProcarData(kpoints=k_list.copy(), weights=np.abs(coeffs) ** 2,
+                        coeffs=coeffs, has_phase=True)
+    return {
+        "prim": prim, "tr": tr, "copies": copies, "band": band,
+        "procar": procar, "k_list": k_list, "coeffs": coeffs,
+        "energies": energies,
+        "b_prim": reciprocal(prim.lattice), "b_super": reciprocal(prim.lattice),
+    }
+
+
+def _unfold_primitive_direct(pd):
+    return unfold_supercell(
+        pd["band"], pd["procar"], pd["tr"], pd["copies"], pd["tr"].m_eff,
+        pd["prim"].lattice, pd["prim"].positions @ pd["prim"].lattice,
+        pd["b_prim"], pd["b_super"], pd["k_list"])
+
+
+def test_primitive_direct_mode_does_not_raise_when_det_is_one():
+    """det(M)=1 时**不能**抛"4 种相位约定没有区分度"。
+
+    det(M)=1 只有一个候选 G ⇒ 4 种约定的主导度必然相同 ⇒ 原来的守卫会把
+    原胞自己的计算也拒掉(用户要的正是原胞的费米面)。
+    """
+    pd = _primitive_direct_fixture()
+    res = _unfold_primitive_direct(pd)
+    assert res.energies.shape == (2, 1, 3)      # (n_k, det=1, n_band)
+    assert res.weights.shape == (2, 1, 3)
+    assert res.valid is not None and res.valid.all()
+
+
+def test_primitive_direct_weights_are_the_orbital_projection_sums():
+    """权重 = Σ_{ion,lm} |c_{ion,lm,n}(k)|²(非相干和), 逐带逐 k 核对。"""
+    pd = _primitive_direct_fixture()
+    res = _unfold_primitive_direct(pd)
+    expect = np.sum(np.abs(pd["coeffs"]) ** 2, axis=(2, 3))     # (n_k, n_band)
+    # 第 2 个 k 的带是乱序的 ⇒ 期望值也要按能量升序重排
+    order = np.argsort(pd["energies"], axis=1, kind="stable")
+    expect = np.take_along_axis(expect, order, axis=1)
+    assert np.allclose(res.weights[:, 0, :], expect, rtol=1e-12, atol=0.0)
+
+
+def test_primitive_direct_energies_are_sorted_ascending():
+    pd = _primitive_direct_fixture()
+    res = _unfold_primitive_direct(pd)
+    e = res.energies[:, 0, :]
+    assert np.all(np.diff(e, axis=1) >= 0.0)
+    # 排序后的能量集合与 EIGENVAL 的能量集合相同(只是换了顺序)
+    assert np.allclose(np.sort(pd["energies"], axis=1), e)
+
+
+def test_primitive_direct_skips_the_convention_selection():
+    """直通模式**没有**相位约定可择优 ⇒ DominanceReport 必须是"不适用"的填充值。
+
+    不能伪造分数(比如硬写 1.0)—— 那会让读者以为做过择优。
+    """
+    pd = _primitive_direct_fixture()
+    res = _unfold_primitive_direct(pd)
+    rep = res.dominance_report
+    assert rep is not None
+    assert rep.scores == ()
+    assert np.isnan(rep.selection_score)
+    assert np.isnan(rep.runner_up_score)
+    assert np.isnan(res.dominance)
+
+
+def test_primitive_direct_is_not_the_popescu_coherent_weight():
+    """直通模式(Σ|c|²)与展开模式(Popescu 相干 G 投影)不是同一个定义。
+
+    det(M)=1 时 Popescu 权重会退化成 |Σ_i e^{i k'·r_i} Σ_lm c_{i,lm}|² ——
+    逐原子的**相干**求和。两者必须不同(否则文档里"两种模式"的说法是假的)。
+    """
+    pd = _primitive_direct_fixture()
+    res = _unfold_primitive_direct(pd)
+    c = pd["coeffs"]
+    # Popescu(相干): 先在原胞原子上相干求和, 再取模方
+    bloch = np.exp(1j * ((pd["k_list"] @ pd["b_prim"])
+                         @ (pd["prim"].positions @ pd["prim"].lattice).T))  # (n_k,n_ions)
+    coherent = np.abs(np.einsum("ki,kbin->kb", bloch, c)) ** 2
+    incoherent = np.sum(np.abs(c) ** 2, axis=(2, 3))
+    assert not np.allclose(coherent, incoherent, rtol=1e-6)
+    # 而工具给的是**非相干**的那一个
+    assert np.allclose(res.weights[:, 0, :],
+                       np.take_along_axis(incoherent,
+                                          np.argsort(pd["energies"], axis=1,
+                                                     kind="stable"), axis=1),
+                       rtol=1e-12, atol=0.0)
+
+
+def test_supercell_path_is_bit_identical_after_the_primitive_direct_branch():
+    """回归锁: det(M)=9 的超胞展开路径**逐位不变**。
+
+    基线是"修复轮 4"之前(只有超胞路径)的代码生成的 npz。
+    """
+    fx = _fixture()
+    res = _unfold_supercell(fx)
+    g = np.load(_GOLDEN_DET9)
+    assert np.array_equal(res.k_cand, g["k_cand"])
+    assert np.array_equal(res.energies, g["energies"])
+    assert np.array_equal(res.weights, g["weights"])
+    assert np.array_equal(res.valid, g["valid"])
+    assert (res.s1, res.s2) == (int(g["s1"]), int(g["s2"]))
+    assert res.dominance == float(g["dominance"])
+    assert res.dominance_report.scores == tuple(g["scores"])

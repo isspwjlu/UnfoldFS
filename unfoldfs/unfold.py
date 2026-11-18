@@ -13,6 +13,17 @@
 2. 相位符号约定 (s1, s2) 由 4 种组合的「单 G 主导度」自动择优(原型实测
    主导度 0.85~1.0, 非主导候选的权重掉到 ~1e-33)。
 
+**两种模式(权重定义不同, 不可混用)**:
+
+* **超胞展开模式**(det(M) > 1): 上面的 Popescu 公式。权重是**相干**的 ——
+  先在原胞原子上相干求和再取模方, 它是"这个态落在哪个候选 G 上"的权重。
+* **原胞直通模式**(det(M) == 1): "超胞"就是原胞, 没有折叠也没有多份副本,
+  Popescu 路径**在数学上退化**(候选 G 只有一个 ⇒ 4 种相位约定的主导度
+  必然完全相同 ⇒ 择优守卫会拒掉原胞自己的计算)。此时**不做展开**, 直接用
+  原胞的带能量与**轨道投影权重** ``w_n(k) = Σ_{ion,lm} |c_{ion,lm,n}(k)|²``
+  (**非相干**和, 教科书定义, 也是 vaspkit 282 用的那个量)。
+  ⇒ 两种模式的**费米面形状不可直接比较**。
+
 约定(与 geometry.py 一致):
 
 * 晶格行 = 实矢量; 倒格矢行 = 倒矢量(含 2π);
@@ -448,6 +459,49 @@ def _match_k(target: np.ndarray, source: np.ndarray,
     return idx
 
 
+def _unfold_primitive_direct(band: BandData, procar: ProcarData,
+                              band_idx: np.ndarray, pro_idx: np.ndarray,
+                              n_band: int, k_list: np.ndarray) -> UnfoldedResult:
+    """det(M)=1 的**直通分支**: 原胞自己的能带 + 轨道投影权重。
+
+    det(M)=1 ⇒ "超胞"就是原胞: 没有折叠、没有多份副本。Popescu 路径在这里
+    **数学上退化** —— 候选 G 只有一个(g=0), 于是 4 种相位约定的主导度必然
+    都等于 1.0(完全相同), 择优守卫会把原胞自己的计算也拒掉。
+
+    ⇒ 这里**不做展开**: 能量 = EIGENVAL 的带能量(逐 k 按能量升序),
+    权重 = ``Σ_{ion,lm} |c_{ion,lm,n}(k)|²``(**非相干**和)。
+
+    ⚠ **权重定义与超胞展开模式不同**:
+      * 直通模式: Σ_{ion,lm}|c|² —— 逐轨道模方相加(教科书定义);
+      * 展开模式: Popescu 的 ``|Σ_i e^{i k'·r_i} Σ_lm p_i(lm)|²`` ——
+        先在原胞原子上**相干**求和再取模方。
+      两者在 det(M)=1 时给出**不同**的数 ⇒ 两种模式的费米面形状不可直接比较。
+
+    相位约定择优与它的守卫在这里**整体跳过**(没有展开就没有约定可择优);
+    ``DominanceReport`` 用 NaN 填充 —— **不伪造分数**。
+    """
+    n_k = k_list.shape[0]
+    w = np.zeros((n_k, n_band))
+    for ik in range(n_k):
+        c = np.asarray(procar.coeffs[pro_idx[ik], :n_band])   # (nb, n_ions, norb)
+        w[ik] = np.sum(np.abs(c) ** 2, axis=(1, 2))
+    e = np.asarray(band.energies, dtype=float)[band_idx, :n_band]
+    # 逐 k 按能量升序(权重跟着一起重排)—— 与展开模式"候选内按能量升序"同口径,
+    # 下游(fsout / band)不需要区分两种模式。
+    order = np.argsort(e, axis=1, kind="stable")
+    e = np.take_along_axis(e, order, axis=1)
+    w = np.take_along_axis(w, order, axis=1)
+
+    k_cand = np.mod(k_list, 1.0)[:, None, :]        # (n_k, 1, 3) 候选只有 g=0
+    energies = e[:, None, :]                       # (n_k, 1, n_band)
+    weights = w[:, None, :]
+    valid = np.ones(energies.shape, dtype=bool)
+    report = DominanceReport()                      # 全 NaN: 不适用, 不伪造
+    return UnfoldedResult(k_cand=k_cand, energies=energies, weights=weights,
+                           s1=1, s2=1, dominance=float("nan"),
+                           valid=valid, dominance_report=report)
+
+
 def unfold_supercell(band: BandData, procar: ProcarData, tr: Transform,
                      copies: AtomCopies, m_eff: np.ndarray,
                      a_prim: np.ndarray, prim_cart: np.ndarray,
@@ -469,6 +523,10 @@ def unfold_supercell(band: BandData, procar: ProcarData, tr: Transform,
     会选出**不同**的约定(164/240 个 (k,带) 的候选归属改变 -> 费米面改变)。
     选定约定后只做**一次**全量权重 pass。
 
+    **det(M) == 1 时走直通分支**(见 ``_unfold_primitive_direct``): 不做展开,
+    权重是轨道投影 Σ_{ion,lm}|c|²; 相位约定择优与它的守卫整体跳过。
+    ``strict_dominance`` 在直通模式下无意义(没有主导度可查), 忽略。
+
     strict_dominance: True 时要求**每个态**的单 G 主导度都 >= MIN_DOMINANCE
         (简报自检①的严格版)。默认关闭 —— 合成 fixture 上有 10.8% 的态低于
         0.5, 严格版会误报; 真实 VASP 数据上应当打开。
@@ -489,6 +547,10 @@ def unfold_supercell(band: BandData, procar: ProcarData, tr: Transform,
             f"EIGENVAL 有 {n_band_eig} 条带而 PROCAR 有 {n_band_pro} 条 —— "
             f"只展开前 {n_band} 条(取两者的最小值); 两个文件的带数不一致, "
             "请检查计算输出", UserWarning, stacklevel=2)
+
+    if det_m == 1:
+        return _unfold_primitive_direct(band, procar, band_idx, pro_idx,
+                                        n_band, k_list)
 
     cp = _copy_arrays(copies, a_prim)
 

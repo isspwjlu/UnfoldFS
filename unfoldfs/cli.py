@@ -420,6 +420,21 @@ def _check_grid_map_consistency(gm, tr, prim, sc) -> None:
                 "`unfoldfs gen`。")
 
 
+def _print_convention_line(unfolded, det: int) -> None:
+    """打印相位约定那一行 —— 直通模式(det(M)=1)下**没有**约定可择优。
+
+    直通模式不能打印"单 G 主导度 nan"(那是个填充值, 不是分数), 也不该
+    打印 s1/s2(没有择优发生过)⇒ 换成一行说清模式与权重定义的话。
+    """
+    if det == 1:
+        print("模式          : 原胞直通 (det(M)=1 —— 不做展开; "
+              "权重 = Σ_{ion,lm}|c|², 与超胞展开模式的 Popescu G 投影不是"
+              "同一个定义)")
+        return
+    print(f"相位约定      : s1 = {unfolded.s1:+d}, s2 = {unfolded.s2:+d} "
+          f"(单 G 主导度 {unfolded.dominance:.4f})")
+
+
 def cmd_unfold(args: argparse.Namespace) -> int:
     """读 VASP 输出 -> 反折叠 -> 对称扩展 -> 写费米面文件。"""
     run_dir = args.dir
@@ -521,8 +536,7 @@ def cmd_unfold(args: argparse.Namespace) -> int:
         strict_dominance=args.strict_dominance)
     expanded = expand_to_full_grid(unfolded, gm)
 
-    print(f"相位约定      : s1 = {unfolded.s1:+d}, s2 = {unfolded.s2:+d} "
-          f"(单 G 主导度 {unfolded.dominance:.4f})")
+    _print_convention_line(unfolded, tr.det)
     print(f"VBM / CBM     : {vbm_txt}")
     print(f"E_F           : {e_f:.6f} eV  (--ef {args.ef}, "
           f"--delta {args.delta:g})")
@@ -728,8 +742,7 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
     write_klabels(klabels_path, labels)
     write_band_dat(dat_path, dist, energy, weight)
 
-    print(f"相位约定      : s1 = {unfolded.s1:+d}, s2 = {unfolded.s2:+d} "
-          f"(单 G 主导度 {unfolded.dominance:.4f})")
+    _print_convention_line(unfolded, tr.det)
     print(f"E_F           : {e_f:.6f} eV  (--ef {args.ef}, --delta {args.delta:g})")
     print(f"路径点        : {path.n_k}(高对称点 "
           f"{', '.join(lab for lab, _ in labels)})")

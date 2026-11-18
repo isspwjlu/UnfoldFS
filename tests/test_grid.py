@@ -8,8 +8,9 @@ from unfoldfs.geometry import (SymmetryOps, candidate_g_vectors,
 from unfoldfs.grid import (GridSpec, build_grid_map, choose_grid_points,
                             decompose_grid, filter_ops_by_grid,
                             grid_resolution, load_grid_map,
-                            matrix_denominator_lcm, primitive_grid_points,
-                            save_grid_map, supercell_kpoints, write_kpoints)
+                            matrix_denominator_lcm, per_dimension_multiples,
+                            primitive_grid_points, save_grid_map,
+                            supercell_kpoints, write_kpoints)
 from tests.conftest import FIXTURE_POSCAR, FIXTURE_PRIMCELL, FIXTURE_TRANSMAT
 
 # spglib 的平移代表元带 ~3e-8 数值残差(硬化只吸附接近 0/1 的分量)
@@ -63,17 +64,69 @@ def test_grid_point_count_matches_spec():
     assert primitive_grid_points(spec).shape[0] == spec.n_points == 36
 
 
-def test_choose_grid_points_respects_comm():
-    # 第二参必须是 resolve_transform 探测过行/列约定的 m_eff(与 CLI 口径一致);
-    # 直接传原始 TRANSMAT 在"对称 M"下恰好相等, 掩盖了行/列约定的隐患。
+def test_choose_grid_points_uses_per_dimension_multiples_for_a_diagonal_m():
+    """对角 M: 逐维约束 M_ii | P_i(不是全局 LCM)。
+
+    第二参必须是 resolve_transform 探测过行/列约定的 m_eff(与 CLI 口径一致);
+    直接传原始 TRANSMAT 在"对称 M"下恰好相等, 掩盖了行/列约定的隐患。
+    """
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    sc = read_poscar(str(FIXTURE_POSCAR))
+    m = read_transmat(str(FIXTURE_TRANSMAT))
+    tr = resolve_transform(sc, prim, m)
+    # 逐维约束本身: M = diag(3,3,1) -> (3, 3, 1)(第三维没被放大 -> 倍数是 1)
+    assert per_dimension_multiples(tr.m_eff) == (3, 3, 1)
+    spec = choose_grid_points(prim.lattice, tr.m_eff, resolution=0.2,
+                              grid_type="gamma")
+    # 前两维必须是 3 的倍数, 第三维(M_33=1)不受约束
+    assert spec.p[0] % 3 == 0
+    assert spec.p[1] % 3 == 0
+    assert matrix_denominator_lcm(tr.m_eff) == 3
+
+
+def test_choose_grid_points_leaves_the_unenlarged_axis_free():
+    """M = diag(3,3,1): 第 3 维**没有**放大 ⇒ P_3 不该被强制成 3 的倍数。
+
+    真实 monolayer 的 c 轴有 ~17.7 Å 真空, P_3=1 就够; 旧的**全局** LCM
+    (= comm(M^-1) = 3)把它强制成 3 的倍数 ⇒ 白烧机时, 且"6x6x1"这种
+    物理上合理的网格在 --resolution 路径上不可达。
+    """
     prim = read_poscar(str(FIXTURE_PRIMCELL))
     sc = read_poscar(str(FIXTURE_POSCAR))
     m = read_transmat(str(FIXTURE_TRANSMAT))
     tr = resolve_transform(sc, prim, m)
     spec = choose_grid_points(prim.lattice, tr.m_eff, resolution=0.2,
                               grid_type="gamma")
-    assert all(p % 3 == 0 for p in spec.p)
-    assert matrix_denominator_lcm(tr.m_eff) == 3
+    assert spec.p[2] != 3
+    assert spec.p[2] % 3 != 0 or spec.p[2] == 1
+
+
+def test_choose_grid_points_keeps_the_global_lcm_for_a_non_diagonal_m():
+    """**非对角** M 下逐维条件不成立(候选 G 集跨维耦合)⇒ 必须用全局 LCM。
+
+    M = [[2,1,0],[0,2,0],[0,0,1]] 的 comm(M^-1) = 4。
+    """
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    m = np.array([[2, 1, 0], [0, 2, 0], [0, 0, 1]])
+    comm = matrix_denominator_lcm(m)
+    assert comm == 4
+    spec = choose_grid_points(prim.lattice, m, resolution=0.2,
+                              grid_type="gamma")
+    assert all(p % comm == 0 for p in spec.p)
+
+
+def test_the_chosen_grid_folds_self_consistently():
+    """逐维约束下选出的网格仍满足 n_points == n_k·det(M)(折叠是 1:1 的)。"""
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    sc = read_poscar(str(FIXTURE_POSCAR))
+    m = read_transmat(str(FIXTURE_TRANSMAT))
+    tr = resolve_transform(sc, prim, m)
+    for resolution in (0.5, 0.2, 0.1):
+        spec = choose_grid_points(prim.lattice, tr.m_eff, resolution=resolution)
+        grid = primitive_grid_points(spec)
+        k_super, full_to_k, weight = supercell_kpoints(grid, tr)
+        assert k_super.shape[0] * tr.det == spec.n_points, resolution
+        assert int(weight.sum()) == spec.n_points, resolution
 
 
 def test_choose_grid_points_scales_with_resolution():

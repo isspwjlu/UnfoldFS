@@ -437,3 +437,33 @@ def test_the_symmetry_invariance_test_is_still_present():
     found = re.search(r"^def test_expanded_spectral_function_"
                       r"is_invariant_under_the_point_group\(", src, re.M)
     assert found, "对称不变性测试被删掉了 —— 必须保留它作为回归锁"
+
+
+def test_each_grid_point_is_covered_by_exactly_one_supercell_candidate():
+    """折叠是 **1:1** 的: 每个原胞网格点只被**唯一**一个 (超胞 k, 候选) 覆盖。
+
+    这条结构性事实决定了"构造 C(把所有落到 k' 的 (K,G) 贡献加起来)"在自洽网格上
+    **退化成构造 A** —— 也就是 §15.2a 的判定实验的结论。
+
+    证明(见 docs/algorithms.md §15.2a): 候选集合 {G : (K+G)·M⁻ᵀ ∈ [0,1)³} 与
+    原胞 k' 一一对应; 两个不同的 K 若有共同的候选 k', 则
+    k'·Mᵀ − K₁ ∈ Z³ 且 k'·Mᵀ − K₂ ∈ Z³ ⇒ K₁ ≡ K₂ (mod 1) ⇒ K₁ = K₂, 矛盾。
+    """
+    from unfoldfs.geometry import periodic_distance
+    gm, grid = _grid_map()
+    m_eff = np.asarray(gm.transform.m_eff, dtype=float)
+    m_inv_T = np.asarray(gm.transform.m_inv, dtype=float).T
+    n_cover = np.zeros(grid.shape[0], dtype=int)
+    for k in range(gm.n_k):
+        kk = np.mod(gm.k_super[k], 1.0)
+        g = candidate_g_for_k(kk, m_eff, m_inv_T)
+        cand = (kk + g) @ m_inv_T                  # (det,3) 该超胞 k 的全部候选
+        d = periodic_distance(grid, cand)
+        hit = d < 1e-6
+        # 每个候选至多覆盖一个网格点(否则候选集与网格不是一一对应)
+        assert hit.sum(axis=1).max() <= 1
+        n_cover += hit.sum(axis=1)
+    assert n_cover.min() >= 1, "有网格点没有被任何候选覆盖"
+    assert n_cover.max() == 1, (
+        f"有网格点被 {int(n_cover.max())} 个 (超胞 k, 候选) 覆盖 —— "
+        "折叠不是 1:1 的, §15.2a 的'构造 C ≡ 构造 A'结论就不再成立")
