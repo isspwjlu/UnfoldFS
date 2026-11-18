@@ -23,6 +23,9 @@
 
 k 侧约定: ``k'_prim = (K + g)·(M^-1)^T`` —— 倒空间用 M^-T, **注意转置**。
 
+对称操作作用到倒空间分数坐标上是 ``k @ R^-1 + t``(分数基的伴随是 R^-1,
+不是 R^T)—— 与 ``geometry.SymmetryOps.apply`` 同口径。
+
 ``k_cart`` 取**候选的**分数坐标(落在 [0,1)³ 内)而不是轨道像 p_i: 后者经
 ``ops.apply`` 取模后可能出现 0.99999997(真实格点是 0.0), 直接用会让
 笛卡尔坐标整整差一个倒格矢。
@@ -33,6 +36,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .geometry import periodic_delta, periodic_distance, rotation_inverse
 from .grid import GridMap, GridSpec
 from .unfold import UnfoldedResult, candidate_g_for_k
 
@@ -64,37 +68,23 @@ class ExpandedData:
     spec: GridSpec
 
 
-def _periodic_delta(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """逐点周期距离: (n,3) x (n,3) -> (n,)。"""
-    d = np.abs(np.asarray(a, dtype=float) - np.asarray(b, dtype=float))
-    d = np.minimum(d, 1.0 - d)
-    return np.linalg.norm(d, axis=1)
-
-
-def _periodic_distance(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """两组分数坐标点之间的周期距离(L2): (n,3) x (m,3) -> (n,m)。
-
-    周期距离 = min(|Δ|, 1-|Δ|): 0.99999997 与 0.0 的距离是 3e-8 而不是 1。
-    """
-    d = np.abs(np.atleast_2d(a)[:, None, :] - np.atleast_2d(b)[None, :, :])
-    d = np.minimum(d, 1.0 - d)
-    return np.linalg.norm(d, axis=2)
-
-
 def _grid_frac_points(gm: GridMap) -> np.ndarray:
     """每个满网格点的原胞分数坐标(轨道像)。
 
     轨道代表点 ``ir_k_prim[ir]`` 经 ``rot_of_full[i]`` 号对称操作即得网格
     点 i; ``rot_of_full[i] == -1`` 表示该点就是代表点本身。
+
+    ⚠ 对称操作作用到**倒空间**分数坐标上是 ``k @ R^-1 + t``(不是 ``k @ R^T``) ——
+    分数基下的算符不是正交阵。与 ``SymmetryOps.apply`` 同口径(两者必须一致,
+    否则轨道像与网格点对不上, 展开会报"没有候选覆盖")。
     """
     ir = np.asarray(gm.full_to_ir, dtype=int)
     rot = np.asarray(gm.rot_of_full, dtype=int)
     idx = np.where(rot < 0, 0, rot)
     rots = gm.ops.rotations[idx]            # (n,3,3)
     trans = gm.ops.translations[idx]        # (n,3)
-    # 对称操作作用于行向量: k -> k @ R^T + t (与 SymmetryOps.apply 同口径)
-    p = np.einsum("oj,ojk->ok", gm.ir_k_prim[ir],
-                  np.swapaxes(rots, 1, 2)) + trans
+    invs = np.stack([rotation_inverse(r) for r in rots])   # (n,3,3) 整数
+    p = np.einsum("oj,ojk->ok", gm.ir_k_prim[ir], invs) + trans
     p = np.mod(p, 1.0)
     fixed = rot < 0
     if fixed.any():
@@ -145,7 +135,7 @@ def expand_to_full_grid(unfolded: UnfoldedResult, grid_map: GridMap,
         # 候选 G **逐 k 计算**: 一般 M 下候选集随 K 平移, 用全局 gset 会取错带
         g = candidate_g_for_k(kk, m_eff, m_inv_T)
         cand = (kk + g) @ m_inv_T            # (det,3) 候选原胞 k, 落在 [0,1)³
-        dist = _periodic_distance(p[sel], cand)
+        dist = periodic_distance(p[sel], cand)
         j = dist.argmin(axis=1)
         best = dist[np.arange(sel.size), j]
         bad = np.nonzero(best > tol)[0]
@@ -160,7 +150,7 @@ def expand_to_full_grid(unfolded: UnfoldedResult, grid_map: GridMap,
 
     # 候选索引必须与展开结果的候选轴一致(k_cand 是展开时算出的候选分数值)
     kc = np.asarray(unfolded.k_cand)[full_to_k, hits]
-    d = _periodic_delta(kc, p)
+    d = periodic_delta(kc, p)
     bad = np.nonzero(d > tol)[0]
     if bad.size:
         i = int(bad[0])

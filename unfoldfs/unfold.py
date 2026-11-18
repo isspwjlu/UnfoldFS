@@ -36,7 +36,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from .geometry import Structure, Transform
+from .geometry import Structure, Transform, periodic_distance
 from .vaspio import BandData, ProcarData
 
 __all__ = [
@@ -85,10 +85,6 @@ class AtomCopies:
     @property
     def n_atoms(self) -> int:
         return len(self.copies)
-
-    def n_copies(self) -> np.ndarray:
-        """每个原胞原子的副本数。"""
-        return np.array([len(lst) for lst in self.copies], dtype=int)
 
 
 @dataclass(frozen=True)
@@ -431,9 +427,7 @@ def _match_k(target: np.ndarray, source: np.ndarray,
     """
     t = np.mod(np.atleast_2d(np.asarray(target, dtype=float)), 1.0)
     s = np.mod(np.atleast_2d(np.asarray(source, dtype=float)), 1.0)
-    d = np.abs(t[:, None, :] - s[None, :, :])
-    d = np.minimum(d, 1.0 - d)                     # 周期距离
-    dist = np.linalg.norm(d, axis=2)              # (n_target, n_source)
+    dist = periodic_distance(t, s)                # (n_target, n_source)
     idx = dist.argmin(axis=1)
     best = dist[np.arange(t.shape[0]), idx]
     bad = np.nonzero(best > tol)[0]

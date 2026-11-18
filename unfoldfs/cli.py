@@ -33,13 +33,13 @@ from .fsout import (band_edges, has_fermi_crossing, make_e_grid,
                     select_fermi_energy, write_bxsf,
                     write_cube, write_fermisurfer_bands,
                     write_spectral_npz)
-from .geometry import (common_symmetry_ops, read_poscar, read_transmat,
-                       reciprocal, resolve_transform)
+from .geometry import (common_symmetry_ops_detailed, read_poscar,
+                       read_transmat, reciprocal, resolve_transform)
 from .grid import (GridSpec, build_grid_map, choose_grid_points,
-                   filter_ops_by_grid, load_grid_map, primitive_grid_points,
-                   save_grid_map, write_kpoints)
+                   filter_ops_by_grid_detailed, load_grid_map,
+                   primitive_grid_points, save_grid_map, write_kpoints)
 from .unfold import build_atom_copies, unfold_supercell
-from .vaspio import read_doscar_fermi, read_eigenval, read_procar
+from .vaspio import BandData, read_doscar_fermi, read_eigenval, read_procar
 
 __all__ = ["main", "cmd_gen", "cmd_unfold", "cmd_info"]
 
@@ -106,24 +106,31 @@ def _nbands_with_margin(n_occ_est: int) -> int:
 
 
 def _naive_supercell_count(p: Sequence[int],
-                            m_eff: np.ndarray) -> Optional[int]:
-    """朴素超胞网格的点数 ∏(P_i / M_ii)(M 非对角或不可整除时返回 None)。
+                            m_eff: np.ndarray) -> tuple:
+    """朴素超胞网格的点数 ∏(P_i / M_ii)(算不出来时返回 (None, 原因))。
 
     这是"不利用对称性时, 超胞 BZ 里 P_i/M_i 个点"的那一套 —— KPOINTS 里
     写的其实就是它(权重把对称等价点合并进同一个 k)。
+
+    返回 (点数 | None, 说明文字): 三种"算不出来"的原因分开给, 否则用户
+    只会看到一句笼统的"变换矩阵不是对角的"。
     """
     m = np.asarray(m_eff, dtype=float)
     if not np.allclose(m, np.diag(np.diag(m))):
-        return None
+        return None, ("变换矩阵不是对角的(有非零的非对角元) —— "
+                      "∏(P_i/M_i) 这个公式只适用于对角 M")
     diag = np.diag(m)
     if np.any(np.abs(diag - np.rint(diag)) > 1e-8):
-        return None
+        return None, "变换矩阵的对角元不是整数 —— ∏(P_i/M_i) 无意义"
     diag = np.rint(diag).astype(int)
     if np.any(diag <= 0):
-        return None
-    if any(int(p[i]) % int(diag[i]) != 0 for i in range(3)):
-        return None
-    return int(np.prod([int(p[i]) // int(diag[i]) for i in range(3)]))
+        return None, "变换矩阵含非正的对角元 —— 不是合法的超胞放大"
+    bad = [i for i in range(3) if int(p[i]) % int(diag[i]) != 0]
+    if bad:
+        axes = ", ".join(f"P_{i+1}={p[i]} (M_{i+1}={diag[i]})" for i in bad)
+        return None, (f"网格点数不是超胞对应维度的整数倍({axes}) —— "
+                      "∏(P_i/M_i) 不是整数")
+    return int(np.prod([int(p[i]) // int(diag[i]) for i in range(3)])), ""
 
 
 def _is_numeric_ef(mode) -> bool:
@@ -242,8 +249,11 @@ def cmd_gen(args: argparse.Namespace) -> int:
     spec = _resolve_grid_spec(prim, tr, args.resolution, args.grid,
                                args.grid_type)
     grid = primitive_grid_points(spec)
-    ops = filter_ops_by_grid(common_symmetry_ops(prim, tr.m_eff), grid)
-    gm = build_grid_map(spec, grid, ops, tr, b_prim, b_super)
+    # 公共对称集 + 被剔除的操作与原因(spec §7: info 里要列出剔除项)
+    all_ops, dropped = common_symmetry_ops_detailed(prim, tr.m_eff)
+    ops, dropped_grid = filter_ops_by_grid_detailed(all_ops, grid)
+    gm = build_grid_map(spec, grid, ops, tr, b_prim, b_super,
+                        dropped=tuple(dropped) + tuple(dropped_grid))
 
     # 自洽性: 满网格点数必须等于 n_k · det(M)(expand 的硬性前提)
     det = int(round(tr.det))
@@ -336,6 +346,58 @@ def _check_ef_in_gap(band, vbm: float, cbm: float, e_f: float,
     return "refuse", msg
 
 
+def _read_eigenval_needed(run_dir: str, mode) -> BandData:
+    """按需读 EIGENVAL, 并给出**可操作**的报错。
+
+    * E_F 的**选取**只有 ``auto``/``vbm`` 需要 EIGENVAL 的**占据数**
+      (VBM/CBM + 金属判据); 数值/``doscar`` 模式不需要它;
+    * 但**反折叠本身**需要 EIGENVAL 的**带能量** —— PROCAR 里没有能量。
+
+    ⇒ EIGENVAL 缺失时必须说清"缺的是哪一部分", 而不是甩一个裸的
+    ``[Errno 2] No such file or directory: ...EIGENVAL``。
+    """
+    path = os.path.join(run_dir, "EIGENVAL")
+    if os.path.exists(path):
+        return read_eigenval(path)
+    if str(mode).strip().lower() in ("auto", "vbm"):
+        raise ValueError(
+            f"--ef {mode} 需要 EIGENVAL 的占据数(求 VBM/CBM 与判金属), "
+            f"但 {path} 不存在。")
+    raise ValueError(
+        f"反折叠需要 EIGENVAL 的**带能量**(PROCAR 里没有能量), "
+        f"但 {path} 不存在。\n"
+        f"      注意: E_F 的选取本身不需要 EIGENVAL(--ef {mode} 已经给了明确的 "
+        f"E_F), 但带能量只有 EIGENVAL 里有。")
+
+
+def _check_grid_map_consistency(gm, tr, prim, sc) -> None:
+    """grid_map.npz 必须与当前的 POSCAR/PRIMCELL.vasp/TRANSMAT.in **自洽**。
+
+    不自洽时(用户把别的目录的 grid_map 混进来、或拷错了 POSCAR)在展开的
+    **最贵的一步之后**才会炸成一个看不懂的 IndexError
+    (``coeffs[:, cp.ion, :]`` 的离子下标越界)。⇒ 在最贵的一步**之前**挡住,
+    并说清是哪一项对不上。
+    """
+    gm_m = np.asarray(gm.transform.m_eff)
+    tr_m = np.asarray(tr.m_eff)
+    if not np.array_equal(gm_m, tr_m):
+        raise ValueError(
+            "grid_map 与 POSCAR/TRANSMAT 不自洽: 变换矩阵不同 —— "
+            f"grid_map 记的是 {gm_m.tolist()}, 而当前结构给出 {tr_m.tolist()}。"
+            "请确认 --dir 里的 grid_map.npz 与 POSCAR/PRIMCELL.vasp/"
+            "TRANSMAT.in 出自同一次 `unfoldfs gen`。")
+    for name, stored, now in (("b_prim", gm.b_prim, reciprocal(prim.lattice)),
+                              ("b_super", gm.b_super, reciprocal(sc.lattice))):
+        if not np.allclose(np.asarray(stored, dtype=float),
+                           np.asarray(now, dtype=float), atol=1e-6):
+            raise ValueError(
+                f"grid_map 与 POSCAR/PRIMCELL.vasp 不自洽: {name} 不同 —— "
+                f"grid_map 记的是 {np.asarray(stored).tolist()}, "
+                f"而当前结构给出 {np.asarray(now).tolist()}。"
+                "请确认 --dir 里的 grid_map.npz 与结构文件出自同一次 "
+                "`unfoldfs gen`。")
+
+
 def cmd_unfold(args: argparse.Namespace) -> int:
     """读 VASP 输出 -> 反折叠 -> 对称扩展 -> 写费米面文件。"""
     run_dir = args.dir
@@ -345,7 +407,7 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     gridmap_path = args.grid_map or os.path.join(run_dir, "grid_map.npz")
 
     gm = load_grid_map(gridmap_path)
-    band = read_eigenval(os.path.join(run_dir, "EIGENVAL"))
+    band = _read_eigenval_needed(run_dir, args.ef)
 
     # k 点数守卫: 比**真实**的 k 点数(EIGENVAL 里实际的 k 点块数), 不能拿
     # 截断后的自身比 —— 那样永远相等, 守卫形同虚设。
@@ -384,6 +446,7 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     prim = read_poscar(primcell)
     sc = read_poscar(supercell)
     tr = resolve_transform(sc, prim, read_transmat(transmat))
+    _check_grid_map_consistency(gm, tr, prim, sc)
     copies = build_atom_copies(prim, sc, tr)
     b_prim = reciprocal(prim.lattice)
     b_super = reciprocal(sc.lattice)
@@ -485,18 +548,32 @@ def _fs_comments(e_f: float, args: argparse.Namespace, vbm: float,
 
 # ------------------------------------------------------------------ info
 
+def _symmetry_summary(gm) -> str:
+    """'保留 N / 剔除 M(原因: …)' 一行摘要(spec §7 要求 info 列出剔除项)。"""
+    n_keep = int(gm.ops.rotations.shape[0])
+    dropped = list(getattr(gm, "dropped", ()) or ())
+    if not dropped:
+        return f"保留 {n_keep} / 剔除 0"
+    reasons: dict = {}
+    for _r, _t, why in dropped:
+        reasons[why] = reasons.get(why, 0) + 1
+    detail = "; ".join(f"{why} × {n}" for why, n in reasons.items())
+    return f"保留 {n_keep} / 剔除 {len(dropped)} (原因: {detail})"
+
+
 def cmd_info(args: argparse.Namespace) -> int:
     """打印网格规模、对称性与约化率。"""
     gridmap_path = args.grid_map or os.path.join(args.dir, "grid_map.npz")
     gm = load_grid_map(gridmap_path)
     p = gm.spec.p
     ratio = gm.n_k / float(gm.spec.n_points)
-    naive = _naive_supercell_count(p, gm.transform.m_eff)
-    naive_txt = ("n/a (变换矩阵不是对角的)" if naive is None
-                 else f"{naive} 点 (∏(P_i/M_i))")
+    naive, naive_reason = _naive_supercell_count(p, gm.transform.m_eff)
+    naive_txt = (f"{naive} 点 (∏(P_i/M_i))" if naive is not None
+                 else f"n/a ({naive_reason})")
     print(f"网格规格      : {p[0]} x {p[1]} x {p[2]} ({gm.spec.grid_type})")
     print(f"满网格点数    : {gm.spec.n_points}")
     print(f"对称不可约点  : {gm.n_ir}")
+    print(f"对称操作      : {_symmetry_summary(gm)}")
     print(f"实际计算 k 点 : {gm.n_k} (超胞分数坐标)")
     print(f"朴素超胞网格  : {naive_txt}")
     print(f"相对原胞满网格: {gm.n_k}/{gm.spec.n_points} = {ratio:.4f}")
@@ -532,7 +609,8 @@ def _add_gen_args(p: argparse.ArgumentParser) -> None:
 
 def _add_unfold_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--dir", required=True,
-                   help="VASP 计算目录(含 EIGENVAL/PROCAR/DOSCAR/grid_map.npz)")
+                   help="VASP 计算目录(含 EIGENVAL/PROCAR/grid_map.npz; "
+                        "DOSCAR 仅 --ef auto|doscar 需要)")
     p.add_argument("--supercell", default=None,
                    help="超胞 POSCAR(默认 <dir>/POSCAR)")
     p.add_argument("--primcell", default=None,
