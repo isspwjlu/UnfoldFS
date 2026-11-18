@@ -29,7 +29,8 @@ from typing import List, Optional, Sequence
 import numpy as np
 
 from .expand import build_spectral_function, expand_to_full_grid
-from .fsout import (band_edges, make_e_grid, select_fermi_energy, write_bxsf,
+from .fsout import (band_edges, has_fermi_crossing, make_e_grid,
+                    select_fermi_energy, write_bxsf,
                     write_cube, write_fermisurfer_bands,
                     write_spectral_npz)
 from .geometry import (common_symmetry_ops, read_poscar, read_transmat,
@@ -169,9 +170,14 @@ def _incar_suggested(grid_map, n_bands: int, encut: float, kpar: int,
         "迭代(实测单核机器上: 9 原子超胞 ~6 s/k 点, 27 原子超胞 ~2 min/k 点)。",
         "#   展宽只影响带边占据数(带隙体系的带边占据数必然是 0.98 这类小数), "
         "并不能让费米能更准。",
-        "#   有带隙的体系更推荐 ISMEAR = -5(四面体法): 占据数接近整数, "
-        "没有 DAV 收敛问题;",
-        "#   若改用 ISMEAR = -5, 请同时删掉 SIGMA(四面体法不接受展宽)。",
+        "#   **不要**改成四面体法(ISMEAR <= -4): 四面体法要求 VASP 从 KPOINTS "
+        "的**首行**自己解析 MP 网格",
+        "#   (首行须为 'M P G X Y Z SHIFT'), 与本工具的**显式 k 点列表**互斥; "
+        "本工具的 KPOINTS 首行是纯注释",
+        "#   => VASP 报 'Error reading KPOINTS file, at line: N+1'。"
+        "四面体法只与 KSPACING(VASP 自建网格)兼容。",
+        "#   想用更小的展宽就改成 ISMEAR = 0 + 更小的 SIGMA(仍是展宽法, "
+        "不改 k 点语义)。",
         f"# NBANDS = {n_bands} = 估计占据带数 {n_occ_est} + 空带余量 "
         f"{n_bands - n_occ_est}(至少 10 条)。",
         "#   NBANDS 由价电子数**估计**得出(表内 ZVAL, Mo=14/S=6 等), "
@@ -385,9 +391,16 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     # E_F 的选取与自检放在反折叠**之前**: 落在带隙深处时要在昂贵的计算之前
     # 就中止(而不是让用户等完再被告知结果没有意义)。
     # VBM/CBM 只在 EIGENVAL 里有占据态时才有意义; --ef <数值> 不该被它挡住
+    #
+    # 费米穿越 = 金属判据(与 fsout.has_fermi_crossing 同一个判据): 有带的
+    # 占据数在 k 上跨过 0.5。对金属而言 band_edges 给的 VBM/CBM 只是**表观值**
+    # (有限 k 网格的采样假象), 不能拿它当带隙。
+    fermi_crossing = has_fermi_crossing(band)
     try:
         vbm, cbm = band_edges(band)
         vbm_txt = f"{vbm:.6f} / {cbm:.6f} eV"
+        if fermi_crossing:
+            vbm_txt += " (金属: 表观值, 有限 k 网格的采样假象)"
     except ValueError as exc:
         vbm, cbm = float("nan"), float("nan")
         vbm_txt = f"不可用 ({exc})"
@@ -396,15 +409,25 @@ def cmd_unfold(args: argparse.Namespace) -> int:
 
     # ★ 自检: 选出的 E_F 落在带隙里 => 该能量上没有任何态 => 费米面是空的。
     # 这是"默认路径静默产出空费米面"的最后一道防线(不依赖 is_metal 的判定)。
+    #
+    # ⚠ **金属必须跳过这个检查**: 金属的表观带隙是采样假象(1T-TaS2 实测:
+    # 6x6x1 网格上表观 gap = 0.209156 eV, DOSCAR 的 E_F = -1.377658 正落在
+    # 里面), 而那个能量上其实**有**态(带 25/26/27 穿过费米能) ⇒ 拿它拒绝
+    # 执行会把一次成功的金属计算扔掉。
     numeric_ef = _is_numeric_ef(args.ef)
-    status, message = _check_ef_in_gap(band, vbm, cbm, e_f, args.sigma,
-                                        numeric_ef)
-    if status == "refuse":
-        raise ValueError(
-            message + "\n      半导体请用 --ef vbm (VBM+delta); "
-            "金属请检查 ISMEAR/展宽设置。已中止, 未写出任何费米面文件。")
-    if status in ("near", "warn"):
-        print(f"提示: {message}", file=sys.stderr)
+    if fermi_crossing:
+        print("提示: 检测到费米穿越(金属) —— 有带的占据数在 k 上跨过 0.5; "
+              "金属的表观带隙是有限 k 网格的采样假象, 跳过带隙检查。",
+              file=sys.stderr)
+    else:
+        status, message = _check_ef_in_gap(band, vbm, cbm, e_f, args.sigma,
+                                            numeric_ef)
+        if status == "refuse":
+            raise ValueError(
+                message + "\n      半导体请用 --ef vbm (VBM+delta); "
+                "金属请检查 ISMEAR/展宽设置。已中止, 未写出任何费米面文件。")
+        if status in ("near", "warn"):
+            print(f"提示: {message}", file=sys.stderr)
 
     # 展开必须传 gm.k_super(去重后的超胞 k), 不是 IR 点列表
     unfolded = unfold_supercell(

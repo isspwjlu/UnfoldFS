@@ -24,7 +24,8 @@ import numpy as np
 import pytest
 
 from unfoldfs.expand import ExpandedData, build_spectral_function
-from unfoldfs.fsout import (BOHR_IN_ANGSTROM, band_edges, is_metal, make_e_grid,
+from unfoldfs.fsout import (BOHR_IN_ANGSTROM, band_edges, has_fermi_crossing,
+                             is_metal, make_e_grid,
                              read_bxsf, read_cube, read_fermisurfer_band,
                              select_fermi_energy, write_bxsf,
                              write_cube, write_fermisurfer_bands,
@@ -176,12 +177,15 @@ def test_band_edges_rejects_a_file_without_occupied_states():
         band_edges(band)
 
 
-def test_is_metal_uses_the_gap_criterion_only():
-    """带边的**分数占据不再意味着金属**。
+def test_is_metal_ignores_fractional_occupations_at_the_band_edges():
+    """带边的**分数占据不意味着金属**。
 
     任何用了展宽的**有带隙**体系, 带边占据数都会变成 0.98 这类小数(高斯展宽
     与四面体法都一样) —— 用它判金属会把半导体误判成金属(实测: MoS2 的
     VBM=-2.077449 / CBM=-0.465849 / gap=1.61 eV 被判成金属)。
+
+    (Ruling 27 起, 金属判据是"费米穿越"**或**"带隙 <= gap_tol";
+    本例三个体系都**没有**费米穿越, 所以仍由带隙决定。)
     """
     smeared = _band([[-2.0, -0.05, 0.05, 3.0]], [[1.0, 0.6, 0.4, 0.0]])
     assert not is_metal(smeared)          # gap = 0.10 eV > gap_tol
@@ -273,6 +277,97 @@ def test_select_fermi_energy_auto_uses_doscar_ef_for_a_zero_gap():
     band = _band([[-2.0, 1.0, 1.0]], [[1.0, 1.0, 0.0]])
     assert select_fermi_energy(dos_ef=0.3, band=band, mode="auto") \
         == pytest.approx(0.3)
+
+
+# ------------------------------------------------------------------ 费米穿越
+
+# 1T-TaS2(金属)的**真实**形态(VASP 6.6.0, 12 k 点, 服务器实测):
+#   带 25 的占据数在 k 上是 0.1885..1.0198 ⇒ **跨过** 0.5 ⇒ 穿过费米能;
+#   而"表观带隙" VBM=-1.568592 / CBM=-1.359436 (gap 0.209156 eV) 是
+#   **有限 k 网格的采样假象**(最高占据态在 k#8, 最低空态在 k#1, 不在同一个 k),
+#   DOSCAR 的 E_F=-1.377658 正好落在这个假带隙里。
+# 下面两个夹具把这条带单独拿出来做**最小复现**。
+_METAL_E = [[-10.0, -6.0, -5.0, -4.6],
+            [-10.0, -6.0, -5.8, -4.6]]
+_METAL_OCC = [[1.0, 1.0, 0.4232, 0.0],
+              [1.0, 1.0, 1.0198, 0.0]]
+_METAL_DOS_EF = -5.4          # 落在表观带隙 (-5.8, -5.0) 里
+
+# 展宽半导体(MoS2 的真实形态): 带边占据 0.9866..1.0267 —— **整带都在 0.5
+# 以上**, 不跨过阈值 ⇒ 不是费米穿越。
+_SMEARED_E = [[-10.0, -6.0, -5.8, -4.6],
+              [-10.0, -6.0, -5.8, -4.6]]
+_SMEARED_OCC = [[1.0, 1.0, 0.9866, 0.0],
+                [1.0, 1.0, 1.0267, 0.0]]
+_SMEARED_DOS_EF = -5.2        # 落在表观带隙 (-5.8, -4.6) 里
+
+
+def test_has_fermi_crossing_is_true_when_a_band_crosses_the_threshold():
+    """某带的占据数在 k 上跨过 0.5 ⇒ 它穿过费米能 ⇒ 金属。"""
+    band = _band(_METAL_E, _METAL_OCC)
+    assert has_fermi_crossing(band)
+    # 阈值可调: 把阈值抬到 1.1 就跨不过了(1.0198 < 1.1)
+    assert not has_fermi_crossing(band, threshold=1.1)
+
+
+def test_has_fermi_crossing_is_false_for_a_smeared_band_edge():
+    """展宽的带边占据是 0.9866/1.0267 这类小数, 但**不跨过** 0.5。"""
+    band = _band(_SMEARED_E, _SMEARED_OCC)
+    assert not has_fermi_crossing(band)
+
+
+def test_is_metal_is_true_for_a_fermi_crossing_even_with_an_apparent_gap():
+    """金属的表观带隙是**采样假象**, 不能用它把金属判成半导体。
+
+    这里的表观 gap = 0.8 eV > gap_tol ⇒ 只有"费米穿越"这条判据能认出金属。
+    """
+    band = _band(_METAL_E, _METAL_OCC)
+    vbm, cbm = band_edges(band)
+    assert cbm - vbm > 0.05          # 表观带隙很大 —— 带隙判据会说"半导体"
+    assert is_metal(band)
+
+
+def test_is_metal_is_false_for_a_smeared_semiconductor():
+    """展宽半导体的带边占据(0.9866..1.0267)不能把半导体判成金属。"""
+    band = _band(_SMEARED_E, _SMEARED_OCC)
+    assert not is_metal(band)
+
+
+def test_is_metal_is_true_for_a_zero_gap():
+    band = _band([[-2.0, 1.0, 1.0]], [[1.0, 1.0, 0.0]])
+    assert is_metal(band)
+
+
+def test_select_fermi_energy_auto_takes_the_doscar_ef_for_a_fermi_crossing_metal():
+    """金属: auto 必须取 DOSCAR 的 E_F(而不是表观带隙里的 VBM+offset)。
+
+    实测(1T-TaS2): 表观 VBM=-1.568592, --ef auto 取 VBM+0.05 = -1.518592,
+    比真 E_F(-1.377658) 低 0.140934 eV ⇒ A(E_F)/A_max = 0.682 而不是 0.877。
+    """
+    band = _band(_METAL_E, _METAL_OCC)
+    ef = select_fermi_energy(dos_ef=_METAL_DOS_EF, band=band, mode="auto",
+                              offset=0.05)
+    assert ef == pytest.approx(_METAL_DOS_EF)
+    # 明确排除旧行为(VBM + offset)
+    assert ef != pytest.approx(-5.8 + 0.05)
+
+
+def test_select_fermi_energy_auto_keeps_the_vbm_for_a_smeared_semiconductor():
+    """展宽半导体: 表观带隙里含 DOSCAR 的 E_F ⇒ 仍然取 VBM+offset。"""
+    band = _band(_SMEARED_E, _SMEARED_OCC)
+    ef = select_fermi_energy(dos_ef=_SMEARED_DOS_EF, band=band, mode="auto",
+                              offset=0.05)
+    assert ef == pytest.approx(-5.8 + 0.05)
+    assert ef != pytest.approx(_SMEARED_DOS_EF)
+
+
+def test_select_fermi_energy_auto_ignores_the_threshold_for_doscar_and_numeric():
+    """数值 / doscar 模式不碰 EIGENVAL ⇒ 也不受费米穿越判据影响。"""
+    band = _band(_METAL_E, _METAL_OCC)
+    assert select_fermi_energy(dos_ef=_METAL_DOS_EF, band=band,
+                                mode="doscar") == pytest.approx(_METAL_DOS_EF)
+    assert select_fermi_energy(dos_ef=_METAL_DOS_EF, band=band,
+                                mode="-3.3") == pytest.approx(-3.3)
 
 
 # ------------------------------------------------------------------ FS.cube

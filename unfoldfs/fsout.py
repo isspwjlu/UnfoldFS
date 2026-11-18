@@ -33,7 +33,8 @@ from .vaspio import BandData
 
 __all__ = [
     "BOHR_IN_ANGSTROM",
-    "band_edges", "is_metal", "select_fermi_energy", "make_e_grid",
+    "band_edges", "has_fermi_crossing", "is_metal", "select_fermi_energy",
+    "make_e_grid",
     "write_cube", "write_bxsf", "write_fermisurfer_bands",
     "write_spectral_npz",
     "read_cube", "read_bxsf", "read_fermisurfer_band",
@@ -129,8 +130,35 @@ def band_edges(band: BandData, threshold: float = 0.5) -> tuple:
     return vbm, cbm
 
 
+def has_fermi_crossing(band: BandData, threshold: float = 0.5) -> bool:
+    """某个带在 k 网格上跨越占据阈值 => 它穿过费米能 => 金属。
+
+    与"存在分数占据"**不是**一回事: 展宽会让半导体的带边占据变成 0.98 这类
+    小数, 但那些带**不会跨过**阈值; 而金属的跨费米带在 k 上会从 ~1 变到 ~0。
+
+    实测(服务器端到端, VASP 6.6.0):
+
+    * 1T-TaS2(**金属**, 12 k 点): 带 25/26/27 的占据数分别是
+      0.1885..1.0198 / 0.1885..1.0198 / -0.0345..1.0198 ⇒ **跨过** 0.5
+      ⇒ 金属 ✓;
+    * MoS2(**半导体**, 带展宽): 带 27 的占据数是 0.9866..1.0267 ⇒ 整带都在
+      0.5 以上 ⇒ **不跨** ⇒ 不是金属 ✓;
+    * 整数占据的 fixture: 只有 0 与 1 ⇒ 不跨 ✓。
+
+    判据只依赖 EIGENVAL 的占据数, 不依赖展宽宽度, 也不需要额外物理参数。
+    """
+    occ = np.asarray(band.occupations, dtype=float)
+    if occ.ndim != 2 or occ.size == 0:
+        return False
+    for i in range(occ.shape[1]):
+        col = occ[:, i]
+        if col.min() < threshold < col.max():
+            return True
+    return False
+
+
 def is_metal(band: BandData, gap_tol: float = 0.05) -> bool:
-    """金属判据: **带隙 <= gap_tol**。
+    """金属判据: **费米穿越** 或 **带隙 <= gap_tol**。
 
     ⚠ "存在分数占据"**不是**金属判据: 任何用了展宽的**有带隙**体系, 带边的
     占据数都会变成 0.98 这类小数(高斯展宽与四面体法都一样) —— 用它判金属
@@ -138,9 +166,17 @@ def is_metal(band: BandData, gap_tol: float = 0.05) -> bool:
     gap=1.61 eV 因带边占据 0.9866 被判成金属, auto 于是取了带隙中央的
     DOSCAR E_F ⇒ 费米面是空的)。
 
+    ⚠ 反过来, **表观带隙也不能单独用来判金属**: 金属的"带隙"是**有限 k 网格
+    的采样假象**(1T-TaS2 实测: 6x6x1 网格上表观 gap = 0.209156 eV,
+    12x12x1 上 = 0.072827 eV —— 网格加密 4 倍, gap 缩到 1/3, 而 DOSCAR 的
+    E_F 一直落在这个假带隙里)。判金属要看**有没有带真的穿过费米能**
+    (``has_fermi_crossing``)。
+
     E_F 的最终选择见 ``select_fermi_energy`` 的 ``auto`` 分支(它还看
     DOSCAR 的 E_F 落在带隙的哪一侧)。
     """
+    if has_fermi_crossing(band):
+        return True
     vbm, cbm = band_edges(band)
     return bool(cbm - vbm <= gap_tol)
 
@@ -154,16 +190,23 @@ def select_fermi_energy(dos_ef: float, band: BandData, mode: str = "auto",
     * ``doscar``  总是 DOSCAR 的 E_F
     * 数值/数值字符串 -> 直接当作 E_F(绝对值, 不加 offset)
 
-    ``auto`` 的判据(不依赖展宽宽度, 因此不需要额外物理参数)::
+    ``auto`` 的判据(按**这个顺序**, 不依赖展宽宽度, 因此不需要额外物理参数)::
 
-        gap = CBM - VBM
-        gap <= gap_tol                 -> DOSCAR 的 E_F   (真金属/半金属)
-        VBM <= dos_ef <= CBM           -> VBM + offset    (E_F 落在带隙里)
-        否则                             -> DOSCAR 的 E_F   (E_F 在带隙外)
+        ① has_fermi_crossing(band)    -> DOSCAR 的 E_F   (金属: 有带穿过费米能)
+        ② gap = CBM - VBM <= gap_tol   -> DOSCAR 的 E_F   (零带隙/半金属)
+        ③ VBM <= dos_ef <= CBM         -> VBM + offset    (半导体: E_F 在带隙里)
+        ④ 否则                          -> DOSCAR 的 E_F   (E_F 在带隙外)
+
+    ①**必须先判**: 对金属而言 ``band_edges`` 给的 VBM/CBM 本身就是**有限 k
+    网格的采样假象**(1T-TaS2 实测: 6x6x1 网格上表观 gap = 0.209156 eV,
+    12x12x1 上 = 0.072827 eV —— 网格加密 4 倍 gap 就缩到 1/3, 而 DOSCAR 的
+    E_F 一直落在里面)。先看 gap 会把金属误判成半导体, auto 于是取了
+    VBM+offset(实测偏 0.141 eV / 0.039 eV)⇒ 费米面权重错一半。
 
     ⚠ "带边有分数占据" **不能**用来判金属: 用了展宽的有带隙体系, 带边占据数
     都会是 0.98 这类小数(实测: MoS2 的 gap=1.61 eV 被误判成金属, auto 于是
-    取了带隙中央的 DOSCAR E_F ⇒ 费米面是空的)。
+    取了带隙中央的 DOSCAR E_F ⇒ 费米面是空的)。真正的判据是"该带的占据数
+    在 k 上**跨过** 0.5"(见 ``has_fermi_crossing``)。
 
     **只有 ``auto`` 与 ``vbm`` 需要 EIGENVAL**: 数值与 ``doscar`` 模式完全不
     碰 EIGENVAL —— 用户明明白白给了 E_F, 不该被一个用不上的 EIGENVAL 挡住。
@@ -175,6 +218,10 @@ def select_fermi_energy(dos_ef: float, band: BandData, mode: str = "auto",
         if key in ("doscar", "dos"):
             return float(dos_ef)
         if key == "auto":
+            # ① 先判费米穿越(金属): 对金属而言 band_edges 给的 VBM/CBM 本身
+            #    就是采样假象, 不能拿来判带隙。
+            if has_fermi_crossing(band):
+                return float(dos_ef)
             try:
                 vbm, cbm = band_edges(band)
             except ValueError as exc:
@@ -183,7 +230,7 @@ def select_fermi_energy(dos_ef: float, band: BandData, mode: str = "auto",
                     f"的费米能 {float(dos_ef):.6f} eV。")
                 return float(dos_ef)
             gap = cbm - vbm
-            if gap <= gap_tol:                    # 真金属/半金属
+            if gap <= gap_tol:                    # 零带隙/半金属
                 return float(dos_ef)
             if vbm <= float(dos_ef) <= cbm:       # E_F 落在带隙里 ⇒ 半导体
                 return float(vbm) + float(offset)

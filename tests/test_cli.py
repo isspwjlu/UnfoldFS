@@ -81,17 +81,35 @@ def _supercell_frac():
     return np.array(out)
 
 
-def _write_mini_system(directory, occupations=None, band_energies=None):
+def _write_mini_system(directory, occupations=None, band_energies=None,
+                       k_points=None, occ_per_k=None, dos_ef=None):
     """写出一个自洽的迷你 VASP 计算目录。
 
     occupations: 4 个带的占据数(默认 1,1,0,0 -> 半导体);
         给 (1, 1, 0.4, 0) 则出现**带边分数占据**(展宽的产物)。
     band_energies: 4 个带的能量(默认 _BAND_ENERGIES);
-        给 _METAL_BAND_ENERGIES 则得到零带隙的**真金属**。
+        给 _METAL_BAND_ENERGIES 则得到零带隙的**真金属**;
+        给**每个 k 一行**的二维序列时, 逐 k 用各自的能量。
+    k_points: 超胞分数坐标的 k 点列表(默认只有 Gamma 一个点)。
+        **多 k 点**才能测出"某带的占据在 k 上跨过阈值"(费米穿越)。
+    occ_per_k: 每个 k 点一组占据数(给了 k_points 时必须给)。
+    dos_ef: DOSCAR 里的 E_F(默认 _DOS_EF)。
     """
     os.makedirs(directory, exist_ok=True)
     occ = occupations if occupations is not None else (1.0, 1.0, 0.0, 0.0)
     energies = band_energies if band_energies is not None else _BAND_ENERGIES
+    kpts = [(0.0, 0.0, 0.0)] if k_points is None \
+        else [(float(a), float(b), float(c)) for a, b, c in k_points]
+    occ_rows = [tuple(occ)] * len(kpts) if occ_per_k is None \
+        else [tuple(o) for o in occ_per_k]
+    assert len(occ_rows) == len(kpts)
+    if energies and isinstance(energies[0], (list, tuple)):
+        energies_per_k = [tuple(e) for e in energies]
+    else:
+        energies_per_k = [tuple(energies)] * len(kpts)
+    assert len(energies_per_k) == len(kpts)
+    energies = energies_per_k[0]
+    ef = _DOS_EF if dos_ef is None else float(dos_ef)
     a_sc = _M @ _A_PRIM
     _write_poscar(os.path.join(directory, "POSCAR"), "synthetic supercell",
                   a_sc, _supercell_frac(), ["Si"], [6])
@@ -113,11 +131,15 @@ def _write_mini_system(directory, occupations=None, band_energies=None):
                  "  0.500000000000000E-15\n")
         fh.write("  1.000000000000000E-004\n")
         fh.write("  CAR \n synthetic mini system\n")
-        fh.write("    2      1    %d\n" % len(energies))
+        fh.write("    2      %d    %d\n" % (len(kpts), len(energies)))
         fh.write("\n")
-        fh.write("  0.0000000E+00  0.0000000E+00  0.0000000E+00  1.0000000E+00\n")
-        for b, e in enumerate(energies):
-            fh.write("  %5d %14.6f %10.6f\n" % (b + 1, e, occ[b]))
+        for ik, kfrac in enumerate(kpts):
+            fh.write("  %14.7E %14.7E %14.7E %14.7E\n"
+                     % (kfrac[0], kfrac[1], kfrac[2], 1.0))
+            for b, e in enumerate(energies_per_k[ik]):
+                fh.write("  %5d %14.6f %10.6f\n"
+                         % (b + 1, e, occ_rows[ik][b]))
+            fh.write("\n")
 
     with open(os.path.join(directory, "DOSCAR"), "w", encoding="utf-8") as fh:
         fh.write("   6   6   1   0\n")
@@ -127,7 +149,7 @@ def _write_mini_system(directory, occupations=None, band_energies=None):
         fh.write("  1.000000000000000E-004\n")
         fh.write("  CAR \n synthetic mini system\n")
         fh.write("  1.000000000000000E+01 -1.000000000000000E+01  301"
-                 " %20.10E  1.000000000000000E+00\n" % _DOS_EF)
+                 " %20.10E  1.000000000000000E+00\n" % ef)
         for i in range(301):
             fh.write("  %14.6f 0.0000E+00 0.0000E+00\n"
                      % (-10.0 + i * 20.0 / 300.0))
@@ -140,28 +162,30 @@ def _write_mini_system(directory, occupations=None, band_energies=None):
                 coeffs[b, i * 3 + j, 0] = at[i] * _U[j]
     with open(os.path.join(directory, "PROCAR"), "w", encoding="utf-8") as fh:
         fh.write("PROCAR lm decomposed + phase\n")
-        fh.write("# of k-points:    1         # of bands:  %d"
-                 "         # of ions:    6\n" % len(energies))
+        fh.write("# of k-points: %3d         # of bands:  %d"
+                 "         # of ions:    6\n" % (len(kpts), len(energies)))
         fh.write("\n")
-        fh.write(" k-point     1 :    0.00000000 0.00000000 0.00000000"
-                 "     weight = 1.00000000\n")
-        for b, e in enumerate(energies):
-            fh.write("\n")
-            fh.write("band  %5d # energy  %14.8f # occ.  1.00000000\n"
-                     % (b + 1, e))
-            fh.write("\n")
-            fh.write("ion      s     tot\n")
-            tot = 0.0
-            for i in range(6):
-                m2 = abs(coeffs[b, i, 0]) ** 2
-                tot += m2
-                fh.write("  %3d  %12.8f  %12.8f\n" % (i + 1, m2, m2))
-            fh.write("tot   %12.8f  %12.8f\n" % (tot, tot))
-            fh.write("ion      s\n")
-            for i in range(6):
-                c = coeffs[b, i, 0]
-                fh.write("  %3d %14.8f %14.8f %14.8f\n"
-                         % (i + 1, c.real, c.imag, abs(c) ** 2))
+        for ik, kfrac in enumerate(kpts):
+            fh.write(" k-point %5d :    %.8f %.8f %.8f"
+                     "     weight = 1.00000000\n"
+                     % (ik + 1, kfrac[0], kfrac[1], kfrac[2]))
+            for b, e in enumerate(energies_per_k[ik]):
+                fh.write("\n")
+                fh.write("band  %5d # energy  %14.8f # occ.  1.00000000\n"
+                         % (b + 1, e))
+                fh.write("\n")
+                fh.write("ion      s     tot\n")
+                tot = 0.0
+                for i in range(6):
+                    m2 = abs(coeffs[b, i, 0]) ** 2
+                    tot += m2
+                    fh.write("  %3d  %12.8f  %12.8f\n" % (i + 1, m2, m2))
+                fh.write("tot   %12.8f  %12.8f\n" % (tot, tot))
+                fh.write("ion      s\n")
+                for i in range(6):
+                    c = coeffs[b, i, 0]
+                    fh.write("  %3d %14.8f %14.8f %14.8f\n"
+                             % (i + 1, c.real, c.imag, abs(c) ** 2))
     return directory
 
 
@@ -243,6 +267,27 @@ def test_gen_writes_kpoints_gridmap_and_incar(tmp_path):
     assert tags["ISMEAR"] == "1"
     assert tags["SIGMA"] == "0.2"
     assert tags["LWAVE"] == ".TRUE."
+
+
+def test_gen_incar_does_not_recommend_the_tetrahedron_method(tmp_path):
+    """Ruling 29: 不得推荐四面体法(ISMEAR <= -4)—— 它与本工具的 KPOINTS 互斥。
+
+    VASP 6.6.0 实测: ISMEAR <= -4 时 VASP **不使用**显式 k 点列表, 而是要求
+    从 KPOINTS 的**首行**自己解析 MP 网格(首行须为 'M P G X Y Z SHIFT'),
+    而本工具的 KPOINTS 首行是纯注释(显式 k 点列表)
+    => VASP 报 'Error reading KPOINTS file, at line: N+1'。
+    """
+    out = tmp_path / "run"
+    src = _write_mini_system(str(tmp_path / "src"))
+    cli.main(_gen_args(src, out, "--resolution", "1.6"))
+    incar = (out / "INCAR.suggested").read_text(encoding="utf-8")
+    assert "ISMEAR = -5" not in incar
+    # 注释里必须把"为什么不能用"说清楚
+    assert "四面体" in incar
+    assert "KPOINTS" in incar
+    tags = _parse_incar(incar)
+    assert tags["ISMEAR"] == "1"
+    assert tags["SIGMA"] == "0.2"
 
 
 def test_gen_incar_kpoints_is_free_of_the_vasp_auto_grid_wording(tmp_path):
@@ -553,6 +598,101 @@ def test_ef_auto_semiconductor_uses_vbm_plus_delta(tmp_path):
     cli.main(["unfold", "--dir", str(run), "--outdir", str(fs)])
     npz = np.load(str(fs / "A(k,E).npz"))
     assert float(npz["ef"]) == pytest.approx(-6.0 + 0.05, abs=1e-9)
+
+
+# ------------------------------------------------------------------ 金属路径
+
+# 1T-TaS2(金属)的**最小复现**: 一条带的占据数在 k 上跨过 0.5(费米穿越), 而
+# 硬阈值切出来的"表观带隙"是**有限 k 网格的采样假象** —— 最高占据态与最低
+# 空态**不在同一个 k** 上。
+#   实测(1T-TaS2, VASP 6.6.0, 12 k 点): 表观 VBM=-1.568592 / CBM=-1.359436
+#   (gap 0.209156 eV), DOSCAR E_F=-1.377658 正落在里面 ⇒ 旧代码把金属当成
+#   半导体, auto 取了 VBM+0.05 = -1.518592(比真 E_F 低 0.140934 eV),
+#   A(E_F)/A_max = 0.682 而不是 0.877。
+_METAL_SPEC = GridSpec(p=(3, 3, 1), grid_type="gamma", shift=(0.0, 0.0, 0.0))
+_METAL_BAND_E = ((-10.0, -6.0, -5.0, -4.6),
+                 (-10.0, -6.0, -5.8, -4.6),
+                 (-10.0, -6.0, -5.0, -4.6))
+_METAL_BAND_OCC = ((1.0, 1.0, 0.4232, 0.0),
+                   (1.0, 1.0, 1.0198, 0.0),
+                   (1.0, 1.0, 0.4232, 0.0))
+_METAL_DOS_EF = -5.4         # 落在表观带隙 (-5.8, -5.0) 里
+
+# 同样的几何, 但带 3 的占据数**整带都在 0.5 以上**(展宽的产物) ⇒ 半导体。
+# 带隙 1.2 eV, DOSCAR 的 E_F 落在带隙中央。
+_SEMI_BAND_E = ((-10.0, -6.0, -5.8, -4.6),
+                (-10.0, -6.0, -5.8, -4.6),
+                (-10.0, -6.0, -5.8, -4.6))
+_SEMI_BAND_OCC = ((1.0, 1.0, 0.9866, 0.0),
+                  (1.0, 1.0, 1.0267, 0.0),
+                  (1.0, 1.0, 0.9866, 0.0))
+_SEMI_DOS_EF = -5.2          # 落在表观带隙 (-5.8, -4.6) 里
+
+
+def _write_multi_k_run(directory, band_e, occ_per_k, dos_ef):
+    """多 k 点的迷你 VASP 计算目录(k 点取自 grid_map 的 k_super)。"""
+    _write_mini_system(directory, band_energies=band_e[0],
+                       occ_per_k=[occ_per_k[0]], dos_ef=dos_ef)
+    gm = _write_grid_map(directory, spec=_METAL_SPEC)
+    _write_mini_system(directory, band_energies=band_e,
+                       k_points=[tuple(k) for k in gm.k_super],
+                       occ_per_k=occ_per_k, dos_ef=dos_ef)
+    return gm
+
+
+def test_unfold_does_not_refuse_a_metal_whose_doscar_ef_sits_in_the_apparent_gap(
+        tmp_path, capsys):
+    """金属: 表观带隙是采样假象 ⇒ **不得**据此拒绝执行(Ruling 28)。
+
+    那个能量上其实**有**态(带 25/26/27 穿过费米能), 拒绝执行等于把一次
+    成功的金属计算扔掉。
+    """
+    run = tmp_path / "run"
+    _write_multi_k_run(str(run), _METAL_BAND_E, _METAL_BAND_OCC, _METAL_DOS_EF)
+    fs = tmp_path / "fs"
+    rc = cli.main(["unfold", "--dir", str(run), "--ef", "doscar",
+                   "--outdir", str(fs)])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "落在带隙内" not in err
+    assert (fs / "FS.cube").is_file()
+    assert (fs / "band.1").is_file()
+
+
+def test_unfold_auto_takes_the_doscar_ef_for_a_metal(tmp_path):
+    """金属: --ef auto 必须取 DOSCAR 的 E_F(不是表观 VBM + delta)。"""
+    run = tmp_path / "run"
+    _write_multi_k_run(str(run), _METAL_BAND_E, _METAL_BAND_OCC, _METAL_DOS_EF)
+    fs = tmp_path / "fs"
+    cli.main(["unfold", "--dir", str(run), "--ef", "auto", "--outdir", str(fs)])
+    npz = np.load(str(fs / "A(k,E).npz"))
+    assert float(npz["ef"]) == pytest.approx(_METAL_DOS_EF, abs=1e-9)
+    assert float(npz["ef"]) != pytest.approx(-5.8 + 0.05, abs=1e-9)
+
+
+def test_unfold_still_refuses_a_semiconductor_whose_doscar_ef_sits_in_the_gap(
+        tmp_path, capsys):
+    """半导体: E_F 落在带隙里 ⇒ **仍然拒绝**(Ruling 28 只对金属关闭这个检查)。"""
+    run = tmp_path / "run"
+    _write_multi_k_run(str(run), _SEMI_BAND_E, _SEMI_BAND_OCC, _SEMI_DOS_EF)
+    fs = tmp_path / "fs"
+    rc = cli.main(["unfold", "--dir", str(run), "--ef", "doscar",
+                   "--outdir", str(fs)])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "落在带隙内" in err
+    assert not fs.exists(), "拒绝执行时不能留下任何输出文件"
+
+
+def test_unfold_auto_keeps_the_vbm_for_a_smeared_semiconductor(tmp_path):
+    """展宽半导体: auto 仍然取 VBM+delta(费米穿越判据不能误伤半导体)。"""
+    run = tmp_path / "run"
+    _write_multi_k_run(str(run), _SEMI_BAND_E, _SEMI_BAND_OCC, _SEMI_DOS_EF)
+    fs = tmp_path / "fs"
+    cli.main(["unfold", "--dir", str(run), "--ef", "auto", "--outdir", str(fs)])
+    npz = np.load(str(fs / "A(k,E).npz"))
+    assert float(npz["ef"]) == pytest.approx(-5.8 + 0.05, abs=1e-9)
+    assert float(npz["ef"]) != pytest.approx(_SEMI_DOS_EF, abs=1e-9)
 
 
 # ------------------------------------------------------------------ C1 自检
