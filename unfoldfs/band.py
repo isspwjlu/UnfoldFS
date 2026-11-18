@@ -26,6 +26,11 @@ G 分辨权重**(路径点上取"原胞 k 等于该路径点"的那个候选的�
 ⚠ **已知限制(必须一并披露)**: 展开谱权重在晶体点群下**不协变**(实测最大相对偏差
 MoS₂ 9.186e-01 / 1T-TaS₂ 1.000e+00), 而**带能量不受影响**(对称相关点吻合到
 8e-6 eV) ⇒ **能带曲线可信, 能带的"形状/对称性"不可信**。
+
+⇒ **修复轮 5**: ``symmetrize_band_weights`` 把路径上**对称相关**的点的权重按
+点群轨道平均(默认开启, ``--no-symmetrize`` 可关)。但它**只动权重**、且
+**只在路径上存在对称相关点时**才生效(泛路径点的轨道离开路径) ⇒ 见
+docs/algorithms.md §16.7。
 """
 from __future__ import annotations
 
@@ -35,7 +40,7 @@ from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .geometry import periodic_distance
+from .geometry import SymmetryOps, periodic_distance
 
 __all__ = [
     "PathSegment", "BandPath", "read_kpath", "path_distances", "path_labels",
@@ -43,6 +48,7 @@ __all__ = [
     "write_band_dat", "select_zero_candidate", "assemble_band", "mirror_path",
     "plot_band", "read_klabels", "KLABELS_HEADER", "KLABELS_TIP",
     "GRD_FIELD_WIDTH", "CANDIDATE_TOL", "spread_order", "reorder_unfolded",
+    "symmetrize_band_weights",
 ]
 
 # vaspkit 的 .grd 每个数值占 14 列("%14.6f"); 行长 = 14 x 列数
@@ -333,6 +339,93 @@ def assemble_band(unfolded, k_prim: np.ndarray, tol: float = CANDIDATE_TOL
             energies[m:, i] = e[-1] if m else 0.0
             weights[m:, i] = 0.0
     return energies, weights
+
+
+def _path_orbits(k_prim: np.ndarray, ops: SymmetryOps,
+                 tol: float = CANDIDATE_TOL) -> List[np.ndarray]:
+    """把**路径上的**k 点按点群轨道分组(只保留也在路径上的成员)。
+
+    轨道成员 = 用 ops 的每个操作把点 i 映出去后, 落在**路径上**的那些点
+    (周期距离 <= tol)。泛路径点的轨道通常**离开**路径 ⇒ 只有一个成员
+    (即无操作) —— 这是"只在路径上做对称化"的必然结果, 见
+    docs/algorithms.md §16.7。
+    """
+    k = np.mod(np.atleast_2d(np.asarray(k_prim, dtype=float)), 1.0)
+    n = int(k.shape[0])
+    n_ops = int(ops.rotations.shape[0])
+    match = np.empty((n, n_ops), dtype=int)
+    for o in range(n_ops):
+        img = ops.apply(k, o)                     # (n,3) 每个路径点的对称像
+        d = periodic_distance(k, img)             # (n,n) 像 -> 路径上的点
+        j = d.argmin(axis=1)
+        best = d[np.arange(n), j]
+        match[:, o] = np.where(best <= tol, j, -1)
+    seen = np.zeros(n, dtype=bool)
+    orbits: List[np.ndarray] = []
+    for i in range(n):
+        if seen[i]:
+            continue
+        members = {i}
+        for o in range(n_ops):
+            j = int(match[i, o])
+            if j >= 0:
+                members.add(j)
+        idx = np.array(sorted(members), dtype=int)
+        seen[idx] = True
+        orbits.append(idx)
+    return orbits
+
+
+def symmetrize_band_weights(energies: np.ndarray, weights: np.ndarray,
+                            k_prim: np.ndarray, ops: SymmetryOps, *,
+                            tol: float = CANDIDATE_TOL,
+                            e_tol: float = 1e-3) -> np.ndarray:
+    """按点群轨道(限制在**路径上**的成员)平均展开谱权重(修复轮 5)。
+
+    展开谱权重在晶体点群下**不协变**(机制见 docs/algorithms.md §15), 于是
+    路径上**对称相关**的两点会给出不同的权重(同一段路径的两半颜色不同)。
+    这里把同一轨道上的权重取平均 —— 与 ``expand.symmetrize_spectral_function``
+    对费米面做的事同源, 只是对象是路径上的**权重矩阵**而不是 A(k,E)。
+
+    参数
+    ----
+    energies : (n_band, n_k) 带能量(eV), 行 = 带、列 = 路径点
+    weights  : (n_band, n_k) 带权重
+    k_prim   : (n_k, 3) 路径点的原胞分数坐标
+    ops      : 对称操作(原胞与超胞的公共对称操作)
+    e_tol    : 带能量的匹配容差(eV) —— 只有**各成员同一行的带能量彼此相符**
+               时才平均(否则那两行根本不是同一条带, 平均会把不同的带混起来)
+
+    返回
+    ----
+    与 ``weights`` 同形状的新数组。
+
+    ⚠ **通常是无操作**: 泛路径点的点群轨道**离开**路径 ⇒ 没有可比较的伙伴。
+    只有当路径**同时经过**对称相关的点(例如路径上出现 k 与 R·k)时才会生效。
+    ⚠ **只动权重, 不动能量**: 带能量本来就是对称的(对称相关点吻合 8e-6 eV)。
+    """
+    e = np.atleast_2d(np.asarray(energies, dtype=float))
+    w = np.atleast_2d(np.asarray(weights, dtype=float))
+    if e.shape != w.shape:
+        raise ValueError(f"energies 的形状 {e.shape} != weights 的形状 {w.shape}")
+    k = np.atleast_2d(np.asarray(k_prim, dtype=float))
+    if int(e.shape[1]) != int(k.shape[0]):
+        raise ValueError(
+            f"路径点数 {k.shape[0]} != 权重矩阵的列数 {e.shape[1]}")
+    out = np.array(w, dtype=float, copy=True)
+    for members in _path_orbits(k, ops, tol=tol):
+        if members.size < 2:
+            continue
+        sub_e = e[:, members]
+        sub_w = w[:, members]
+        # 逐行判定: 这一行在各成员上是不是**同一条带**(能量与参考成员相符)?
+        same_band = np.all(np.abs(sub_e - sub_e[:, 0:1]) <= e_tol, axis=1)
+        if not same_band.any():
+            continue
+        mean = sub_w[same_band].mean(axis=1)
+        for m in members:
+            out[same_band, m] = mean
+    return out
 
 
 def spread_order(n: int, n_sample: int = 4) -> np.ndarray:

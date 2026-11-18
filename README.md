@@ -105,7 +105,7 @@ unfoldfs gen --supercell POSCAR --primcell PRIMCELL.vasp --transmat TRANSMAT.in
 ```
 unfoldfs unfold --dir DIR [--supercell SUPERCELL] [--primcell PRIMCELL] [--transmat TRANSMAT]
                  [--grid-map GRID_MAP] [--ef EF] [--delta DELTA] [--sigma SIGMA]
-                 [--strict-dominance] [--outdir OUTDIR]
+                 [--strict-dominance] [--no-symmetrize] [--outdir OUTDIR]
 ```
 
 | 参数 | 必填 | 默认 | 说明 |
@@ -119,6 +119,7 @@ unfoldfs unfold --dir DIR [--supercell SUPERCELL] [--primcell PRIMCELL] [--trans
 | `--delta` | | `0.05` | 半导体时 `VBM + delta` 的偏移（eV） |
 | `--sigma` | | `0.06` | 谱函数展宽（eV） |
 | `--strict-dominance` | | 关 | 要求**每个态**的单 G 主导度 ≥ 0.5（严格模式） |
+| `--no-symmetrize` | | 关 | **不做**点群轨道对称化（默认**做**）⇒ `A(k,E)` 保持逐 (K,G) 的原始谱权重，费米面带对称性破缺 |
 | `--outdir` | | `fs` | 费米面文件输出目录 |
 
 `--ef` 的语义：
@@ -137,8 +138,22 @@ unfoldfs unfold --dir DIR [--supercell SUPERCELL] [--primcell PRIMCELL] [--trans
 > **跨过 0.5**）。金属时 CLI 也**跳过**"E_F 落在带隙内"的拒绝检查。
 > 详见 [`docs/algorithms.md`](docs/algorithms.md) §9。
 
-`unfold` 会打印选出的相位约定 `(s1, s2)` 与单 G 主导度、VBM/CBM、选出的 E_F，
-并把它们写进输出文件的头部与 `A(k,E).npz` 的元信息。
+`unfold` 会打印选出的相位约定 `(s1, s2)` 与单 G 主导度、VBM/CBM、选出的 E_F、
+**点群对称化是开是关**，并把它们写进输出文件的头部与 `A(k,E).npz` 的元信息。
+
+#### ★ 默认输出是**对称化后**的（点群轨道平均）
+
+展开得到的谱权重 `A(k,E)` 在晶体点群下**天然不协变**（对称相关的两个 k 点，
+谱函数可以差到 **100 %**）⇒ 费米面的等值面相对晶体对称性是畸变的。
+⇒ **默认把 `A(k,E)` 按原胞点群轨道平均**（把展开谱**投影到对称不变子空间**），
+实测最大相对偏差从 **1.000e+00 降到 0.000e+00**（三个真实数据集）。
+`--no-symmetrize` 关掉 ⇒ 回到"逐 (K,G) 的原始权重"。
+
+⚠ 两条限制：① 对称化只恢复**超胞自己保留**的对称操作（各向异性的面内超胞
+3×1×1 只保留 12 个里的 4 个 ⇒ 六重对称恢复不了）；② **逐带数据**
+（`band.N` / `FS.bxsf` / npz 的 `band_e`/`band_w`）**不**对称化。
+机制、实测与"哪些超胞受影响"的对照表 → [`docs/algorithms.md`](docs/algorithms.md) §15.7；
+每个输出在两种模式下的含义 → [`docs/formats.md`](docs/formats.md) §6c。
 
 #### 2.2b ★ 原胞自己的费米面（`det(M) = 1`，"直通模式"）
 
@@ -177,6 +192,7 @@ unfoldfs band --supercell POSCAR --primcell PRIMCELL.vasp --transmat TRANSMAT.in
 # 阶段 2：读 VASP 输出，展开并写 vaspkit 的四个文件（+ 长表 + PNG）
 unfoldfs band --dir run/ --outdir bandfs/ [--ef auto|vbm|doscar|数值]
               [--sigma 0.06] [--e-min E] [--e-max E] [--mirror] [--no-plot]
+              [--no-symmetrize]
 ```
 
 | 参数 | 阶段 | 默认 | 说明 |
@@ -189,6 +205,7 @@ unfoldfs band --dir run/ --outdir bandfs/ [--ef auto|vbm|doscar|数值]
 | `--e-min` / `--e-max` | 2 | 自动 | 图的能量范围（eV，**绝对值**） |
 | `--mirror` | 2 | 关 | 把镜像路径（距离取负、顺序反过来）也画上（对应 MATLAB 脚本的 `IsPlotMirror`） |
 | `--no-plot` | 2 | 关 | 不画 PNG（不需要 matplotlib） |
+| `--no-symmetrize` | 2 | 关 | **不做**路径上的点群轨道对称化（默认**做**；泛路径通常无操作，见 §16.7） |
 | `--nbands` / `--encut` / `--kpar` | 1 | 同 `gen` | 建议 INCAR 里的 `NBANDS` / `ENCUT` / `KPAR` |
 
 **产出**（阶段 2 写进 `--outdir`）：
@@ -210,8 +227,10 @@ unfoldfs band --dir run/ --outdir bandfs/ [--ef auto|vbm|doscar|数值]
 > 投影法的 G 分辨权重**，vaspkit 282 给的是 **WAVECAR 平面波展开得到的原胞带
 > |c(k)|²**。两者都叫"权重"但物理含义不同、数值不可比（我们的不归一）。
 >
-> ⚠ 展开谱权重在晶体点群下**不协变**（带能量不受影响）⇒ **能带曲线可信，
-> 能带形状不可信**。详见 [`docs/algorithms.md`](docs/algorithms.md) §15 / §16.6。
+> ⚠ 展开谱权重在晶体点群下**天然不协变**（带能量不受影响）⇒ **能带曲线可信，
+> 能带形状不可信**。默认对路径上**对称相关**的点做轨道平均（`--no-symmetrize`
+> 可关），但泛路径点的轨道离开路径 ⇒ 通常是无操作。
+> 详见 [`docs/algorithms.md`](docs/algorithms.md) §15 / §16.6 / §16.7。
 
 ### 2.4 `unfoldfs info` —— 查看网格与对称信息
 
@@ -422,8 +441,10 @@ E_F           : -1.377658 eV  (--ef auto, --delta 0.05)
 ```
 
 > ⚠ **"费米面非空"只说明"这个能量上有态"，不等于"等值面的形状可信"** ——
-> 展开谱权重在点群下不协变（对称相关点的谱函数最大差 **100 %**），
-> 见 §7 第 8 条与 [`docs/algorithms.md`](docs/algorithms.md) §15。
+> 展开谱权重在点群下天然不协变（对称相关点的谱函数最大差 **100 %**）；
+> 默认输出已按点群轨道**对称化**（偏差降到 **0**），但对称化是**投影**：
+> 绝对形状（面积/半径）仍不可当定量结果用。
+> 见 §7 第 8 条与 [`docs/algorithms.md`](docs/algorithms.md) §15.7。
 
 > ⚠ **`band.N` 的编号是能量升序**：`band.1` 是最低的深带（**不跨** E_F：
 > 绝对能量 −16.2163 … −14.1675 eV，相对 E_F 是 −14.7559 … −12.7071）。
@@ -509,15 +530,20 @@ VASPKIT 的能带反折叠与费米面两个模块**没有交点**：
    50 %·A_max ⇒ **E_F 的选取已修对**（§4b），但**费米面的形状**仍受 k 采样
    限制 —— 要定量形状必须把超胞 BZ 采得更密。
 8. ⚠ **费米面的形状有对称性破缺（实测最大相对偏差 ~1.0）**：展开后的谱权重
-   `A(k,E)` 在晶体点群下**不协变** —— 对称相关的两个 k 点，谱函数可以差到
+   `A(k,E)` 在晶体点群下**天然不协变** —— 对称相关的两个 k 点，谱函数可以差到
    **100 %**（一个谱峰被映到 0）。**能带能量不受影响**（对称相关点的带能量
    吻合到 8e-6 eV），受影响的只是**权重在 k 上的分配**。
-   ⇒ **能量、带的连接、费的拓扑（有几个口袋）、E_F 的选取是可靠的；
-   等值面的形状与对称性不是** —— 不要用本工具的费米面图去量"各向异性"、
-   "口袋面积"、"对称性破缺"这类结论。
-   实测数字、已排除的可能与机制分析 → [`docs/algorithms.md`](docs/algorithms.md) §15。
-   修复轮 4 又试了两种新构造（"把落到 k' 的所有 (K,G) 贡献加起来"、
-   "每个 k' 收下所有 K 的贡献"）—— **都不协变** ⇒ 缺陷在**逐 (K,G) 的权重本身**。
+   ⇒ **修复轮 5**: 默认把 `A(k,E)` 按**点群轨道平均**（投影到对称不变子空间），
+   实测偏差 **1.000e+00 → 0.000e+00**（MoS₂ 9.186e-01 → 0.000e+00，三个真实
+   数据集），费米面等值面恢复对称。`--no-symmetrize` 可关掉（回到原始逐
+   (K,G) 权重）。
+   ⇒ **仍然要当心**: 对称化只恢复**超胞自己保留**的对称操作（各向异性的面内
+   超胞 3×1×1 只保留 12 个里的 4 个 ⇒ 六重对称恢复不了）；**逐带数据**
+   （`band.N` / `FS.bxsf` / npz 的 `band_e`/`band_w`）**不**对称化；对称化是
+   **投影** ⇒ **绝对**形状（口袋面积、各向异性）仍不可当定量结果用。
+   ⇒ **能量、带的连接、费的拓扑（有几个口袋）、E_F 的选取是可靠的**；
+   等值面的**对称性**（在超胞保留的操作下）现在也可靠。
+   实测数字、机制与修法 → [`docs/algorithms.md`](docs/algorithms.md) §15 / §15.7。
 
 9. ⚠ **相位约定的选择对采样敏感**：真实路径（1T-TaS₂，60 个路径点）上，
    4 种约定的主导度只差 **0.1 %～0.3 %**，可换成另一条约定会让 **66 % 的
@@ -527,8 +553,10 @@ VASPKIT 的能带反折叠与费米面两个模块**没有交点**：
    → [`docs/algorithms.md`](docs/algorithms.md) §15.6。
 
 10. ⚠ **展开能带（`unfoldfs band`）同样受上面的协变性缺陷影响**：**能带能量可信**
-   （对称相关点吻合到 8e-6 eV），**权重的 k 依赖不可信** ⇒ 能带的"形状/对称性"
-   不能当定量结果用。另有一条**格式层面的**区别：`WEIGHT.grd` 里的权重是
+   （对称相关点吻合到 8e-6 eV），**权重的 k 依赖原本不可信** ⇒ 能带的"形状/对称性"
+   不能当定量结果用。默认对路径上**对称相关**的点做轨道平均（`--no-symmetrize`
+   可关），但泛路径点的轨道离开路径 ⇒ 通常是**无操作**。
+   另有一条**格式层面的**区别：`WEIGHT.grd` 里的权重是
    **Popescu G 分辨权重**，不是 vaspkit 282 的 WAVECAR 平面波展开 |c(k)|²
    ⇒ 两者的数值不可比（见 §2.3 与 `docs/formats.md` §13.5）。
 

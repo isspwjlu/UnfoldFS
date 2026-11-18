@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 
 from unfoldfs import cli
+from unfoldfs.expand import point_group_orbits
 from unfoldfs.fsout import read_bxsf, read_cube, read_fermisurfer_band
 from unfoldfs.geometry import (common_symmetry_ops_detailed, read_poscar,
                                read_transmat, reciprocal, resolve_transform)
@@ -519,6 +520,60 @@ def test_unfold_prints_fermi_energy(mini_run, capsys):
     out = capsys.readouterr().out
     assert "E_F" in out
     assert "-5.950000 eV" in out
+
+
+# ------------------------------------------------------------------ 点群轨道对称化
+
+def test_unfold_symmetrizes_by_default_and_no_symmetrize_disables_it(tmp_path,
+                                                                       mini_run):
+    """默认对称化 => 谱函数在点群轨道上逐位相同; --no-symmetrize => 恢复原始权重。
+
+    (迷你体系是 3 个网格点, 其中两个在同一条轨道上 —— 见 mini_run 的
+    full_to_ir = [0, 1, 1]; 这两个点的原始谱权重不同, 所以"默认 vs 关闭"
+    必然给出不同的输出。)
+    """
+    out_sym = tmp_path / "fs_sym"
+    out_raw = tmp_path / "fs_raw"
+    assert cli.main(["unfold", "--dir", str(mini_run),
+                     "--outdir", str(out_sym)]) == 0
+    assert cli.main(["unfold", "--dir", str(mini_run), "--outdir", str(out_raw),
+                     "--no-symmetrize"]) == 0
+    a_sym = np.load(str(out_sym / "A(k,E).npz"))["A"]
+    a_raw = np.load(str(out_raw / "A(k,E).npz"))["A"]
+    assert not np.array_equal(a_sym, a_raw), (
+        "--no-symmetrize 必须给出与默认不同的结果(对称化在这里确实有活干)")
+
+    gm = load_grid_map(str(mini_run / "grid_map.npz"))
+    grid = primitive_grid_points(gm.spec)
+    orbits = point_group_orbits(grid, gm.ops)
+    multi = [o for o in orbits if o.size > 1]
+    assert multi, "迷你体系应当有多点轨道(否则本用例无意义)"
+    for members in multi:
+        for i in members[1:]:
+            assert np.array_equal(a_sym[members[0]], a_sym[i]), (
+                "默认输出在点群轨道上不逐位相同 —— 对称化没生效")
+            assert not np.array_equal(a_raw[members[0]], a_raw[i])
+
+
+def test_unfold_reports_the_symmetrization_state(mini_run, tmp_path, capsys):
+    """CLI 必须**说清**默认是对称化的, 以及 --no-symmetrize 的后果。"""
+    cli.main(["unfold", "--dir", str(mini_run), "--outdir",
+              str(tmp_path / "fs")])
+    out = capsys.readouterr().out
+    assert "点群对称化" in out
+    assert "已启用" in out
+    cli.main(["unfold", "--dir", str(mini_run), "--outdir",
+              str(tmp_path / "fs2"), "--no-symmetrize"])
+    out = capsys.readouterr().out
+    assert "已关闭" in out
+
+
+def test_unfold_help_documents_the_symmetrization_switch(capsys):
+    with pytest.raises(SystemExit):
+        cli.main(["unfold", "--help"])
+    out = capsys.readouterr().out
+    assert "--no-symmetrize" in out
+    assert "对称化" in out
 
 
 # ------------------------------------------------------------------ det(M)=1 直通模式

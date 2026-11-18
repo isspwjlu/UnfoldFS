@@ -13,7 +13,8 @@ import numpy as np
 import pytest
 
 from unfoldfs.expand import (ExpandedData, build_spectral_function,
-                             expand_to_full_grid)
+                             expand_to_full_grid, point_group_orbits,
+                             symmetrize_spectral_function)
 from unfoldfs.geometry import (SymmetryOps, Transform, common_symmetry_ops,
                                read_poscar, read_transmat, reciprocal,
                                resolve_transform)
@@ -348,9 +349,11 @@ def test_expand_on_the_real_unfold_pipeline():
 
 
 # ------------------------------------------------------------------ 点群协变性
-# (C1) spec §8 要求: **扩展后的 A(k',E) 在每个对称操作下数值不变**(阈值 1e-8)。
-# 实测: 该性质**为假** —— 谱权重在点群下不协变(最大相对偏差 ~1.0)。
-# 这里把这条要求**原样写成测试**: 它现在是红的(xfail), 作为回归锁留着。
+# spec §8 要求: **扩展后的 A(k',E) 在每个对称操作下数值不变**(阈值 1e-8)。
+#
+# 修复轮 5: 该性质原本**为假** —— 展开得到的谱权重在点群下不协变(最大相对
+# 偏差 ~1.0, 即一个谱峰被映到 0)。修法是**按点群轨道平均 A(k,E)**(把展开谱
+# 投影到"对称不变子空间"), 机制与实测见 docs/algorithms.md §15。
 
 def _point_group_deviation(gm, grid, a):
     """每个对称操作下 A(k,E) 与 A(k',E) 的最大相对偏差。"""
@@ -393,36 +396,97 @@ def _fixture_pipeline_spectrum():
     return gm, grid, a
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="C1(已知缺陷, 未修): 展开后的 A(k,E) 在晶体点群下**不**协变 —— "
-           "谱权重在对称相关点之间不一致(实测最大相对偏差 ~1.0, 即一个谱峰被"
-           "映到 0)。机制与实测见 docs/algorithms.md §14 与 §15。"
-           "修好之后请把本条改成普通断言(并删掉下面两条锁)。")
 def test_expanded_spectral_function_is_invariant_under_the_point_group():
-    """spec §8: 扩展后 A(k',E) 在每个对称操作下数值不变(<= 1e-8)。"""
+    """spec §8: 展开 + 对称化后 A(k',E) 在每个对称操作下数值不变(<= 1e-8)。
+
+    修复轮 5 把这条从 xfail 改成普通断言 —— 对称化后偏差降到机器精度。
+    """
     gm, grid, a = _fixture_pipeline_spectrum()
-    devs = _point_group_deviation(gm, grid, a)
+    devs = _point_group_deviation(gm, grid, symmetrize_spectral_function(a, gm))
     assert devs, "没有可比的对称操作"
     worst = max(devs.values())
     assert worst <= 1e-8, (
-        f"A(k,E) 在点群下不协变: 最大相对偏差 {worst:.3e} "
+        f"对称化后的 A(k,E) 在点群下仍不协变: 最大相对偏差 {worst:.3e} "
         f"(逐操作: { {k: f'{v:.3e}' for k, v in devs.items()} })")
 
 
-def test_point_group_covariance_defect_stays_within_the_documented_band():
-    """把已知缺陷的**量级**锁住: fixture 上 12 个操作的偏差都是 ~1.0。
+def test_the_raw_spectrum_is_still_not_covariant():
+    """锁住"**原始**(未对称化)的谱仍然不协变"。
 
-    这条锁的是"缺陷还在、且没有变本加厉" —— 缺陷若被修好, 上面那条 xfail 会
-    变成 XPASS(strict) 而报错, 这条也会失败 ⇒ 两者一起提醒人更新文档。
+    这条锁的是"修好靠的是**对称化**, 不是展开本身变了" —— 若有人改了
+    unfold.py 让原始权重自己协变了, 本条会失败 ⇒ 提醒更新
+    docs/algorithms.md §15(机制描述会过时)。
     """
     gm, grid, a = _fixture_pipeline_spectrum()
     devs = _point_group_deviation(gm, grid, a)
     worst = max(devs.values())
     assert worst >= 0.5, (
-        f"协变性偏差只有 {worst:.3e} —— 缺陷可能被修好了(或数据变了), "
-        "请更新 docs/algorithms.md §14/§15 与本文件的 xfail 标记")
+        f"原始谱的协变性偏差只有 {worst:.3e} —— 展开本身似乎被改了, "
+        "请更新 docs/algorithms.md §15 与本文件的说明")
     assert worst <= 1.0 + 1e-9
+
+
+def test_symmetrize_spectral_function_is_bit_identical_for_a_covariant_spectrum():
+    """本来就没有对称性破缺时, 对称化必须**逐位**无操作。
+
+    对应"保留全部 12 个操作的超胞"(如 √3×√3 R30° 莫尔超胞): 那里的谱权重
+    本来就是协变的 ⇒ 轨道平均后必须**逐位不变**(不能引入 1 ulp 的噪声)。
+    """
+    gm, grid, a = _fixture_pipeline_spectrum()
+    assert gm.ops.rotations.shape[0] == 12, "fixture 应当保留全部 12 个操作"
+    a_cov = symmetrize_spectral_function(a, gm)      # 造一个协变的谱
+    again = symmetrize_spectral_function(a_cov, gm)
+    assert np.array_equal(again, a_cov), (
+        "对称化对已经协变的谱不是逐位无操作 —— 会引入 1 ulp 量级的噪声")
+
+
+def test_symmetrize_spectral_function_preserves_the_total_weight():
+    """轨道平均**不改变**总权重: 每个点取轨道平均 ⇒ 逐轨道的权重和不变。"""
+    gm, grid, a = _fixture_pipeline_spectrum()
+    a_sym = symmetrize_spectral_function(a, gm)
+    assert a_sym.shape == a.shape
+    assert float(a_sym.sum()) == pytest.approx(float(a.sum()), rel=1e-12)
+
+
+def test_symmetrize_spectral_function_leaves_a_single_point_orbit_alone():
+    """只有一个点的轨道(恒等轨道)必须**原样**保留。"""
+    gm, grid, a = _fixture_pipeline_spectrum()
+    orbits = point_group_orbits(grid, gm.ops)
+    singles = [o for o in orbits if o.size == 1]
+    assert singles, "fixture 应当有单点轨道(否则本用例无意义)"
+    a_sym = symmetrize_spectral_function(a, gm)
+    for o in singles:
+        assert np.array_equal(a_sym[o], a[o])
+
+
+def test_point_group_orbits_match_the_grid_map_decomposition():
+    """轨道分解必须与 ``grid_map.full_to_ir`` 一致。
+
+    不一致 ⇒ 对称化的轨道与网格自己的轨道不是一回事 ⇒ 对称化会把不相干的
+    点平均进来(docs/algorithms.md §15 的"只对可比的点做"就失效了)。
+    """
+    gm, grid = _grid_map()
+    orbits = point_group_orbits(grid, gm.ops)
+    by_orbit = sorted(tuple(sorted(o.tolist())) for o in orbits)
+    ir = np.asarray(gm.full_to_ir, dtype=int)
+    by_ir = sorted(tuple(sorted(np.nonzero(ir == k)[0].tolist()))
+                   for k in np.unique(ir))
+    assert by_orbit == by_ir
+
+
+def test_point_group_orbits_partition_the_grid():
+    """轨道必须是网格的一个**划分**(每个点恰好属于一个轨道)。"""
+    gm, grid = _grid_map()
+    orbits = point_group_orbits(grid, gm.ops)
+    all_members = np.concatenate(orbits)
+    assert sorted(all_members.tolist()) == list(range(grid.shape[0]))
+
+
+def test_symmetrize_spectral_function_rejects_a_mismatched_grid():
+    """A 的点数与网格点数不一致时必须报错(否则会静默取错带)。"""
+    gm, grid, a = _fixture_pipeline_spectrum()
+    with pytest.raises(ValueError, match="点数"):
+        symmetrize_spectral_function(a[:-1], gm)
 
 
 def test_the_symmetry_invariance_test_is_still_present():
