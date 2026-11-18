@@ -22,6 +22,7 @@ pip install -e .
 python -m unfoldfs.cli --help
 python -m unfoldfs.cli gen --help
 python -m unfoldfs.cli unfold --help
+python -m unfoldfs.cli band --help
 python -m unfoldfs.cli info --help
 ```
 
@@ -34,9 +35,13 @@ python -m unfoldfs.cli info --help
 | scipy | ≥ 1.6 | 周期 KD-tree（网格点匹配） |
 | spglib | **≥ 2.0** | 原胞点群（代码用 **spglib ≥ 2.0 的 dict API**：`sym["rotations"]`；1.x 的 tuple API 会直接 `TypeError`） |
 | VASP | **6.6.0**（实测） | 只用来产生输入（`EIGENVAL` / `PROCAR` / `DOSCAR`） |
+| matplotlib | **可选**（`pip install 'unfoldfs[plot]'`） | 只有 `unfoldfs band` 的 PNG 需要；`gen` / `unfold` / `info` 与四个 vaspkit 文本文件都**不需要** |
 | VESTA 3.5.8 / XCrySDen 1.5.60 / FermiSurfer 2.2.1 | 可选 | **消费方**，用来打开输出的费米面文件 |
 
-`unfoldfs` 本身**不画图** ⇒ **不需要** matplotlib / scikit-image。
+费米面那部分**不画图** ⇒ **不需要** matplotlib / scikit-image；
+只有 `unfoldfs band` 的 `unfolded_band.png` 需要 matplotlib（缺了会给出
+可操作的报错，并提示 `pip install 'unfoldfs[plot]'`；也可以用 `--no-plot`
+只出数据文件）。
 
 > 服务器 master 的实测环境：Python 3.9.13（numpy 1.23.5 / scipy 1.13.1 /
 > spglib 2.0.2）、VASP `vasp.6.6.0 06Mar2026`。
@@ -48,7 +53,7 @@ python -m unfoldfs.cli info --help
 
 ---
 
-## 2. 三个子命令
+## 2. 四个子命令
 
 ### 2.1 `unfoldfs gen` —— 生成网格与 KPOINTS
 
@@ -123,7 +128,55 @@ unfoldfs unfold --dir DIR [--supercell SUPERCELL] [--primcell PRIMCELL] [--trans
 `unfold` 会打印选出的相位约定 `(s1, s2)` 与单 G 主导度、VBM/CBM、选出的 E_F，
 并把它们写进输出文件的头部与 `A(k,E).npz` 的元信息。
 
-### 2.3 `unfoldfs info` —— 查看网格与对称信息
+### 2.3 `unfoldfs band` —— 沿 k 路径做展开能带（unfolded band）
+
+和 `gen`→VASP→`unfold` 同一套路，分**两个阶段**：
+
+```bash
+# 阶段 1：读 vaspkit 的 KPATH.in，写 KPOINTS + INCAR.suggested + KLABELS.in
+unfoldfs band --supercell POSCAR --primcell PRIMCELL.vasp --transmat TRANSMAT.in \
+              --kpath KPATH.in --outdir run/
+
+# 阶段 2：读 VASP 输出，展开并写 vaspkit 的四个文件（+ 长表 + PNG）
+unfoldfs band --dir run/ --outdir bandfs/ [--ef auto|vbm|doscar|数值]
+              [--sigma 0.06] [--e-min E] [--e-max E] [--mirror] [--no-plot]
+```
+
+| 参数 | 阶段 | 默认 | 说明 |
+|---|---|---|---|
+| `--supercell` / `--primcell` / `--transmat` | 1 | — | 结构文件（阶段 2 默认从 `--dir` 里找） |
+| `--kpath` | 1 | — | **vaspkit 格式**的 `KPATH.in`（原胞倒数分数坐标 + 标签） |
+| `--dir` | 2 | — | VASP 计算目录（须含 `EIGENVAL` / `PROCAR` / `KPATH.in`） |
+| `--outdir` | 1 / 2 | `run` / `bandfs` | 输出目录 |
+| `--ef` | 2 | `auto` | 与 `unfold` **完全一致**的语义；只用于画图上的费米能虚线 |
+| `--e-min` / `--e-max` | 2 | 自动 | 图的能量范围（eV，**绝对值**） |
+| `--mirror` | 2 | 关 | 把镜像路径（距离取负、顺序反过来）也画上（对应 MATLAB 脚本的 `IsPlotMirror`） |
+| `--no-plot` | 2 | 关 | 不画 PNG（不需要 matplotlib） |
+| `--nbands` / `--encut` / `--kpar` | 1 | 同 `gen` | 建议 INCAR 里的 `NBANDS` / `ENCUT` / `KPAR` |
+
+**产出**（阶段 2 写进 `--outdir`）：
+
+| 文件 | 内容 |
+|---|---|
+| `ENERGY.grd` | (n_band, n_k) 带能量（eV，**绝对值**） |
+| `MOMENTUM.grd` | (n_band, n_k) 沿路径的累计距离 |
+| `WEIGHT.grd` | (n_band, n_k) 权重 |
+| `KLABELS` | 高对称点的标签 + 距离（**与 vaspkit 逐字节同格式**） |
+| `unfolded_band.dat` | 长表：路径距离 / E(eV) / 权重 / 带号（自用） |
+| `unfolded_band.png` | 加权能带图（自用，需 matplotlib） |
+
+前四个**就是 vaspkit 的文件名与布局** ⇒ 用户组现有的 MATLAB 脚本
+（`unfold_band_plot_mirror.m`）**不改一行**直接能画我们的数据。
+格式规范见 [`docs/formats.md`](docs/formats.md) §13。
+
+> ⚠ **`WEIGHT.grd` 的权重与 vaspkit 282 的不是同一件事**：本工具给的是 **Popescu
+> 投影法的 G 分辨权重**，vaspkit 282 给的是 **WAVECAR 平面波展开得到的原胞带
+> |c(k)|²**。两者都叫"权重"但物理含义不同、数值不可比（我们的不归一）。
+>
+> ⚠ 展开谱权重在晶体点群下**不协变**（带能量不受影响）⇒ **能带曲线可信，
+> 能带形状不可信**。详见 [`docs/algorithms.md`](docs/algorithms.md) §15 / §16.6。
+
+### 2.4 `unfoldfs info` —— 查看网格与对称信息
 
 ```
 unfoldfs info --dir DIR [--grid-map GRID_MAP]
@@ -211,6 +264,38 @@ E_F           : -1.440480 eV  (--ef vbm, --delta 0.05)
 | **FermiSurfer** | `band.N` | 逐带费米面（能量**相对 E_F**，直接打开即可） |
 | Python | `A(k,E).npz` | 完整谱函数 + 元信息，二次分析用 |
 
+### ⑤ 展开能带（沿 k 路径 —— 另一条流水线）
+
+```bash
+# 1) 准备 VASP 输入：读 vaspkit 的 KPATH.in -> KPOINTS + INCAR.suggested + KLABELS.in
+unfoldfs band --supercell POSCAR --primcell PRIMCELL.vasp --transmat TRANSMAT.in \
+              --kpath KPATH.in --outdir run/
+
+# 2) 跑 VASP（同 ②；INCAR 里的 ISYM = 0 / LORBIT = 12 同样必须保留）
+
+# 3) 展开并出图
+unfoldfs band --dir run/ --outdir bandfs/
+```
+
+```
+相位约定      : s1 = -1, s2 = +1 (单 G 主导度 0.7980)
+E_F           : -2.026108 eV  (--ef auto, --delta 0.05)
+路径点        : 2(高对称点 GAMMA, X)
+展开带数      : 16
+已写出        : bandfs/ENERGY.grd
+已写出        : bandfs/MOMENTUM.grd
+已写出        : bandfs/WEIGHT.grd
+已写出        : bandfs/KLABELS
+已写出        : bandfs/unfolded_band.dat
+已写出        : bandfs/unfolded_band.png
+```
+
+（上例是 3×3×1 MoS₂ 超胞 fixture 的实跑：2 个路径点、16 条展开带。）
+
+`bandfs/` 里的 `ENERGY.grd` / `MOMENTUM.grd` / `WEIGHT.grd` / `KLABELS`
+**就是 vaspkit 的文件名与布局** ⇒ 用户组现有的 MATLAB 脚本
+（`unfold_band_plot_mirror.m`）不改一行就能画我们的数据。
+
 ---
 
 ## 4. 输出文件（4 种格式）
@@ -242,6 +327,20 @@ E_F           : -1.440480 eV  (--ef vbm, --delta 0.05)
 > 二次分析的需求由 `A(k,E).npz` 覆盖。
 > **想在 XCrySDen 里画体数据等值面请用 `FS.cube`**（XCrySDen 的两个体数据入口是
 > "Open BXSF" 与 "Gaussian98 Cube File"，过滤器 `{.cube}`）。
+
+### 4c. 展开能带的输出文件（`unfoldfs band`）
+
+| 文件 | 消费者 | 内容 |
+|---|---|---|
+| `ENERGY.grd` | 用户组的 MATLAB 脚本 | (n_band, n_k) 带能量（eV，**绝对值**） |
+| `MOMENTUM.grd` | 同上 | (n_band, n_k) 沿路径的累计距离（每行重复同一条序列） |
+| `WEIGHT.grd` | 同上 | (n_band, n_k) 权重（**Popescu G 分辨权重，不归一**） |
+| `KLABELS` | 同上 | 高对称点的标签 + 距离（**与 vaspkit 逐字节同格式**） |
+| `unfolded_band.dat` | 自用 / 二次分析 | 长表：路径距离 / E(eV) / 权重 / 带号 |
+| `unfolded_band.png` | 自用 | 加权能带图（需 matplotlib） |
+
+前四个与 vaspkit **同名同布局** ⇒ 那个 MATLAB 脚本不改一行就能画。
+逐字段规范见 [`docs/formats.md`](docs/formats.md) §13。
 
 ---
 
@@ -339,6 +438,9 @@ VASPKIT 的能带反折叠与费米面两个模块**没有交点**：
 | `已跳过: fs/FS.bxsf (… 只支持 Gamma 网格 …)` | 用 `--grid-type mp` 生成的 MP 网格，而 FermiSurfer 的 BXSF 读取器一律按 Γ 网格解释 | MP 网格改看 `FS.cube` / `band.N` / `A(k,E).npz`；要 BXSF 就用 Γ 网格 |
 | `错误: 候选 G 数 N != 期望 D 个 … 请检查 m_eff 是否为整数矩阵、是否奇异` | `TRANSMAT.in` 不是整数矩阵或矩阵奇异 | 修 `TRANSMAT.in`；`TRANSMAT` 的行/列约定不用自己管（工具自动探测） |
 | `错误: 满网格点数 36 != n_k·det(M) = 4×9` | 网格与超胞变换不自洽（点数不是 `comm(M⁻¹)` 的倍数） | 换一个 `--grid`，或用 `--resolution` 让工具自己选 |
+| `错误: 画展开能带需要 matplotlib, 但当前环境没有装` | 只有 `unfoldfs band` 的 PNG 需要 matplotlib（**可选依赖**） | `pip install 'unfoldfs[plot]'`；或加 `--no-plot` 只出四个 vaspkit 文本文件 |
+| `错误: 阶段 2 需要 …/KPATH.in` | `--dir` 里没有路径文件 | 用阶段 1（`unfoldfs band --kpath … --outdir <dir>`）生成，它会把 `KPATH.in` 复制过去 |
+| `错误: 路径点 … 在展开结果里找不到对应的候选` | KPATH.in 与实际计算的 k 点不自洽（多半是 KPOINTS 不是本工具写的，或 INCAR 里 `ISYM ≠ 0`） | 用阶段 1 写出的 `KPOINTS`；确认 `ISYM = 0` |
 
 > **关于 `valid == False` 的补位槽**：`A(k,E).npz` 里的 `band_e` / `band_w` 有补位槽
 > （能量 `+inf`、权重 0），表示"该候选在这个 k 点上没有第 n 条带"。
@@ -377,6 +479,12 @@ VASPKIT 的能带反折叠与费米面两个模块**没有交点**：
    "口袋面积"、"对称性破缺"这类结论。
    实测数字、已排除的可能与机制分析 → [`docs/algorithms.md`](docs/algorithms.md) §15。
 
+9. ⚠ **展开能带（`unfoldfs band`）同样受上面的协变性缺陷影响**：**能带能量可信**
+   （对称相关点吻合到 8e-6 eV），**权重的 k 依赖不可信** ⇒ 能带的"形状/对称性"
+   不能当定量结果用。另有一条**格式层面的**区别：`WEIGHT.grd` 里的权重是
+   **Popescu G 分辨权重**，不是 vaspkit 282 的 WAVECAR 平面波展开 |c(k)|²
+   ⇒ 两者的数值不可比（见 §2.3 与 `docs/formats.md` §13.5）。
+
 完整的限制清单与全部实测数字 → [`docs/algorithms.md`](docs/algorithms.md) §14。
 
 ---
@@ -391,11 +499,12 @@ unfoldfs/            本工具（可安装的包）
   unfold.py          Popescu 投影展开 / 副本相位还原平均 / 候选重组
   expand.py          对称扩展到均匀网格 / 谱函数 A(k,E)
   fsout.py           FS.cube / FS.bxsf / band.N / A(k,E).npz 写出
-  cli.py             gen / unfold / info
+  band.py            KPATH.in 解析 / 展开能带组装 / vaspkit 四件套写出 / 画图
+  cli.py             gen / unfold / band / info
 docs/
   algorithms.md      算法、约定与实测数字
   formats.md         输出格式的逐字段规范
-tests/               209 个用例（含 tests/data/ 下的合成 fixture）
+tests/               258 个用例通过 + 1 个 xfail（含 tests/data/ 下的合成 fixture）
 unfold_procar.py     仓库根的**已验证原型**（与本工具的全路径交叉核对基准，
                      max|Δw| = 4.99e-09、max|ΔE| = 0）
 ```

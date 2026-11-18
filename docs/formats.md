@@ -613,3 +613,117 @@ A(k,E_F) 峰值 / 全局峰值 = 0.134
 `n_points == n_k · det(M)`，逐维条件即可满足。本轮用 `--grid` 逃生口
 绕过（§12.4），**未修改 `grid.py` 的网格逻辑** —— 留给 grid 模块的 owner。
 
+## 13. 展开能带的四个文件（vaspkit 格式，消费者：用户组现有的 MATLAB 脚本）
+
+> 本节是 `unfoldfs/band.py` 的**权威格式规范**。格式出处是服务器上的实测
+> （2026-11-18，`$WORKDIR/vasp_work/TaS2_new/AH_sliding_1v6/unfolded_band/`
+> 与 `$WORKDIR/vasp_work/TaS2/A/band_unfold/`），互操作性的逐条核对见
+> §13.6。
+
+### 13.1 交付面
+
+`unfoldfs band --dir <run>/ --outdir <bandfs>/` 写出 6 个文件：
+
+| 文件 | 内容 | 消费者 |
+|---|---|---|
+| `ENERGY.grd` | (n_band, n_k) 带能量（eV，**绝对值**） | MATLAB `unfold_band_plot_mirror.m` |
+| `MOMENTUM.grd` | (n_band, n_k) 沿路径的累计距离（每行重复同一条序列） | 同上 |
+| `WEIGHT.grd` | (n_band, n_k) 权重 | 同上 |
+| `KLABELS` | 高对称点的标签 + 距离 | 同上 |
+| `unfolded_band.dat` | 长表：路径距离 / E(eV) / 权重 / 带号 | 自用（二次分析） |
+| `unfolded_band.png` | matplotlib 画的加权能带图 | 自用（没有 MATLAB 时） |
+
+**前四个的文件名与布局与 vaspkit 完全一致** ⇒ 用户组现有的 MATLAB 脚本
+（`unfold_band_plot_mirror.m`）**不改一行**就能画我们的数据。
+
+### 13.2 三个 `.grd` 的布局
+
+```
+ENERGY.grd / MOMENTUM.grd / WEIGHT.grd  ——  都是 (n_band, n_k) 的矩阵
+  行 = 带（band）
+  列 = 路径上的 k 点（k-point）
+  三个文件必须**同样大小**（MATLAB 的 pcolor(momentum, energy, weight) 要求）
+```
+
+* `ENERGY.grd[i][j]` = 第 i 条带在第 j 个路径点上的能量（eV，**绝对值**）
+* `MOMENTUM.grd[i][j]` = 第 j 个路径点的累计距离（**每一行都是同一条序列**）
+* `WEIGHT.grd[i][j]` = 第 i 条带在第 j 个路径点上的权重
+
+数值格式：**每个数值占 14 列**（`"%14.6f"`），一行 = 14 × n_k 个字符，
+字段之间没有额外的分隔符（靠定宽对齐）。这与 vaspkit 实测的 `.grd`
+逐字节同格式（实测行长 1848 = 14 × 132 列）。
+
+### 13.3 `KLABELS`
+
+```
+K-Label    Coordinate of high-symmetry k-point in band-structure plots ⏎
+           M       0.000⏎
+       GAMMA       0.299⏎
+     M|GAMMA       0.599⏎
+           A       0.730⏎
+ ⏎
+ ⏎
+* Tip: Please label each high symmetry point in KPOINTS (KPATH.in) file. Otherwise, they will be identified as 'XX' in KLABELS file⏎
+```
+
+* 第 1 行是表头（**末尾有一个空格**）；
+* 随后是 **N 行**"标签 + 距离"：**标签右对齐在 12 列**、距离右对齐在 12 列
+  （3 位小数）⇒ 每行恰好 24 个字符；
+* 再是 **2 行只含一个空格**的行；
+* 最后是 vaspkit 的提示行（131 字符）。
+
+**标签必须右对齐**：MATLAB 脚本用 `regexp(str,'\s+','split')` 切分，
+前导空白会切出一个空字段，只有右对齐时 `S(2)` 才是标签、`S(3)` 才是距离
+（标签左对齐的话 `S(2)` 会变成距离 ⇒ 脚本画错）。
+
+**行数约定**：MATLAB 脚本读 `Nline-4` 行标签 ⇒ 文件里必须正好有 `Nline-4`
+行标签（1 表头 + N 标签 + 2 空白 + 1 提示 = N+4 行）。
+
+**标签的来历**：段内两端同名时只写一次；不同时写 `前一段的终点|后一段的起点`。
+实测（3 段 M→GAMMA, GAMMA→M, GAMMA→A）⇒ `M` / `GAMMA` / `M|GAMMA` / `A`
+—— 与 vaspkit 实测的 KLABELS 逐字节一致。
+
+### 13.4 距离的单位
+
+`MOMENTUM.grd` 与 `KLABELS` 里的距离是**沿路径的累计长度**，用**原胞**倒格矢
+计算，单位 **2π/Å**（与本工具其它地方一致）。⚠ vaspkit 的绝对标度可能不同
+（其输出目录里的 `.grd` 与 `KPATH.in`/`KPOINTS` 不是同一次运行的产物，
+无法反推其标度）；这不影响互操作 —— MATLAB 脚本只把距离当 x 轴坐标用，
+只要**我们自己的四个文件自洽**即可（`KLABELS` 的距离与 `MOMENTUM.grd` 的
+距离序列一致，容差 1e-3，因为 `KLABELS` 只保留 3 位小数）。
+
+### 13.5 ⚠ 权重的含义与 vaspkit 282 **不同**
+
+| | 本工具的 `WEIGHT.grd` | vaspkit 282 的 `WEIGHT.grd` |
+|---|---|---|
+| 做法 | Popescu 投影法：把超胞态投影到原胞的各个候选 k，权重 = 该候选上的谱权重 | WAVECAR 平面波展开：把超胞波函数展开成原胞带，权重 = 原胞带系数 \|c(k)\|² |
+| 含义 | **G 分辨**的谱权重（"这个态属于哪个 G"） | 原胞带的**平面波系数**的模方 |
+| 归一 | **不归一**（数值量级 ~ 原胞的电子数，典型 0.1 ~ 几十） | 归一（0 ~ 1） |
+
+两者都叫"权重"但**物理含义不同** ⇒ 数值不能互相比较。我们的权重在**同一次
+计算内**可比；跨体系比较没有意义。MATLAB 脚本用 `caxis` 自动归一，
+所以配色不受影响。
+
+### 13.6 互操作性的逐条核对（对着 MATLAB 脚本的源码）
+
+用户组脚本 `$WORKDIR/vasp_work/TaS2_new/AH_sliding_1v6/unfolded_band/
+unfold_band_plot_mirror.m`（2026-11-18 读原文）：
+
+| 脚本里的动作 | 我们的文件 | 结论 |
+|---|---|---|
+| `load('MOMENTUM.grd')` / `load('ENERGY.grd')` / `load('WEIGHT.grd')` | 三个同样大小的纯数字矩阵 | ✓ |
+| `pcolor(momentum, energy, weight)` | 三个文件同样大小 | ✓ |
+| `energy(n)`、`weight(n,:)` 取行 | 行 = 带、列 = k 点 | ✓（数值沿 k 变化） |
+| `Nline-4` 行标签，`S(2)`=标签、`S(3)`=距离 | `KLABELS` 的布局（§13.3） | ✓ |
+| `K_label` 用 `S(2)`，`GAMMA` 特判、`\|` 分支取 `label(1:2)` | 标签右对齐、`GAMMA`/`M\|GAMMA` 原样给出 | ✓ |
+| `xlim([K_length(Nkpt_start) K_length(Nkpt_end)])` | 距离单调递增 | ✓ |
+| `line([...],[0 0],'--')` 画费米能 | 我们的 `.grd` 存**绝对**能量，脚本用 `Efermi_adjust` 平移 | ✓（与 vaspkit 一致） |
+| `IsPlotMirror` 分支：`[-fliplr(momentum) momentum]` | `--mirror` 只影响我们的 PNG（`.grd` 不镜像） | ✓ |
+
+⚠ **一处残留风险（脚本自身的，不是文件格式的）**：脚本用
+`energy(n)`（线性下标）与 `weight(n,:)`（行下标）挑行算 `caxis`；
+若**第一条路径点上没有任何带的能量落在 `E_plot_min..E_plot_max` 窗口内**，
+`weight_plot` 为空 ⇒ 脚本在 `min(min(weight_plot))` 处报错。这是脚本的
+健壮性问题，我们无法通过改文件格式规避（除非把路径点顺序换掉）。
+
+

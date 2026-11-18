@@ -1,9 +1,10 @@
-"""命令行接口: ``unfoldfs gen`` / ``unfoldfs unfold`` / ``unfoldfs info``。
+"""命令行接口: ``unfoldfs gen`` / ``unfoldfs unfold`` / ``unfoldfs band`` / ``unfoldfs info``。
 
-三个子命令把整条流水线接起来:
+四个子命令把整条流水线接起来:
 
     gen     对称原胞网格 -> KPOINTS + grid_map.npz + INCAR.suggested
     unfold  读 VASP 输出 -> 反折叠 -> 对称扩展 -> 写费米面文件
+    band    沿 k 路径做展开能带 -> 写 vaspkit 的 ENERGY/MOMENTUM/WEIGHT/KLABELS
     info    查看网格与对称信息
 
 约定(与 geometry.py / grid.py 一致):
@@ -24,10 +25,15 @@ import argparse
 import os
 import shutil
 import sys
+from dataclasses import dataclass
 from typing import List, Optional, Sequence
 
 import numpy as np
 
+from .band import (assemble_band, path_distances, path_labels,
+                   path_to_super_k, plot_band, read_klabels, read_kpath,
+                   reorder_unfolded, spread_order, write_band_dat, write_grd,
+                   write_klabels, write_kpoints_explicit)
 from .expand import build_spectral_function, expand_to_full_grid
 from .fsout import (band_edges, has_fermi_crossing, make_e_grid,
                     select_fermi_energy, write_bxsf,
@@ -41,7 +47,7 @@ from .grid import (GridSpec, build_grid_map, choose_grid_points,
 from .unfold import build_atom_copies, unfold_supercell
 from .vaspio import BandData, read_doscar_fermi, read_eigenval, read_procar
 
-__all__ = ["main", "cmd_gen", "cmd_unfold", "cmd_info"]
+__all__ = ["main", "cmd_gen", "cmd_unfold", "cmd_band", "cmd_info"]
 
 # 谱函数 npz 的能量窗: 以 E_F 为中心 ±_NPZ_HALF_WIDTH eV, 含 E_F 本身
 _NPZ_HALF_WIDTH = 0.5
@@ -152,8 +158,22 @@ def _nearest_state_distance(band, e_f: float) -> float:
     return float(np.min(np.abs(e - float(e_f))))
 
 
-def _incar_suggested(grid_map, n_bands: int, encut: float, kpar: int,
-                     unknown_species: Sequence[str], n_occ_est: int) -> str:
+@dataclass(frozen=True)
+class _IncarContext:
+    """INCAR 建议文本需要的"体系与计算规模"信息(gen 与 band 共用)。
+
+    抽出来是为了让**能带路径**那条流水线复用同一套 INCAR 生成逻辑
+    (ISYM=0 / LORBIT=12 / ISMEAR=1 / SIGMA=0.2 / NBANDS 余量 …) ——
+    复制一份的话, 两边的硬要求迟早会走偏。
+    """
+    n_k: int          # 实际计算的 k 点数
+    det: int          # 超胞放大倍数 det(M)
+    desc: str         # 一句话说明(网格规格 / 能带路径)
+    n_occ_est: int    # 估计的占据带数
+
+
+def _incar_suggested(ctx: _IncarContext, n_bands: int, encut: float, kpar: int,
+                     unknown_species: Sequence[str]) -> str:
     """给出建议的 INCAR 文本。
 
     其中 ``ISYM = 0`` 与 ``LORBIT = 12`` 是**硬要求**:
@@ -161,12 +181,10 @@ def _incar_suggested(grid_map, n_bands: int, encut: float, kpar: int,
         与顺序都会变, 反折叠的映射随之失效;
       * LORBIT=12: PROCAR 必须带复投影系数(相位), LORBIT=11 不写相位。
     """
-    p = grid_map.spec.p
     head = [
         "# unfoldfs 建议的 INCAR",
-        f"# 网格: {p[0]} x {p[1]} x {p[2]} ({grid_map.spec.grid_type}), "
-        f"实际计算 {grid_map.n_k} 个超胞 k 点",
-        f"# 超胞变换: det(M) = {grid_map.transform.det}",
+        f"# {ctx.desc}, 实际计算 {ctx.n_k} 个超胞 k 点",
+        f"# 超胞变换: det(M) = {ctx.det}",
         "#",
         "# ISYM = 0 必须保留: 否则 VASP 会把显式 k 点表按对称性归约, "
         "k 点的个数与顺序都会变,",
@@ -185,8 +203,8 @@ def _incar_suggested(grid_map, n_bands: int, encut: float, kpar: int,
         "四面体法只与 KSPACING(VASP 自建网格)兼容。",
         "#   想用更小的展宽就改成 ISMEAR = 0 + 更小的 SIGMA(仍是展宽法, "
         "不改 k 点语义)。",
-        f"# NBANDS = {n_bands} = 估计占据带数 {n_occ_est} + 空带余量 "
-        f"{n_bands - n_occ_est}(至少 10 条)。",
+        f"# NBANDS = {n_bands} = 估计占据带数 {ctx.n_occ_est} + 空带余量 "
+        f"{n_bands - ctx.n_occ_est}(至少 10 条)。",
         "#   NBANDS 由价电子数**估计**得出(表内 ZVAL, Mo=14/S=6 等), "
         "**请按实际 POTCAR 的 ZVAL 核对**,",
         "#   或直接用 unfoldfs gen --nbands <N> 覆盖。",
@@ -277,8 +295,12 @@ def cmd_gen(args: argparse.Namespace) -> int:
     else:
         n_bands = _nbands_with_margin(n_occ_est)
     with open(incar_path, "w", newline="\n", encoding="utf-8") as fh:
-        fh.write(_incar_suggested(gm, n_bands, args.encut, args.kpar, unknown,
-                                  n_occ_est))
+        fh.write(_incar_suggested(
+            _IncarContext(n_k=gm.n_k, det=gm.transform.det,
+                          desc=f"网格: {spec.p[0]} x {spec.p[1]} x {spec.p[2]} "
+                               f"({spec.grid_type})",
+                          n_occ_est=n_occ_est),
+            n_bands, args.encut, args.kpar, unknown))
 
     # 结构文件顺手复制过去: unfold 默认从 --dir 里找它们
     sources = {"POSCAR": args.supercell, "PRIMCELL.vasp": args.primcell,
@@ -546,6 +568,212 @@ def _fs_comments(e_f: float, args: argparse.Namespace, vbm: float,
     return [line1, line2]
 
 
+# ------------------------------------------------------------------ band
+
+def _check_klabels_consistent(path: str, labels: Sequence[tuple]) -> None:
+    """阶段 1 写下的 KLABELS.in 必须与当前 KPATH.in 算出的标签一致。
+
+    不一致说明用户改了 KPATH.in 却没重跑阶段 1 ⇒ 阶段 2 复原出来的 KLABELS
+    与实际算的 k 点对不上。**必须报错**: 标签与距离对不上时, MATLAB 脚本
+    画出来的 x 轴刻度是错的, 而且看不出来。
+    """
+    stored = read_klabels(path)
+    if len(stored) != len(labels):
+        raise ValueError(
+            f"{os.path.basename(path)} 里有 {len(stored)} 个标签, 而当前的 "
+            f"KPATH.in 算出 {len(labels)} 个 —— 两者不自洽。"
+            "请用同一个 KPATH.in 重跑阶段 1(`unfoldfs band --kpath ...`)。")
+    for (lab_a, dist_a), (lab_b, dist_b) in zip(stored, labels):
+        # KLABELS 里的距离只保留 3 位小数(与 vaspkit 一致) ⇒ 按**写出来的值**比
+        if lab_a != lab_b or round(float(dist_a), 3) != round(float(dist_b), 3):
+            raise ValueError(
+                f"{os.path.basename(path)} 与当前的 KPATH.in 不自洽: "
+                f"({lab_a}, {dist_a}) != ({lab_b}, {dist_b}) —— "
+                "请用同一个 KPATH.in 重跑阶段 1(`unfoldfs band --kpath ...`)。")
+
+
+def cmd_band_prepare(args: argparse.Namespace) -> int:
+    """阶段 1: KPATH.in -> 超胞 k -> KPOINTS + INCAR.suggested + KLABELS.in。"""
+    prim = read_poscar(args.primcell)
+    sc = read_poscar(args.supercell)
+    tr = resolve_transform(sc, prim, read_transmat(args.transmat))
+    b_prim = reciprocal(prim.lattice)
+
+    path = read_kpath(args.kpath)
+    dist = path_distances(path, b_prim)
+    labels = path_labels(path, dist)
+    # K = k'·Mᵀ (mod 1): 路径点用的是**原胞**分数坐标, VASP 算的是**超胞** k
+    k_super = path_to_super_k(path.k_prim, tr.m_eff)
+
+    outdir = args.outdir or "run"
+    os.makedirs(outdir, exist_ok=True)
+    kpoints_path = os.path.join(outdir, "KPOINTS")
+    write_kpoints_explicit(kpoints_path, k_super)
+
+    nelect, n_bands_prim, unknown = _valence_estimate(prim.species)
+    n_occ_est = tr.det * max(n_bands_prim, 1)
+    n_bands = int(args.nbands) if args.nbands is not None \
+        else _nbands_with_margin(n_occ_est)
+    incar_path = os.path.join(outdir, "INCAR.suggested")
+    with open(incar_path, "w", newline="\n", encoding="utf-8") as fh:
+        fh.write(_incar_suggested(
+            _IncarContext(n_k=int(k_super.shape[0]), det=tr.det,
+                          desc=f"能带路径: {path.n_k} 个路径点"
+                               "(原胞分数坐标 -> 超胞分数坐标)",
+                          n_occ_est=n_occ_est),
+            n_bands, args.encut, args.kpar, unknown))
+
+    klabels_path = os.path.join(outdir, "KLABELS.in")
+    write_klabels(klabels_path, labels)
+
+    # 结构文件与路径文件顺手复制过去(阶段 2 从 --dir 里找它们)
+    sources = {"POSCAR": args.supercell, "PRIMCELL.vasp": args.primcell,
+               "TRANSMAT.in": args.transmat, "KPATH.in": args.kpath}
+    copied = []
+    for name, src in sources.items():
+        dst = os.path.join(outdir, name)
+        if os.path.abspath(src) != os.path.abspath(dst):
+            shutil.copyfile(src, dst)
+            copied.append(dst)
+
+    print(f"路径段数      : {len(path.segments)}(每段 {path.n_points_per_segment} "
+          f"个采样点, 含两端)")
+    print(f"路径点总数    : {path.n_k}")
+    print(f"高对称点      : {', '.join(lab for lab, _ in labels)}")
+    print(f"路径总长度    : {float(dist[-1]):.6f} (2π/Å)")
+    print(f"超胞变换      : det(M) = {tr.det}")
+    print(f"估计占据带数  : {n_occ_est}, NBANDS = {n_bands}")
+    print(f"已写出        : {kpoints_path}")
+    print(f"已写出        : {incar_path}")
+    print(f"已写出        : {klabels_path}")
+    for path_out in copied:
+        print(f"已复制        : {path_out}")
+    return 0
+
+
+def cmd_band_unfold(args: argparse.Namespace) -> int:
+    """阶段 2: VASP 输出 -> 展开能带 -> 写 vaspkit 的四个文件(+ PNG)。"""
+    run_dir = args.dir
+    supercell = args.supercell or os.path.join(run_dir, "POSCAR")
+    primcell = args.primcell or os.path.join(run_dir, "PRIMCELL.vasp")
+    transmat = args.transmat or os.path.join(run_dir, "TRANSMAT.in")
+    kpath_path = os.path.join(run_dir, "KPATH.in")
+    if not os.path.exists(kpath_path):
+        raise ValueError(
+            f"阶段 2 需要 {kpath_path}(路径信息在阶段 1 写的 KPATH.in 里) —— "
+            "请先跑阶段 1: `unfoldfs band --supercell ... --primcell ... "
+            "--transmat ... --kpath KPATH.in --outdir <dir>`")
+
+    band_data = _read_eigenval_needed(run_dir, args.ef)
+    procar = read_procar(os.path.join(run_dir, "PROCAR"))
+    dos_path = os.path.join(run_dir, "DOSCAR")
+    need_dos = str(args.ef).strip().lower() in ("auto", "doscar", "dos")
+    if os.path.exists(dos_path):
+        dos_ef = read_doscar_fermi(dos_path)
+    elif need_dos:
+        raise ValueError(
+            f"--ef {args.ef} 需要 DOSCAR 里的费米能, 但 {dos_path} 不存在。")
+    else:
+        dos_ef = float("nan")
+
+    prim = read_poscar(primcell)
+    sc = read_poscar(supercell)
+    tr = resolve_transform(sc, prim, read_transmat(transmat))
+    copies = build_atom_copies(prim, sc, tr)
+    b_prim = reciprocal(prim.lattice)
+    b_super = reciprocal(sc.lattice)
+
+    e_f = select_fermi_energy(dos_ef, band_data, mode=args.ef,
+                               offset=args.delta, gap_tol=_GAP_TOL)
+    # E_F 落在带隙里对能带图是**正常**的(半导体), 只提示, 不阻断
+    try:
+        vbm, cbm = band_edges(band_data)
+    except ValueError:
+        vbm = cbm = float("nan")
+    status, message = _check_ef_in_gap(band_data, vbm, cbm, e_f, args.sigma,
+                                        _is_numeric_ef(args.ef))
+    if status in ("near", "warn"):
+        print(f"提示: {message}", file=sys.stderr)
+
+    path = read_kpath(kpath_path)
+    dist = path_distances(path, b_prim)
+    labels = path_labels(path, dist)
+    klabels_in = os.path.join(run_dir, "KLABELS.in")
+    if os.path.exists(klabels_in):
+        _check_klabels_consistent(klabels_in, labels)
+    k_super = path_to_super_k(path.k_prim, tr.m_eff)
+
+    # 相位约定择优只采样 k 列表的前 4 个点(见 unfold.CONVENTION_SAMPLE_N_K)。
+    # 路径上前 4 个点挨得太近 ⇒ 4 种约定给不出区分(择优落在退化区) ⇒
+    # 这里把路径点重排, 让采样的 4 个点分布在路径的不同位置, 算完再还原
+    # 顺序(输出的列序仍与路径一致)。
+    order = spread_order(int(k_super.shape[0]))
+    unfolded = unfold_supercell(
+        band_data, procar, tr, copies, tr.m_eff, prim.lattice,
+        prim.positions @ prim.lattice, b_prim, b_super, k_super[order],
+        strict_dominance=args.strict_dominance)
+    unfolded = reorder_unfolded(unfolded, order)
+    energy, weight = assemble_band(unfolded, path.k_prim)
+
+    outdir = args.outdir or "bandfs"
+    os.makedirs(outdir, exist_ok=True)
+    energy_path = os.path.join(outdir, "ENERGY.grd")
+    momentum_path = os.path.join(outdir, "MOMENTUM.grd")
+    weight_path = os.path.join(outdir, "WEIGHT.grd")
+    klabels_path = os.path.join(outdir, "KLABELS")
+    dat_path = os.path.join(outdir, "unfolded_band.dat")
+    write_grd(energy_path, energy)
+    write_grd(momentum_path, np.tile(dist, (energy.shape[0], 1)))
+    write_grd(weight_path, weight)
+    write_klabels(klabels_path, labels)
+    write_band_dat(dat_path, dist, energy, weight)
+
+    print(f"相位约定      : s1 = {unfolded.s1:+d}, s2 = {unfolded.s2:+d} "
+          f"(单 G 主导度 {unfolded.dominance:.4f})")
+    print(f"E_F           : {e_f:.6f} eV  (--ef {args.ef}, --delta {args.delta:g})")
+    print(f"路径点        : {path.n_k}(高对称点 "
+          f"{', '.join(lab for lab, _ in labels)})")
+    print(f"展开带数      : {energy.shape[0]}")
+    print(f"已写出        : {energy_path}")
+    print(f"已写出        : {momentum_path}")
+    print(f"已写出        : {weight_path}")
+    print(f"已写出        : {klabels_path}")
+    print(f"已写出        : {dat_path}")
+
+    if args.no_plot:
+        print("已跳过        : PNG(--no-plot)")
+        return 0
+    png_path = os.path.join(outdir, "unfolded_band.png")
+    try:
+        plot_band(dist, energy, weight, labels, e_f=e_f, out_path=png_path,
+                  e_min=args.e_min, e_max=args.e_max, mirror=args.mirror)
+    except ValueError as exc:
+        raise ValueError(
+            f"{exc}\n      (四个 vaspkit 文件已经写好了, 只是画不出 PNG)") from exc
+    print(f"已写出        : {png_path}")
+    return 0
+
+
+def cmd_band(args: argparse.Namespace) -> int:
+    """``unfoldfs band``: 阶段 1 准备 VASP 输入, 阶段 2 出展开能带。"""
+    if args.kpath and args.dir:
+        raise ValueError(
+            "--kpath(阶段 1)与 --dir(阶段 2)只能给一个: "
+            "阶段 1 生成 KPOINTS 供 VASP 算, 阶段 2 才读 VASP 的输出")
+    if args.kpath:
+        for name, value in (("--supercell", args.supercell),
+                            ("--primcell", args.primcell),
+                            ("--transmat", args.transmat)):
+            if not value:
+                raise ValueError(f"阶段 1 需要 {name}")
+        return cmd_band_prepare(args)
+    if args.dir:
+        return cmd_band_unfold(args)
+    raise ValueError(
+        "`unfoldfs band` 需要 --kpath(阶段 1: 准备 VASP 输入)"
+        "或 --dir(阶段 2: 从 VASP 输出得到展开能带)")
+
+
 # ------------------------------------------------------------------ info
 
 def _symmetry_summary(gm) -> str:
@@ -630,6 +858,45 @@ def _add_unfold_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--outdir", default="fs", help="费米面文件输出目录")
 
 
+def _add_band_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--supercell", default=None,
+                   help="超胞 POSCAR 路径(阶段 1 必给)")
+    p.add_argument("--primcell", default=None,
+                   help="原胞 PRIMCELL.vasp 路径(阶段 1 必给)")
+    p.add_argument("--transmat", default=None,
+                   help="TRANSMAT.in 路径(阶段 1 必给)")
+    p.add_argument("--kpath", default=None,
+                   help="vaspkit 格式的 KPATH.in(阶段 1: 读路径, 写 KPOINTS)")
+    p.add_argument("--dir", default=None,
+                   help="VASP 计算目录(阶段 2: 读 EIGENVAL/PROCAR/KPATH.in)")
+    p.add_argument("--outdir", default=None,
+                   help="输出目录(阶段 1 默认 run, 阶段 2 默认 bandfs)")
+    p.add_argument("--nbands", type=int, default=None,
+                   help="建议 INCAR 里的 NBANDS(不给则按价电子数估计 + 余量)")
+    p.add_argument("--encut", type=float, default=320.0,
+                   help="建议 INCAR 里的 ENCUT (eV)")
+    p.add_argument("--kpar", type=int, default=1,
+                   help="建议 INCAR 里的 KPAR")
+    p.add_argument("--ef", default="auto",
+                   help="费米能: auto | vbm | doscar | 数值(eV)"
+                        "(只用于画图上的水平虚线; .grd 里存的是绝对能量)")
+    p.add_argument("--delta", type=float, default=0.05,
+                   help="半导体时 VBM + delta 的偏移 (eV)")
+    p.add_argument("--sigma", type=float, default=0.06,
+                   help="谱函数展宽 (eV); 只用于判断 E_F 是否落在带隙里")
+    p.add_argument("--e-min", type=float, default=None,
+                   help="图的能量下限 (eV, 绝对值)")
+    p.add_argument("--e-max", type=float, default=None,
+                   help="图的能量上限 (eV, 绝对值)")
+    p.add_argument("--mirror", action="store_true",
+                   help="把镜像路径(距离取负、顺序反过来)也画上"
+                        "(对应 MATLAB 脚本里的 IsPlotMirror)")
+    p.add_argument("--strict-dominance", action="store_true",
+                   help="要求每个态的单 G 主导度 >= 0.5(严格模式)")
+    p.add_argument("--no-plot", action="store_true",
+                   help="不画 PNG(不需要 matplotlib)")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="unfoldfs",
@@ -643,6 +910,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_unfold = sub.add_parser("unfold", help="反折叠 VASP 输出并写费米面文件")
     _add_unfold_args(p_unfold)
     p_unfold.set_defaults(func=cmd_unfold)
+
+    p_band = sub.add_parser(
+        "band", help="沿 k 路径做展开能带(输出 vaspkit 的四个文件)",
+        description=(
+            "沿 k 路径做展开能带(unfolded band structure)。\n"
+            "分两个阶段, 与 gen -> VASP -> unfold 同一套路:\n"
+            "  阶段 1: --supercell/--primcell/--transmat/--kpath -> "
+            "KPOINTS + INCAR.suggested + KLABELS.in\n"
+            "  阶段 2: --dir -> 展开 -> ENERGY.grd/MOMENTUM.grd/WEIGHT.grd/"
+            "KLABELS + unfolded_band.dat/.png\n"
+            "输出四个 vaspkit 格式的文件, 用户组现有的 MATLAB 脚本"
+            "(unfold_band_plot_mirror.m)可以直接画。\n"
+            "⚠ WEIGHT.grd 里的权重是 **Popescu 投影法的 G 分辨权重**"
+            "(路径点上取原胞 k 等于该路径点的那个候选的投影权重),\n"
+            "   **不是** vaspkit 282 用 WAVECAR 平面波展开得到的原胞带 |c(k)|² —— "
+            "两者都叫权重但含义不同。\n"
+            "⚠ 展开谱权重在晶体点群下不协变(带能量不受影响) => "
+            "能带曲线可信、能带形状不可信。"))
+    _add_band_args(p_band)
+    p_band.set_defaults(func=cmd_band)
 
     p_info = sub.add_parser("info", help="查看网格与对称信息")
     p_info.add_argument("--dir", required=True, help="含 grid_map.npz 的目录")

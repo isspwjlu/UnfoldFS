@@ -16,6 +16,11 @@ dependencies = [
     "spglib>=2.0",
 ]
 
+# 画图是**可选**的: 只有 `unfoldfs band` 的 PNG 需要 matplotlib;
+# gen / unfold / info 与 band 的四个 vaspkit 文本文件都不需要它。
+[project.optional-dependencies]
+plot = ["matplotlib>=3.5"]
+
 [project.scripts]
 unfoldfs = "unfoldfs.cli:main"
 
