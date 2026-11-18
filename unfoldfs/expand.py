@@ -2,15 +2,24 @@
 
 展开(unfold.py)的结果是**按已算超胞 k 索引**的: 每个超胞 k 上有 det(M) 个
 候选原胞 k(分数坐标), 每个候选上有一组带能量与谱权重。本模块把它们重新
-铺回满网格的每个点 —— 每个网格点恰好由一个 (超胞 k, 候选) 对覆盖。
+铺回满网格的每个点 —— 一个网格点可以由**多个** (超胞 k, 候选) 对覆盖
+(多源求和, 修复轮 8)。
 
-核心映射(逐满网格点 i):
+核心映射(**正向**: 候选 -> 网格点):
 
-    k_idx = full_to_k[i]                           该点折到哪个已算超胞 k
-    p_i   = ops.apply(ir_k_prim[ir], rot_of_full)  该点的原胞分数坐标(轨道像)
-    gset  = candidate_g_for_k(k_super[k_idx])      该 k 的**逐 k**候选折叠矢量
-    j     = argmin_j 周期距离( (k_super+g_j)·M^-T , p_i )
-    band  = energies/weights/valid[k_idx, j]
+    g     = candidate_g_for_k(K)                   该 k 的**逐 k**候选折叠矢量
+    cand  = (K+g)·M^-T                             候选原胞 k(落在 [0,1)³)
+    i     = 网格点里周期距离最近的那个(cand)        多个源可以落到同一点
+    band  = energies/weights/valid[k, j]           该 (超胞 k, 候选) 的贡献
+
+**多源求和(修复轮 8)**: 原胞的谱函数是**所有**落到同一个原胞 k' 的超胞态的
+投影之和 —— 每个超胞 k 点 K 各贡献一份(经由自己的 G 分量 G_K = k'·Mᵀ − K)。
+⇒ 同一个网格点被几个超胞 k 覆盖, 权重就该是几份之和; 只取一份就丢掉
+(n_k−1)/n_k 的权重。多个源落在同一点时, 它们的带**按能量对齐**后合并
+(能量差 <= merge_tol 的带权重相加)。⚠ 当前 ``unfoldfs gen`` 写出的 KPOINTS
+是**折叠网格**(每个网格点恰好折到一个超胞 k) ⇒ 实测每个网格点的源数
+min = max = 1 ⇒ 多源求和在当前流程里是**恒等变换** —— 见 docs/algorithms.md
+§8.7。
 
 三处**不可改**的语义(本项目已踩过的坑):
 
@@ -48,12 +57,11 @@ docs/algorithms.md §15.8。
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .geometry import (SymmetryOps, periodic_delta, periodic_distance,
-                       rotation_inverse)
+from .geometry import SymmetryOps, periodic_delta, rotation_inverse
 from .grid import (GridMap, GridSpec, _PeriodicIndex, filter_ops_by_grid,
                    primitive_grid_points)
 from .unfold import UnfoldedResult, candidate_g_for_k
@@ -64,6 +72,10 @@ __all__ = ["ExpandedData", "expand_to_full_grid", "build_spectral_function",
 
 # 分数坐标下的匹配容差: 远大于 spglib 平移残差(~3e-8), 又远小于网格间距
 _MATCH_TOL = 1e-6
+
+# 多源合并时"同一条带"的能量容差(eV): 两个源里能量差小于它的带视为同一条,
+# 权重相加(简并带本来就该在谱函数里相加)
+_MERGE_TOL = 1e-6
 
 # 谱函数分块计算时每块的最大元素数(控制峰值内存)
 _SPECTRAL_BLOCK = 2_000_000
@@ -112,26 +124,104 @@ def _grid_frac_points(gm: GridMap) -> np.ndarray:
     return p
 
 
-def expand_to_full_grid(unfolded: UnfoldedResult, grid_map: GridMap,
-                        *, tol: float = _MATCH_TOL) -> ExpandedData:
-    """把展开结果铺回完整均匀原胞网格。
+def _wrap01(v: np.ndarray) -> np.ndarray:
+    """把分数坐标折回 [0,1)³。
 
-    对每个满网格点 i: 找到唯一覆盖它的 (超胞 k, 候选 j), 取该候选的能带块。
+    ⚠ ``np.mod`` 对**极小的负数**会返回精确的 1.0(而不是 0)⇒ 直接用它做
+    折叠会让"折回后的 K"偶尔带着一个 1.0 分量, 于是候选坐标整整差一个倒格矢
+    (实测: √3×√3 超胞的 K=(0.0625,0,0) 反推成 (0.0625,1,0) ⇒ 候选的分数值
+    偏 0.47)。⇒ 这里把 1.0 显式改回 0.0。
+    """
+    out = np.mod(np.asarray(v, dtype=float), 1.0)
+    return np.where(out >= 1.0, 0.0, out)
+
+
+def _merge_source_bands(sources: List[Tuple[np.ndarray, np.ndarray]],
+                        merge_tol: float) -> Tuple[np.ndarray, np.ndarray]:
+    """把多个源的带按**能量对齐**合并: 能量相同(差 <= merge_tol)的带权重相加。
+
+    ``sources`` = [(能量数组, 权重数组), ...]; 每个数组已按能量升序、且**不含**
+    补位槽(能量 +inf)。
+
+    * 合并只发生在**不同源之间**: 同一个源里的简并带保持分开(逐带输出依赖
+      这个区分 —— 两条简并带是两条带, 不是一条);
+    * 同一个源内部的匹配是**单调**的(第 n 条带只会匹配到第 n 条已合并带之后
+      的位置)⇒ 简并带在源之间也能一一对上;
+    * 合并后的列表按能量升序(稳定排序 ⇒ 源 0 的顺序不变)。
+    """
+    merged_e: List[float] = []
+    merged_w: List[float] = []
+    merged_src: List[set] = []
+    for s, (e_src, w_src) in enumerate(sources):
+        cursor = 0
+        for e, w in zip(np.asarray(e_src, float), np.asarray(w_src, float)):
+            hit = -1
+            for i in range(cursor, len(merged_e)):
+                if abs(float(e) - merged_e[i]) <= merge_tol and \
+                        s not in merged_src[i]:
+                    hit = i
+                    break
+            if hit < 0:
+                merged_e.append(float(e))
+                merged_w.append(float(w))
+                merged_src.append({s})
+            else:
+                merged_w[hit] += float(w)
+                merged_src[hit].add(s)
+                cursor = hit + 1
+    if not merged_e:
+        return np.zeros(0, dtype=float), np.zeros(0, dtype=float)
+    e = np.array(merged_e, dtype=float)
+    w = np.array(merged_w, dtype=float)
+    order = np.argsort(e, kind="stable")
+    return e[order], w[order]
+
+
+def expand_to_full_grid(unfolded: UnfoldedResult, grid_map: GridMap,
+                        *, tol: float = _MATCH_TOL,
+                        merge_tol: float = _MERGE_TOL) -> ExpandedData:
+    """把展开结果铺回完整均匀原胞网格(**多源求和**)。
+
+    每个超胞 k 点 K 的每个候选 G 都落到**一个**原胞网格点上; **同一个网格点
+    可以被多个源覆盖** —— 那些源的带按能量对齐后合并、权重相加。
+
+    **为什么需要多源**: 原胞的谱函数是**所有**落到同一个原胞 k' 的超胞态的
+    投影之和; 每个超胞 k 点 K 各贡献一份(经由自己的 G 分量 G_K = k'·Mᵀ − K)。
+    当超胞 k 列表覆盖了原胞第一布里渊区里的**多个超胞 BZ 副本**(k 列表含有
+    相差一个超胞倒格矢的 k 点)时, 同一个原胞 k' 会被 det(M) 个超胞 k 覆盖 ——
+    只取其中一个就丢掉 (n_k−1)/n_k 的谱权重。
+
+    **单源情形逐位等价于旧实现**: ``grid_map.k_super`` 给出的折叠网格里每个
+    原胞网格点恰好被一个 (K, 候选) 覆盖(见 ``grid.supercell_kpoints`` 的折叠
+    K = k'·Mᵀ) ⇒ 多源列表每个只有一项 ⇒ 合并是恒等操作。
+
     三项自检(任一不通过即抛错, 不静默取错带):
 
-    1. 每个网格点命中一个候选, 且命中距离 < tol;
-    2. 命中的候选与展开结果的候选轴**索引一致**(用 unfolded.k_cand 交叉核对)
+    1. 每个候选都落在某个满网格点上(距离 < tol), 每个满网格点至少被一个
+       源覆盖;
+    2. 候选与展开结果的候选轴**索引一致**(用 ``unfolded.k_cand`` 交叉核对)
        —— 候选顺序一旦错位就会在这里被抓到;
-    3. (超胞 k, 候选) 与满网格点构成双射(不多不少)。
+    3. 前 ``n_k`` 行(``grid_map.k_super`` 给出的那些 k)的 (K, 候选) 与满网格点
+       构成双射(不多不少)—— 匹配塌缩会在这里被抓到。
+
+    参数
+    ----
+    unfolded : 展开结果; k 列表必须**包含** ``grid_map.k_super`` 的全部 k 点
+                (前 ``n_k`` 行按顺序对应它们), 额外的行是超胞 BZ 的其它副本
+                (它们的 K 由 ``k_cand`` 反推: K = k_cand·Mᵀ mod 1)
+    grid_map : 网格与变换
+    tol      : 候选与网格点之间的匹配容差(分数坐标下的周期距离)
+    merge_tol: 多源合并时"同一条带"的能量容差(eV)
     """
     gm = grid_map
     n_points = int(gm.full_to_k.shape[0])
     n_k = int(gm.k_super.shape[0])
     det = int(gm.transform.det)
-    if unfolded.energies.shape[0] != n_k:
+    n_rows = int(unfolded.energies.shape[0])
+    if n_rows < n_k:
         raise ValueError(
-            f"展开结果的 k 数 {unfolded.energies.shape[0]} != grid_map 的 "
-            f"{n_k} —— 展开时传入的 k 列表必须就是 grid_map.k_super")
+            f"展开结果的 k 数 {n_rows} < grid_map 的 {n_k} —— 展开时传入的 "
+            "k 列表必须至少包含 grid_map.k_super 的全部 k 点")
     if unfolded.energies.shape[1] != det:
         raise ValueError(
             f"展开结果的候选数 {unfolded.energies.shape[1]} != det(M)={det}")
@@ -142,58 +232,95 @@ def expand_to_full_grid(unfolded: UnfoldedResult, grid_map: GridMap,
 
     m_eff = np.asarray(gm.transform.m_eff, dtype=float)
     m_inv_T = np.asarray(gm.transform.m_inv, dtype=float).T
-    full_to_k = np.asarray(gm.full_to_k, dtype=int)
     p = _grid_frac_points(gm)
+    # 网格点的周期索引: 候选 -> 网格点 的正向匹配(替代旧的"按 k 分组反查")
+    index = _PeriodicIndex(p, tol=tol)
 
-    hits = np.full(n_points, -1, dtype=int)
-    frac = np.zeros((n_points, 3))
-    for k in range(n_k):
-        sel = np.nonzero(full_to_k == k)[0]
-        if sel.size == 0:
-            continue
-        kk = np.mod(gm.k_super[k], 1.0)
+    energies = np.asarray(unfolded.energies, dtype=float)
+    weights = np.asarray(unfolded.weights, dtype=float)
+    if unfolded.valid is not None:
+        valid = np.asarray(unfolded.valid, dtype=bool)
+    else:
+        valid = np.isfinite(energies)
+    kcand = np.asarray(unfolded.k_cand, dtype=float)
+
+    # 每个网格点的源列表: [(能量, 权重, 候选分数坐标), ...]
+    src_e: List[List[np.ndarray]] = [[] for _ in range(n_points)]
+    src_w: List[List[np.ndarray]] = [[] for _ in range(n_points)]
+    src_frac: List[List[np.ndarray]] = [[] for _ in range(n_points)]
+    primary: Dict[int, Tuple[int, int]] = {}      # 网格点 -> (K, 候选)(前 n_k 行)
+    for k in range(n_rows):
+        # 前 n_k 行的 K 取自 grid_map.k_super; 额外的行(BZ 副本)由 k_cand
+        # 反推: K = k_cand·Mᵀ mod 1(g 是整数矢量, 取模把它消掉)
+        if k < n_k:
+            kk = _wrap01(gm.k_super[k])
+        else:
+            kk = _wrap01(kcand[k, 0] @ m_eff.T)
         # 候选 G **逐 k 计算**: 一般 M 下候选集随 K 平移, 用全局 gset 会取错带
         g = candidate_g_for_k(kk, m_eff, m_inv_T)
         cand = (kk + g) @ m_inv_T            # (det,3) 候选原胞 k, 落在 [0,1)³
-        dist = periodic_distance(p[sel], cand)
-        j = dist.argmin(axis=1)
-        best = dist[np.arange(sel.size), j]
-        bad = np.nonzero(best > tol)[0]
+
+        # 候选索引必须与展开结果的候选轴一致(k_cand 是展开时算出的候选分数值)
+        d = periodic_delta(kcand[k], cand)
+        bad = np.nonzero(d > tol)[0]
         if bad.size:
-            i = int(sel[int(bad[0])])
+            j = int(bad[0])
             raise ValueError(
-                f"满网格点 {i} 没有被任何候选覆盖(最近距离 "
-                f"{best[int(bad[0])]:.2e} > {tol:.0e}) —— grid_map 与展开结果"
-                "的 k 集合不一致?")
-        hits[sel] = j
-        frac[sel] = cand[j]
+                f"候选索引与展开结果不一致: 第 {k} 行的候选 {j} 与其原胞 k "
+                f"坐标相差 {d[j]:.2e} —— 展开时用的 k 列表顺序必须与 "
+                "grid_map.k_super 一致, 否则会静默取错带")
 
-    # 候选索引必须与展开结果的候选轴一致(k_cand 是展开时算出的候选分数值)
-    kc = np.asarray(unfolded.k_cand)[full_to_k, hits]
-    d = periodic_delta(kc, p)
-    bad = np.nonzero(d > tol)[0]
-    if bad.size:
-        i = int(bad[0])
+        hit = index.find(cand)               # (det,) 命中的网格点(-1 = 没命中)
+        miss = np.nonzero(hit < 0)[0]
+        if miss.size:
+            j = int(miss[0])
+            raise ValueError(
+                f"第 {k} 行的候选 {j} 没有落在任何满网格点上 —— grid_map 与"
+                "展开结果的 k 集合不一致?")
+        for j in range(det):
+            i = int(hit[j])
+            v = valid[k, j]
+            src_e[i].append(energies[k, j][v])
+            src_w[i].append(weights[k, j][v])
+            src_frac[i].append(cand[j])
+            if k < n_k:
+                if i in primary:
+                    raise ValueError(
+                        f"(超胞 k, 候选) 映射不是单射: 满网格点 {i} 同时被 "
+                        f"({primary[i][0]}, {primary[i][1]}) 和 ({k}, {j}) 命中 "
+                        "—— 匹配发生塌缩")
+                primary[i] = (k, j)
+
+    # 每个满网格点至少被一个源覆盖
+    empty = [i for i in range(n_points) if not src_e[i]]
+    if empty:
+        i = int(empty[0])
         raise ValueError(
-            f"候选索引与展开结果不一致: 满网格点 {i} 命中的候选与其原胞 k "
-            f"坐标相差 {d[i]:.2e} —— 展开时用的 k 列表顺序必须与 "
-            "grid_map.k_super 一致, 否则会静默取错带")
+            f"满网格点 {i} 没有被任何候选覆盖 —— grid_map 与展开结果的 k "
+            "集合不一致?")
 
-    slots = full_to_k * det + hits
-    if np.unique(slots).size != n_points:
-        raise ValueError(
-            f"(超胞 k, 候选) 映射不是单射: {np.unique(slots).size} 个不同"
-            f"组合覆盖了 {n_points} 个满网格点 —— 匹配发生塌缩")
-
-    e = np.asarray(unfolded.energies)[full_to_k, hits]
-    w = np.asarray(unfolded.weights)[full_to_k, hits]
-    if unfolded.valid is not None:
-        v = np.asarray(unfolded.valid, dtype=bool)[full_to_k, hits]
-    else:
-        v = np.isfinite(e)
+    # 多源合并: 同一网格点的各源的带按能量对齐后相加
+    merged = [_merge_source_bands(list(zip(src_e[i], src_w[i])), merge_tol)
+              for i in range(n_points)]
+    # 带轴长度: 不小于展开结果原来的带轴长度(补位槽的口径保持不变)
+    n_band_eff = int(energies.shape[2])
+    for e, _ in merged:
+        n_band_eff = max(n_band_eff, int(e.size))
+    band_e = np.full((n_points, n_band_eff), np.inf)
+    band_w = np.zeros((n_points, n_band_eff))
+    out_valid = np.zeros((n_points, n_band_eff), dtype=bool)
+    frac = np.zeros((n_points, 3))
+    for i in range(n_points):
+        e, w = merged[i]
+        m = int(e.size)
+        band_e[i, :m] = e
+        band_w[i, :m] = w
+        out_valid[i, :m] = True
+        # k_cart 取**候选的**分数坐标(落在 [0,1)³ 内)而不是轨道像 p_i
+        frac[i] = src_frac[i][0]
     k_cart = frac @ np.asarray(gm.b_prim, dtype=float)
-    return ExpandedData(k_cart=k_cart, band_e=e, band_w=w, valid=v,
-                         spec=gm.spec)
+    return ExpandedData(k_cart=k_cart, band_e=band_e, band_w=band_w,
+                         valid=out_valid, spec=gm.spec)
 
 
 def build_spectral_function(expanded: ExpandedData, e_grid: np.ndarray,
