@@ -303,6 +303,44 @@ def common_symmetry_ops(prim: Structure, m_eff: np.ndarray,
     return ops
 
 
+def primitive_symmetry_ops(prim: Structure, symprec: float = 1e-5) -> SymmetryOps:
+    """原胞的**完整**点群(spglib 给的全部对称操作), 不按超胞变换过滤。
+
+    与 ``common_symmetry_ops`` 的区别 —— 后者只保留"同时也是超胞对称"的操作
+    (判据 ``M^-T·R·M^T ∈ Z³``)⇒ **破坏对称性的超胞**只剩下一小部分
+    (实测 1T-TaS2 的 M=diag(3,1,1): 12 个操作里只剩 4 个)⇒ 用它做对称化
+    只能恢复那个更小的对称性, 六重对称恢复不了。
+
+    ⇒ 本函数给的是**原胞自己的**点群。原胞的谱函数按构造就在这个点群下
+    不变, 所以把展开谱投影到"在这个点群下不变"的子空间是**有物理依据**的
+    (见 docs/algorithms.md §15.8)—— 任何超胞 M 都能这样折回原胞的对称性。
+
+    * **只保留整数旋转矩阵**: 非整数矩阵无法作用在分数坐标上
+      (``rotation_inverse`` 要求幺模整数阵)。spglib 在原胞基底下给的就是
+      整数阵, 这一步是防御性的(传入的"原胞"若其实不是原胞, 分数旋转会
+      被这里挡掉而不是在下游静默算错)。
+    * **平移分量保留**: spglib 给的是模原胞格矢的代表元(C3² 的代表元是
+      ``(1,0,0)``), ``_harden_translation`` 把接近 0/1 的分量吸附到 0。
+      平移不参与任何筛选(见 ``common_symmetry_ops_detailed`` 的说明)。
+    """
+    import spglib
+
+    cell = (prim.lattice, prim.positions, _species_ids(prim.species))
+    sym = spglib.get_symmetry(cell, symprec=symprec)
+    keep_r, keep_t = [], []
+    for r, t in zip(sym["rotations"], sym["translations"]):
+        r_int = np.asarray(r)
+        if not np.allclose(r_int, np.round(r_int), atol=1e-6):
+            continue                    # 非整数旋转: 无法作用在分数坐标上
+        keep_r.append(r_int.astype(int))
+        keep_t.append(_harden_translation(t))
+    if not keep_r:
+        raise ValueError(
+            "原胞点群为空(spglib 一个整数旋转都没给) —— 检查结构文件与 "
+            f"symprec={symprec}")
+    return SymmetryOps(np.array(keep_r), np.array(keep_t))
+
+
 def _harden_translation(t: np.ndarray, tol: float = 1e-8) -> np.ndarray:
     """平移归一化到 [0,1)³, 并把接近 0/1 的分量吸附到 0。
 

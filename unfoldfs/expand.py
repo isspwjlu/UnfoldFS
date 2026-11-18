@@ -36,6 +36,14 @@ k 侧约定: ``k'_prim = (K + g)·(M^-1)^T`` —— 倒空间用 M^-T, **注意�
 相位多出 (k'−K)·Δᵢ 项)。``symmetrize_spectral_function`` 把 A(k,E) 按轨道
 平均, 正好抵消这一项(实测最大相对偏差 1.000e+00 -> 0.000e+00), 即把展开谱
 **投影到对称不变子空间** —— 见 docs/algorithms.md §15。
+
+**用哪个点群(修复轮 6)**: 投影的目标子空间是"**原胞点群**下不变"的子空间
+(原胞的谱函数按构造就在原胞点群下不变 ⇒ 这个投影有物理依据)。因此对称化
+必须用**原胞的完整点群**(:func:`geometry.primitive_symmetry_ops`), 而不是
+"原胞与超胞的公共对称操作"(``grid_map.ops`` —— 后者对破坏对称性的超胞只剩
+4/12 个操作, 六重对称恢复不了)。实测(3×1×1 的 1T-TaS2): 完整点群下最大相对
+偏差 1.000e+00 -> 0.000e+00, 而只用公共子群仍是 1.000e+00 —— 见
+docs/algorithms.md §15.8。
 """
 from __future__ import annotations
 
@@ -46,11 +54,13 @@ import numpy as np
 
 from .geometry import (SymmetryOps, periodic_delta, periodic_distance,
                        rotation_inverse)
-from .grid import GridMap, GridSpec, _PeriodicIndex, primitive_grid_points
+from .grid import (GridMap, GridSpec, _PeriodicIndex, filter_ops_by_grid,
+                   primitive_grid_points)
 from .unfold import UnfoldedResult, candidate_g_for_k
 
 __all__ = ["ExpandedData", "expand_to_full_grid", "build_spectral_function",
-           "point_group_orbits", "symmetrize_spectral_function"]
+           "point_group_orbits", "symmetrize_spectral_function",
+           "full_point_group"]
 
 # 分数坐标下的匹配容差: 远大于 spglib 平移残差(~3e-8), 又远小于网格间距
 _MATCH_TOL = 1e-6
@@ -258,10 +268,42 @@ def point_group_orbits(grid: np.ndarray, ops: SymmetryOps, *,
     return orbits
 
 
+def full_point_group(grid_map: GridMap) -> SymmetryOps:
+    """从 grid_map 复原**原胞的完整点群**(不做 M 过滤, 也不做网格过滤)。
+
+    ``grid_map.ops`` 只装了"原胞与超胞的**公共**对称操作"(判据
+    ``M^-T·R·M^T ∈ Z³``); 被剔除的那些 —— 原胞点群里**不保持超胞晶格**的
+    操作(破坏对称性的超胞会剔掉一大半), 或不把当前网格映到自身的操作 ——
+    **带着旋转与平移**记在 ``grid_map.dropped`` 里(``unfoldfs gen`` 就是
+    这么记的, 见 ``grid.save_grid_map``)⇒ 两者合起来 = 原胞的完整点群。
+
+    ⚠ 若 grid_map 不是由 ``unfoldfs gen`` 生成的(``dropped`` 为空), 复原
+    出来的就只有公共子群 —— 调用方应当显式传 ``ops``
+    (CLI 就是这么做的: ``geometry.primitive_symmetry_ops(prim)``)。
+    """
+    rots = [np.asarray(r, dtype=int) for r in grid_map.ops.rotations]
+    trans = [np.asarray(t, dtype=float) for t in grid_map.ops.translations]
+    for entry in (getattr(grid_map, "dropped", ()) or ()):
+        rots.append(np.asarray(entry[0], dtype=int))
+        trans.append(np.asarray(entry[1], dtype=float))
+    seen = set()
+    keep_r, keep_t = [], []
+    for r, t in zip(rots, trans):
+        key = (tuple(np.asarray(r, dtype=int).ravel()),
+               tuple(np.round(np.mod(np.asarray(t, dtype=float), 1.0), 6)))
+        if key in seen:
+            continue
+        seen.add(key)
+        keep_r.append(r)
+        keep_t.append(t)
+    return SymmetryOps(np.array(keep_r), np.array(keep_t))
+
+
 def symmetrize_spectral_function(a: np.ndarray, grid_map: GridMap,
                                  grid: Optional[np.ndarray] = None, *,
+                                 ops: Optional[SymmetryOps] = None,
                                  tol: Optional[float] = None) -> np.ndarray:
-    """按**原胞点群轨道**平均谱函数 A(k,E) —— 把展开谱投影到对称不变子空间。
+    """按**原胞完整点群**的轨道平均谱函数 A(k,E) —— 投影到对称不变子空间。
 
     **为什么需要它**: 展开得到的 A(k,E) 在晶体点群下**不协变** —— 同一轨道上
     的对称相关点给出不同的谱权重(实测最大相对偏差 MoS2 9.186e-01 /
@@ -270,13 +312,23 @@ def symmetrize_spectral_function(a: np.ndarray, grid_map: GridMap,
     另一个原子(附带原胞晶格平移 Δᵢ)时相位会多出 (k'−K)·Δᵢ 项 ⇒ 权重不协变。
     **按轨道平均正好抵消这一项** ⇒ 偏差降到机器精度。
 
+    **为什么用原胞的*完整*点群**(修复轮 6): 原胞的谱函数按构造就在原胞点群
+    下不变 ⇒ 把展开谱投影到"在这个点群下不变"的子空间是**有物理依据**的。
+    若只用"超胞还保留的那部分操作"(= ``grid_map.ops``, 判据
+    ``M^-T·R·M^T ∈ Z³``), 破坏对称性的超胞(如 3×1×1)只剩 4/12 个操作
+    ⇒ 六重对称恢复不了。**任何**超胞都应当能折回原胞的对称性 ⇒ 用完整点群。
+
     参数
     ----
     a        : (n_points,) 或 (n_points, n_E) 的谱函数(点序 = 网格点序)
-    grid_map : 网格与对称操作的来源(``gm.ops`` = 原胞与超胞的公共对称操作,
-               再按网格筛选过)
+    grid_map : 网格与对称操作的来源
     grid     : 网格点的原胞分数坐标; 缺省时由 ``grid_map.spec`` 重建
                (``primitive_grid_points``)
+    ops      : 用来做轨道平均的对称操作; **缺省 = 原胞完整点群**
+               (由 ``full_point_group(grid_map)`` 复原)。显式传入
+               ``ops=grid_map.ops`` 则只用"原胞与超胞的公共子群"。
+               无论哪种来源, 都会**按网格筛选**(只有把网格映到自身的操作
+               才能参与 —— 否则轨道不是群轨道, 平均后的结果也不再协变)。
     tol      : 匹配容差(分数坐标下的周期距离); None = 由网格自身推出
 
     返回
@@ -301,8 +353,12 @@ def symmetrize_spectral_function(a: np.ndarray, grid_map: GridMap,
         raise ValueError(
             f"A(k,E) 的点数 {arr.shape[0]} != 网格点数 {pts.shape[0]} —— "
             "对称化要求 A 的点序与网格点序一致")
+    if ops is None:
+        ops = full_point_group(grid_map)
+    # 按网格筛选: 只有把网格映到自身的操作才参与(否则轨道不是群轨道)
+    ops = filter_ops_by_grid(ops, pts, tol=tol)
     out = np.array(arr, dtype=float, copy=True)
-    for members in point_group_orbits(pts, grid_map.ops, tol=tol):
+    for members in point_group_orbits(pts, ops, tol=tol):
         vals = arr[members]
         mean = vals.mean(axis=0)
         # 轨道上各点完全相同时直接取该值: 保证"无对称性破缺"的情形逐位不变

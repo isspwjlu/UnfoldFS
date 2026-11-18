@@ -4,7 +4,7 @@ import pytest
 from unfoldfs.geometry import (
     Structure, read_poscar, reciprocal, read_transmat,
     resolve_transform, matrix_denominator_lcm, candidate_g_vectors,
-    common_symmetry_ops, periodic_delta,
+    common_symmetry_ops, periodic_delta, primitive_symmetry_ops,
 )
 from tests.conftest import (
     DATA_DIR, FIXTURE_POSCAR, FIXTURE_PRIMCELL, FIXTURE_TRANSMAT,
@@ -545,6 +545,91 @@ def test_common_symmetry_ops_detailed_reports_the_dropped_operations():
     assert len(dropped) == 8
     for _r, _t, why in dropped:
         assert why and "M^-T" in why
+
+
+# ------------------------------------------------------------------ 原胞完整点群
+# 修复轮 6: 对称化必须用**原胞的完整点群**, 而不是"原胞与超胞的公共对称操作"
+# —— 后者在破坏对称性的超胞上只剩 4/12 个操作, 六重对称恢复不了。
+
+def test_primitive_symmetry_ops_returns_the_whole_point_group():
+    """原胞点群 = spglib 给的全部 12 个操作(D3h), **不按超胞变换过滤**。"""
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    ops = primitive_symmetry_ops(prim)
+    assert ops.rotations.shape == (12, 3, 3)
+    assert ops.translations.shape == (12, 3)
+
+
+def test_primitive_symmetry_ops_rotations_are_integer_and_unimodular():
+    """旋转必须是**整数**矩阵(否则作用不到分数坐标上)且行列式为 ±1。
+
+    ``rotation_inverse`` 要求幺模整数阵(否则抛错)⇒ 这里的过滤是必要的。
+    """
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    ops = primitive_symmetry_ops(prim)
+    for r in ops.rotations:
+        assert np.array_equal(r, np.round(r).astype(int))
+        assert abs(abs(np.linalg.det(r.astype(float))) - 1.0) < 1e-9
+
+
+def test_primitive_symmetry_ops_keeps_the_translations():
+    """平移分量必须保留(spglib 给的是模原胞格矢的代表元)。"""
+    import spglib
+
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    ops = primitive_symmetry_ops(prim)
+    ids = np.array([sorted(set(prim.species)).index(s) + 1 for s in prim.species],
+                   dtype=int)
+    sym = spglib.get_symmetry((prim.lattice, prim.positions, ids), symprec=1e-5)
+    raw = sym["translations"]
+    assert raw.shape[0] == ops.translations.shape[0]
+    for t_raw, t_stored in zip(raw, ops.translations):
+        d = np.mod(t_raw - t_stored + 0.5, 1.0) - 0.5
+        assert np.allclose(d, 0.0, atol=1e-6)
+
+
+def test_primitive_symmetry_ops_is_a_superset_of_the_common_subgroup():
+    """破坏对称性的超胞(M=diag(3,1,1)): 公共子群只剩 4 个, 完整点群仍是 12 个。
+
+    这正是修复轮 6 的核心: 只用公共子群做对称化 ⇒ 六重对称恢复不了。
+    """
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    m_bad = np.array([[3, 0, 0], [0, 1, 0], [0, 0, 1]])
+    common = common_symmetry_ops(prim, m_bad)
+    full = primitive_symmetry_ops(prim)
+    assert common.rotations.shape[0] == 4
+    assert full.rotations.shape[0] == 12
+
+    def key(r):
+        return tuple(np.round(np.asarray(r, dtype=float)).astype(int).ravel())
+
+    full_keys = {key(r) for r in full.rotations}
+    assert all(key(r) in full_keys for r in common.rotations)
+
+
+def test_primitive_symmetry_ops_forms_a_group():
+    """完整点群必须是群(轨道分解依赖封闭性)。"""
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    ops = primitive_symmetry_ops(prim)
+    n = ops.rotations.shape[0]
+
+    def compose(i, j):
+        """{R_i|t_i} o {R_j|t_j} = {R_j R_i | t_j + R_j t_i}(列向量约定)。"""
+        rj, tj = ops.rotations[j].astype(float), ops.translations[j]
+        ri, ti = ops.rotations[i].astype(float), ops.translations[i]
+        return rj @ ri, np.mod(tj + rj @ ti, 1.0)
+
+    def find(r, t):
+        for k in range(n):
+            if np.allclose(ops.rotations[k], np.round(r), atol=1e-6) and \
+                    np.allclose(np.mod(ops.translations[k] - t + 0.5, 1.0) - 0.5,
+                                0.0, atol=1e-6):
+                return k
+        return None
+
+    for i in range(n):
+        for j in range(n):
+            r, t = compose(i, j)
+            assert find(r, t) is not None, f"复合 {i} o {j} 不在集合内"
 
 
 def test_pyproject_requires_a_spglib_with_the_dict_api():

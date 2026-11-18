@@ -13,13 +13,14 @@ import numpy as np
 import pytest
 
 from unfoldfs.expand import (ExpandedData, build_spectral_function,
-                             expand_to_full_grid, point_group_orbits,
-                             symmetrize_spectral_function)
+                             expand_to_full_grid, full_point_group,
+                             point_group_orbits, symmetrize_spectral_function)
 from unfoldfs.geometry import (SymmetryOps, Transform, common_symmetry_ops,
-                               read_poscar, read_transmat, reciprocal,
-                               resolve_transform)
+                               common_symmetry_ops_detailed,
+                               primitive_symmetry_ops, read_poscar,
+                               read_transmat, reciprocal, resolve_transform)
 from unfoldfs.grid import (GridSpec, build_grid_map, filter_ops_by_grid,
-                           primitive_grid_points)
+                           filter_ops_by_grid_detailed, primitive_grid_points)
 from unfoldfs.unfold import (UnfoldedResult, build_atom_copies,
                              candidate_g_for_k, unfold_supercell)
 from unfoldfs.vaspio import read_eigenval, read_procar
@@ -356,12 +357,17 @@ def test_expand_on_the_real_unfold_pipeline():
 # 投影到"对称不变子空间"), 机制与实测见 docs/algorithms.md §15。
 
 def _point_group_deviation(gm, grid, a):
-    """每个对称操作下 A(k,E) 与 A(k',E) 的最大相对偏差。"""
+    """每个对称操作下 A(k,E) 与 A(k',E) 的最大相对偏差(用 gm.ops)。"""
+    return _deviation_under_ops(gm.ops, grid, a)
+
+
+def _deviation_under_ops(ops, grid, a):
+    """每个对称操作下 A(k,E) 与 A(k',E) 的最大相对偏差(逐操作)。"""
     from unfoldfs.geometry import periodic_distance, rotation_inverse
     devs = {}
-    for o in range(gm.ops.rotations.shape[0]):
-        r = gm.ops.rotations[o]
-        t = gm.ops.translations[o]
+    for o in range(ops.rotations.shape[0]):
+        r = ops.rotations[o]
+        t = ops.translations[o]
         img = np.mod(grid @ rotation_inverse(r) + t, 1.0)
         d = periodic_distance(grid, img)
         j = d.argmin(axis=1)
@@ -531,3 +537,137 @@ def test_each_grid_point_is_covered_by_exactly_one_supercell_candidate():
     assert n_cover.max() == 1, (
         f"有网格点被 {int(n_cover.max())} 个 (超胞 k, 候选) 覆盖 —— "
         "折叠不是 1:1 的, §15.2a 的'构造 C ≡ 构造 A'结论就不再成立")
+
+
+# ------------------------------------------------------------------ 原胞完整点群
+# 修复轮 6: 对称化必须用**原胞的完整点群**。
+#
+# 背景: 修复轮 5 的对称化用的是 ``grid_map.ops`` —— 那是"原胞与超胞的**公共**
+# 对称操作"(判据 M^-T·R·M^T ∈ Z³)。对 1T-TaS2 的 3×1×1 超胞, 面内 C3 被破坏
+# ⇒ 公共操作只剩 4/12 个 ⇒ 六重对称恢复不了(费米面仍然不对称)。
+#
+# ⇒ 现在用原胞的完整点群(12 个操作)做轨道平均: 原胞的谱函数按构造就在这个
+# 点群下不变 ⇒ 把展开谱投影到"在这个点群下不变"的子空间是有物理依据的,
+# 且**任何**超胞 M 都能这样折回原胞的对称性。
+
+def _grid_map_symmetry_breaking(spec=SPEC):
+    """M = diag(3,1,1) 的超胞网格图(破坏面内 C3 ⇒ 公共子群只剩 4 个操作)。
+
+    超胞晶格直接由 ``M @ A_prim`` 算出(不需要真的写 POSCAR): 这里只做
+    网格/轨道层面的测试。
+    """
+    prim, _sc, _tr = _fixture_geometry()
+    m = np.array([[3, 0, 0], [0, 1, 0], [0, 0, 1]])
+    tr = Transform(m, np.linalg.inv(m.astype(float)))
+    grid = primitive_grid_points(spec)
+    all_ops, dropped = common_symmetry_ops_detailed(prim, m)
+    ops, dropped_grid = filter_ops_by_grid_detailed(all_ops, grid)
+    gm = build_grid_map(spec, grid, ops, tr, reciprocal(prim.lattice),
+                        reciprocal(m @ prim.lattice),
+                        dropped=tuple(dropped) + tuple(dropped_grid))
+    return gm, grid
+
+
+def _synthetic_spectrum(gm, n_band=6, e_grid=None, sigma=0.2):
+    """由**合成**展开结果造的 A(k,E)(各候选权重不同 ⇒ 天然不协变)。"""
+    res = _synthetic_unfolded(gm, n_band=n_band)
+    exp = expand_to_full_grid(res, gm)
+    if e_grid is None:
+        e_grid = np.linspace(-20.0, 10.0, 61)
+    return build_spectral_function(exp, e_grid, sigma)
+
+
+def test_symmetry_breaking_supercell_keeps_only_four_common_operations():
+    """前提: M=diag(3,1,1) 确实把公共对称操作从 12 个砍到 4 个。
+
+    没有这条, 下面的用例就可能因为"公共子群本来就等于完整点群"而空过。
+    """
+    gm, _grid = _grid_map_symmetry_breaking()
+    assert gm.ops.rotations.shape[0] == 4
+    assert primitive_symmetry_ops(_fixture_geometry()[0]).rotations.shape[0] == 12
+
+
+def test_symmetrization_restores_the_full_primitive_point_group():
+    """核心回归锁(修复轮 6): 破坏对称性的超胞上, 对称化后的 A(k,E) 在
+    **原胞完整点群**(12 个操作)下协变(最大相对偏差 <= 1e-8)。
+
+    修复轮 5 的实现只用 4 个公共操作 ⇒ 这条会红(偏差 ~1.0)。
+    """
+    gm, grid = _grid_map_symmetry_breaking()
+    prim = _fixture_geometry()[0]
+    full = filter_ops_by_grid(primitive_symmetry_ops(prim), grid)
+    assert full.rotations.shape[0] == 12, "6x6x1 网格应当容得下整个点群"
+
+    a = _synthetic_spectrum(gm)
+    raw = _deviation_under_ops(full, grid, a)
+    assert max(raw.values()) >= 0.1, (
+        "合成的谱本来就不协变(否则本用例无意义): "
+        f"{max(raw.values()):.3e}")
+
+    a_sym = symmetrize_spectral_function(a, gm)
+    devs = _deviation_under_ops(full, grid, a_sym)
+    worst = max(devs.values())
+    assert worst <= 1e-8, (
+        f"对称化后的 A(k,E) 在原胞完整点群下仍不协变: 最大相对偏差 "
+        f"{worst:.3e} (逐操作: "
+        f"{ {k: f'{v:.3e}' for k, v in devs.items()} })")
+
+
+def test_symmetrization_with_the_common_subgroup_alone_is_not_covariant():
+    """对照: 显式只用**公共子群**(修复轮 5 的做法)时, 六重对称恢复不了。
+
+    这条同时是"变异自检"的固化版本: 把默认实现退回 ``grid_map.ops``,
+    上面的 ``test_symmetrization_restores_the_full_primitive_point_group``
+    就会变红。
+    """
+    gm, grid = _grid_map_symmetry_breaking()
+    prim = _fixture_geometry()[0]
+    full = filter_ops_by_grid(primitive_symmetry_ops(prim), grid)
+    a = _synthetic_spectrum(gm)
+    a_common = symmetrize_spectral_function(a, gm, ops=gm.ops)
+    devs = _deviation_under_ops(full, grid, a_common)
+    assert max(devs.values()) >= 1e-3, (
+        "只用公共子群时竟然也协变了 —— 前提(公共子群 < 完整点群)不成立?")
+
+
+def test_full_group_symmetrization_is_idempotent():
+    """完整点群对称化是**幂等**的: 再做一次不改变任何位。"""
+    gm, _grid = _grid_map_symmetry_breaking()
+    a = _synthetic_spectrum(gm)
+    once = symmetrize_spectral_function(a, gm)
+    twice = symmetrize_spectral_function(once, gm)
+    assert np.array_equal(twice, once), (
+        "对称化不是幂等的 —— 第二次又改了结果")
+
+
+def test_full_group_symmetrization_is_bit_identical_for_a_covariant_spectrum():
+    """本来就没有对称性破缺时, 完整点群对称化必须**逐位**无操作。
+
+    对应"保留全部 12 个操作的超胞"(如 √3×√3 R30° 莫尔超胞)与 3×3×1 的
+    fixture: 谱权重本来就是协变的 ⇒ 轨道平均不能引入 1 ulp 的噪声。
+    """
+    gm, grid, a = _fixture_pipeline_spectrum()
+    prim = _fixture_geometry()[0]
+    full = filter_ops_by_grid(primitive_symmetry_ops(prim), grid)
+    assert full.rotations.shape[0] == 12
+    a_cov = symmetrize_spectral_function(a, gm, ops=full)
+    again = symmetrize_spectral_function(a_cov, gm, ops=full)
+    assert np.array_equal(again, a_cov), (
+        "完整点群对称化对已经协变的谱不是逐位无操作")
+
+
+def test_full_point_group_is_recovered_from_the_grid_map():
+    """``full_point_group(grid_map)`` 必须复原出原胞的完整点群。
+
+    grid_map.ops 只装了公共子群, 被剔除的那些(带旋转与平移)记在
+    ``grid_map.dropped`` 里 ⇒ 两者合起来 = 原胞点群。
+    """
+    gm, _grid = _grid_map_symmetry_breaking()
+    recovered = full_point_group(gm)
+    assert recovered.rotations.shape[0] == 12
+    prim = _fixture_geometry()[0]
+    truth = primitive_symmetry_ops(prim)
+    key = lambda r: tuple(np.asarray(r, dtype=int).ravel())
+    assert {key(r) for r in recovered.rotations} == \
+        {key(r) for r in truth.rotations}
+

@@ -28,7 +28,8 @@ import pytest
 from unfoldfs import cli
 from unfoldfs.expand import point_group_orbits
 from unfoldfs.fsout import read_bxsf, read_cube, read_fermisurfer_band
-from unfoldfs.geometry import (common_symmetry_ops_detailed, read_poscar,
+from unfoldfs.geometry import (common_symmetry_ops_detailed,
+                               primitive_symmetry_ops, read_poscar,
                                read_transmat, reciprocal, resolve_transform)
 from unfoldfs.grid import (GridSpec, build_grid_map,
                            filter_ops_by_grid_detailed, load_grid_map,
@@ -1049,3 +1050,202 @@ def test_naive_supercell_count_gives_a_reason_for_each_failure_mode():
     # 正常情形
     n, why = _naive_supercell_count((6, 6, 1), np.diag([3, 3, 1]))
     assert n == 4 and why == ""
+
+
+# ------------------------------------------------------------------ 原胞完整点群
+# 修复轮 6: CLI 的默认对称化必须用**原胞的完整点群**。
+#
+# 迷你体系(正交 Si)对 M=diag(3,1,1) 是**保持对称**的(公共操作 = 完整点群)
+# ⇒ 测不出"只用公共子群"的差别。要测出差别必须用**破坏对称性**的超胞:
+# 这里用 fixture 的 1H-MoS2 原胞(点群 D3h = 12 个操作)+ M=diag(3,1,1)
+# ⇒ 公共操作只剩 4 个, 完整点群仍是 12 个。
+
+_MOS2_PRIMCELL = str(REPO_ROOT / "tests" / "data" / "PRIMCELL.vasp")
+_MOS2_M = np.array([[3, 0, 0], [0, 1, 0], [0, 0, 1]])
+_MOS2_ENERGIES = (-10.0, -6.0, -2.0, 1.0)
+_MOS2_DOS_EF = -5.0
+# 副本相位(沿 a 方向差 2pi/3): 让 4 种相位约定有区分度(实测相对差 ~9.6%)
+_MOS2_U = np.array([0.1027125684732821 - 0.21014635803702303j,
+                    0.23240310131893024 - 0.7116491117596169j,
+                    0.5501292501189036 + 1.001533391119041j])
+_MOS2_THETA = (0.0, np.pi / 4, np.pi / 2, 3 * np.pi / 4)
+
+
+def _write_mos2_supercell(directory):
+    """写 MoS2 原胞 + 3x1x1 超胞的结构文件(破坏面内 C3)。"""
+    os.makedirs(directory, exist_ok=True)
+    prim = read_poscar(_MOS2_PRIMCELL)
+    a_sc = _MOS2_M @ prim.lattice
+    inv_m = np.linalg.inv(_MOS2_M.astype(float))
+    frac, species = [], []
+    for p, sp in zip(prim.positions, prim.species):
+        for j in range(3):
+            frac.append((p + j * np.array([1.0, 0.0, 0.0])) @ inv_m)
+            species.append(sp)
+    uniq = list(dict.fromkeys(species))
+    _write_poscar(os.path.join(directory, "POSCAR"), "3x1x1 supercell", a_sc,
+                  np.array(frac), uniq, [species.count(s) for s in uniq])
+    _write_poscar(os.path.join(directory, "PRIMCELL.vasp"), "MoS2 primitive",
+                  prim.lattice, prim.positions, uniq,
+                  [prim.species.count(s) for s in uniq])
+    with open(os.path.join(directory, "TRANSMAT.in"), "w",
+              encoding="utf-8") as fh:
+        fh.write("Read transformation matrix from the TRANSMAT.in file\n")
+        for row in _MOS2_M:
+            fh.write("  %d  %d  %d   # must be three integers\n" % tuple(row))
+    return prim
+
+
+def _write_mos2_vasp_output(directory, k_points, n_ions):
+    """写合成的 EIGENVAL / PROCAR / DOSCAR。
+
+    PROCAR 的复系数 = **原子相位**(随带与原子序号变) × **副本相位**(沿 a 方向
+    差 2pi/3)⇒ 展开能把态集中到唯一一个候选 G 上, 且 4 种相位约定有区分度。
+
+    占据数在 k 上跨过 0.5(第 3 条带在偶数/奇数 k 上分别 0 / 1)⇒ 金属 ⇒
+    ``--ef auto`` 取 DOSCAR 的 E_F, 不会触发带隙检查的告警。
+    """
+    n_band = len(_MOS2_ENERGIES)
+    with open(os.path.join(directory, "EIGENVAL"), "w", encoding="utf-8") as fh:
+        fh.write("   %d   %d    1    1\n" % (n_ions, n_ions))
+        fh.write("  1.000000000000000E+02  0.000000000000000E+00"
+                 "  0.000000000000000E+00  0.100000000000000E-08"
+                 "  0.500000000000000E-15\n")
+        fh.write("  1.000000000000000E-004\n")
+        fh.write("  CAR \n synthetic MoS2 supercell\n")
+        fh.write("    2      %d    %d\n" % (len(k_points), n_band))
+        fh.write("\n")
+        for ik, kfrac in enumerate(k_points):
+            fh.write("  %14.7E %14.7E %14.7E %14.7E\n"
+                     % (kfrac[0], kfrac[1], kfrac[2], 1.0))
+            occ = (1.0, 1.0, 1.0 if ik % 2 else 0.0, 0.0)
+            for b, e in enumerate(_MOS2_ENERGIES):
+                fh.write("  %5d %14.6f %10.6f\n" % (b + 1, e, occ[b]))
+            fh.write("\n")
+    coeffs = np.zeros((n_band, n_ions, 1), dtype=complex)
+    for b, theta in enumerate(_MOS2_THETA):
+        for i in range(n_ions):
+            coeffs[b, i, 0] = np.exp(1j * theta * (i // 3)) * _MOS2_U[i % 3]
+    with open(os.path.join(directory, "PROCAR"), "w", encoding="utf-8") as fh:
+        fh.write("PROCAR lm decomposed + phase\n")
+        fh.write("# of k-points: %3d         # of bands:  %d"
+                 "         # of ions:  %4d\n" % (len(k_points), n_band, n_ions))
+        fh.write("\n")
+        for ik, kfrac in enumerate(k_points):
+            fh.write(" k-point %5d :    %.8f %.8f %.8f"
+                     "     weight = 1.00000000\n"
+                     % (ik + 1, kfrac[0], kfrac[1], kfrac[2]))
+            for b, e in enumerate(_MOS2_ENERGIES):
+                fh.write("\n")
+                fh.write("band  %5d # energy  %14.8f # occ.  1.00000000\n"
+                         % (b + 1, e))
+                fh.write("\n")
+                fh.write("ion      s     tot\n")
+                tot = 0.0
+                for i in range(n_ions):
+                    m2 = abs(coeffs[b, i, 0]) ** 2
+                    tot += m2
+                    fh.write("  %3d  %12.8f  %12.8f\n" % (i + 1, m2, m2))
+                fh.write("tot   %12.8f  %12.8f\n" % (tot, tot))
+                fh.write("ion      s\n")
+                for i in range(n_ions):
+                    c = coeffs[b, i, 0]
+                    fh.write("  %3d %14.8f %14.8f %14.8f\n"
+                             % (i + 1, c.real, c.imag, abs(c) ** 2))
+    with open(os.path.join(directory, "DOSCAR"), "w", encoding="utf-8") as fh:
+        fh.write("   %d   %d   1   0\n" % (n_ions, n_ions))
+        fh.write("  1.000000000000000E+02  0.000000000000000E+00"
+                 "  0.000000000000000E+00  0.100000000000000E-08"
+                 "  0.500000000000000E-15\n")
+        fh.write("  1.000000000000000E-004\n")
+        fh.write("  CAR \n synthetic MoS2 supercell\n")
+        fh.write("  1.000000000000000E+01 -1.000000000000000E+01  301"
+                 " %20.10E  1.000000000000000E+00\n" % _MOS2_DOS_EF)
+        for i in range(301):
+            fh.write("  %14.6f 0.0000E+00 0.0000E+00\n"
+                     % (-10.0 + i * 20.0 / 300.0))
+
+
+def _mos2_run(tmp_path):
+    """一个"破坏对称性"的 MoS2 3x1x1 计算目录(gen 出来的 grid_map + 合成输出)。"""
+    src = tmp_path / "src"
+    run = tmp_path / "run"
+    prim = _write_mos2_supercell(str(src))
+    assert cli.main(["gen",
+                      "--supercell", str(src / "POSCAR"),
+                      "--primcell", str(src / "PRIMCELL.vasp"),
+                      "--transmat", str(src / "TRANSMAT.in"),
+                      "--grid", "6", "6", "1",
+                      "--outdir", str(run)]) == 0
+    gm = load_grid_map(str(run / "grid_map.npz"))
+    assert gm.ops.rotations.shape[0] == 4, "前提: 公共操作只剩 4 个"
+    _write_mos2_vasp_output(str(run), [tuple(k) for k in gm.k_super], 9)
+    return run, prim, gm
+
+
+def _full_group_deviation(prim, grid, a):
+    """A(k,E) 在**原胞完整点群**下的最大相对偏差(逐操作)。"""
+    from unfoldfs.geometry import periodic_distance, rotation_inverse
+    ops = primitive_symmetry_ops(prim)
+    worst = 0.0
+    for o in range(ops.rotations.shape[0]):
+        r = ops.rotations[o]
+        t = ops.translations[o]
+        img = np.mod(grid @ rotation_inverse(r) + t, 1.0)
+        d = periodic_distance(grid, img)
+        j = d.argmin(axis=1)
+        on = np.nonzero(d[np.arange(grid.shape[0]), j] < 1e-6)[0]
+        for i in on:
+            denom = max(a[i].max(), a[j[i]].max(), 1e-300)
+            worst = max(worst, float(np.abs(a[i] - a[j[i]]).max() / denom))
+    return worst
+
+
+def test_unfold_default_output_is_covariant_under_the_full_point_group(tmp_path):
+    """默认(unfold)的输出必须在**原胞完整点群**(12 个操作)下协变。
+
+    破坏对称性的超胞(M=diag(3,1,1))上, 公共操作只有 4 个 ⇒ 只用公共子群
+    做对称化时, 另外 8 个操作下**不协变**(实测最大相对偏差 1.000e+00)。
+
+    两个产物都要查: ``FS.cube``(用户真正拿去画费米面的文件)与
+    ``A(k,E).npz``(完整谱函数)。
+    """
+    run, prim, gm = _mos2_run(tmp_path)
+    fs = tmp_path / "fs"
+    assert cli.main(["unfold", "--dir", str(run), "--outdir", str(fs)]) == 0
+    grid = primitive_grid_points(gm.spec)
+    a = np.load(str(fs / "A(k,E).npz"))["A"]
+    worst = _full_group_deviation(prim, grid, a)
+    assert worst <= 1e-8, (
+        f"A(k,E).npz 在原胞完整点群下不协变: 最大相对偏差 {worst:.3e}")
+    cube = read_cube(str(fs / "FS.cube"))
+    field = cube["field"].reshape(-1)
+    assert field.size == grid.shape[0]
+    worst_cube = _full_group_deviation(prim, grid, field)
+    assert worst_cube <= 1e-8, (
+        f"FS.cube 在原胞完整点群下不协变: 最大相对偏差 {worst_cube:.3e}")
+
+
+def test_unfold_no_symmetrize_leaves_the_spectrum_non_covariant(tmp_path):
+    """--no-symmetrize 时不协变(证明上面的协变确实是**对称化**带来的)。"""
+    run, prim, gm = _mos2_run(tmp_path)
+    fs = tmp_path / "fs_raw"
+    assert cli.main(["unfold", "--dir", str(run), "--outdir", str(fs),
+                     "--no-symmetrize"]) == 0
+    grid = primitive_grid_points(gm.spec)
+    a = np.load(str(fs / "A(k,E).npz"))["A"]
+    worst = _full_group_deviation(prim, grid, a)
+    assert worst >= 1e-3, (
+        f"--no-symmetrize 的输出竟然协变(最大相对偏差只有 {worst:.3e}) —— "
+        "要么展开本身变了, 要么对称化没被关掉")
+
+
+def test_unfold_reports_the_full_point_group_size(tmp_path, capsys):
+    """CLI 必须说清用的是**原胞完整点群**以及补回了几个被超胞破坏的操作。"""
+    run, _prim, _gm = _mos2_run(tmp_path)
+    cli.main(["unfold", "--dir", str(run), "--outdir", str(tmp_path / "fs")])
+    out = capsys.readouterr().out
+    assert "原胞完整点群" in out
+    assert "12 个操作" in out
+    assert "公共对称操作" in out
+
