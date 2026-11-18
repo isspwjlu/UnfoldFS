@@ -29,7 +29,8 @@ from unfoldfs import cli
 from unfoldfs.expand import point_group_orbits
 from unfoldfs.fsout import read_bxsf, read_cube, read_fermisurfer_band
 from unfoldfs.geometry import (common_symmetry_ops_detailed,
-                               primitive_symmetry_ops, read_poscar,
+                               periodic_distance, primitive_symmetry_ops,
+                               read_poscar,
                                read_transmat, reciprocal, resolve_transform)
 from unfoldfs.grid import (GridSpec, build_grid_map,
                            filter_ops_by_grid_detailed, load_grid_map,
@@ -349,6 +350,22 @@ def test_gen_kpoints_first_line_is_not_a_vasp_branch_keyword(tmp_path):
     cli.main(_gen_args(src, out, "--resolution", "1.6"))
     first, _ = _read_kpoints(str(out / "KPOINTS"))
     assert first[0] not in "GgKkSsCcRr"
+
+
+def test_gen_kpoints_has_no_duplicate_k_point(tmp_path):
+    """`gen` 写出的 KPOINTS 也**不许有重复 k 点**(修复轮 7 / B1)。
+
+    VASP 6.6.0 读到含重复 k 点的显式列表会崩(服务器实测 2026-11-18: 每次
+    都在第一个 k 点算完后死掉)。网格的 k 点天然唯一 —— 这里把它**锁住**,
+    免得将来有人改折叠/去重的逻辑时把它弄坏。
+    """
+    out = tmp_path / "run"
+    src = _write_mini_system(str(tmp_path / "src"))
+    cli.main(_gen_args(src, out, "--resolution", "1.6"))
+    _first, pts = _read_kpoints(str(out / "KPOINTS"))
+    k = np.array([p[0] for p in pts])
+    d = periodic_distance(k, k)
+    assert np.all(d[~np.eye(len(k), dtype=bool)] > 1e-6)
 
 
 def test_gen_grid_map_round_trips(tmp_path):

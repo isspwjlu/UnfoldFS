@@ -707,7 +707,7 @@ A(k,E_F) 峰值 / 全局峰值 = 0.134
 | `WEIGHT.grd` | (n_band, n_k) 权重 | 同上 |
 | `KLABELS` | 高对称点的标签 + 距离 | 同上 |
 | `unfolded_band.dat` | 长表：路径距离 / E(eV) / 权重 / 带号 | 自用（二次分析） |
-| `unfolded_band.png` | matplotlib 画的加权能带图 | 自用（没有 MATLAB 时） |
+| `unfolded_band.png` | matplotlib 画的加权能带图（x 轴 = `k-path (2π/Å)`；图上标出 E_F 的**数值**；图注给出**画出来的**能量窗口 `E_plot`） | 自用（没有 MATLAB 时） |
 
 **前四个的文件名与布局与 vaspkit 完全一致** ⇒ 用户组现有的 MATLAB 脚本
 （`unfold_band_plot_mirror.m`）**不改一行**就能画我们的数据。
@@ -728,6 +728,30 @@ ENERGY.grd / MOMENTUM.grd / WEIGHT.grd  ——  都是 (n_band, n_k) 的矩阵
 数值格式：**每个数值占 14 列**（`"%14.6f"`），一行 = 14 × n_k 个字符，
 字段之间没有额外的分隔符（靠定宽对齐）。这与 vaspkit 实测的 `.grd`
 逐字节同格式（实测行长 1848 = 14 × 132 列）。
+
+#### 13.2.1 ★ 列数 = **路径点**数，不是 KPOINTS 的行数（修复轮 7 / B1）
+
+`.grd` 的**列**、`KLABELS` 的标签、`unfolded_band.dat` 的行，用的都是**原始
+路径点**（**含重复端点**）；而 `KPOINTS` 的**行**是**去重后**的待算超胞 k。
+两个数**一般不相等**：
+
+| | 数量 | 出处 |
+|---|---|---|
+| 路径点（含重复端点） | 每段 n 个 × 段数 | `.grd` 的列 / `KLABELS` / `unfolded_band.dat` |
+| 去重后的计算 k 点 | **≤** 路径点数 | `KPOINTS` 的行数与表头计数 |
+
+重复的两个来源：① 路径的**相邻段共享端点**（M 既是第 1 段的终点又是第 2 段
+的起点）；② **折叠**到超胞后重合（不同的原胞 k 折到同一个超胞 k —— 同一个
+超胞 k 只算一次，展开时再各自取自己的候选）。
+
+⇒ 阶段 2 把每个路径点映射回**已计算的** k：重复端点映射到**同一个** k
+（两列的数据逐位相同），不同的原胞 k 折到同一个超胞 k 时各取自己的候选。
+
+⚠ **为什么必须去重**：**VASP 6.6.0 读到含重复 k 点的显式列表会崩**（服务器
+实测 2026-11-18：每次都在第一个 k 点算完后死掉；手工去重并把计数改成 33 后，
+同一次计算 194 s 跑完全部 33 个 k 点）。⇒ `band.write_kpoints_explicit`
+按周期距离去重（容差 1e-6）且**表头计数 = 实际行数**；`unfoldfs gen` 写出的
+网格 KPOINTS 同样有"无重复"的断言。
 
 ### 13.3 `KLABELS`
 
@@ -767,6 +791,16 @@ K-Label    Coordinate of high-symmetry k-point in band-structure plots ⏎
 无法反推其标度）；这不影响互操作 —— MATLAB 脚本只把距离当 x 轴坐标用，
 只要**我们自己的四个文件自洽**即可（`KLABELS` 的距离与 `MOMENTUM.grd` 的
 距离序列一致，容差 1e-3，因为 `KLABELS` 只保留 3 位小数）。
+
+**修复轮 7 / B2 —— PNG 的 x 轴标签已改正**：`unfolded_band.png` 的 x 轴现在
+标成 **`k-path (2π/Å)`**（旧实现写的是 `k-path (1/Angstrom)`，与
+`MOMENTUM.grd` / `KLABELS` / `unfolded_band.dat` 的单位矛盾 ⇒ 同一个横坐标在
+图与数据里单位不同，是个会误导人的不一致）。
+
+**为什么 `.grd` 里没有"单位"表头**：三个 `.grd` 必须是**纯数字矩阵** ——
+MATLAB 脚本用 `load('MOMENTUM.grd')` 直接读，加任何表头行都会让它读错矩阵。
+⇒ 单位**不在文件里**、写在本节；`unfolded_band.dat`（我们自己的长表，不是
+vaspkit 格式）才有表头 `# 路径距离(2π/Å)  E(eV, 绝对值)  权重  带号`。
 
 ### 13.5 ⚠ 权重的含义与 vaspkit 282 **不同**
 
