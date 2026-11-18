@@ -41,9 +41,8 @@ from .fsout import (band_edges, has_fermi_crossing, make_e_grid,
                     select_fermi_energy, write_bxsf,
                     write_cube, write_fermisurfer_bands,
                     write_spectral_npz)
-from .geometry import (common_symmetry_ops, common_symmetry_ops_detailed,
-                       read_poscar, read_transmat, reciprocal,
-                       resolve_transform)
+from .geometry import (common_symmetry_ops_detailed, primitive_symmetry_ops,
+                       read_poscar, read_transmat, reciprocal, resolve_transform)
 from .grid import (GridSpec, build_grid_map, choose_grid_points,
                    filter_ops_by_grid_detailed, load_grid_map,
                    primitive_grid_points, save_grid_map, write_kpoints)
@@ -440,7 +439,7 @@ def _print_convention_line(unfolded, det: int) -> None:
 
 def _write_spectral_npz(path: str, expanded, b_prim: np.ndarray, e_f: float, *,
                         vbm: float, cbm: float, e_grid: np.ndarray, sigma: float,
-                        symmetrize=None) -> None:
+                        symmetrize=None, ops=None) -> None:
     """写 ``A(k,E).npz``; 给定 ``symmetrize`` 时把文件里的 A 换成**对称化后**的。
 
     ``fsout.write_spectral_npz`` 自己从 ``expanded`` 重算 A(k,E) —— 而对称化是
@@ -450,13 +449,16 @@ def _write_spectral_npz(path: str, expanded, b_prim: np.ndarray, e_f: float, *,
 
     ⇒ npz 里的 ``A`` 是**对称化后**的谱函数, 而 ``band_e``/``band_w`` 是
     **原始**展开数据(见 docs/formats.md)。
+
+    ``ops``: 对称化用的对称操作(缺省 = 原胞完整点群, 见
+    ``expand.symmetrize_spectral_function``)。
     """
     write_spectral_npz(path, expanded, b_prim, e_f, vbm=vbm, cbm=cbm,
                        e_grid=e_grid, sigma=sigma)
     if symmetrize is None:
         return
     a = symmetrize_spectral_function(
-        build_spectral_function(expanded, e_grid, sigma), symmetrize)
+        build_spectral_function(expanded, e_grid, sigma), symmetrize, ops=ops)
     with np.load(path) as data:
         arrays = {key: data[key] for key in data.files}
     arrays["A"] = a
@@ -567,13 +569,22 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     # ★ 点群轨道对称化(默认开): 把展开谱 A(k,E) 投影到"对称不变子空间" ——
     # 展开得到的谱权重在点群下**不协变**(docs/algorithms.md §15), 不对称化
     # 的话费米面的等值面相对晶体对称性是畸变的。
+    #
+    # ★ 用**原胞的完整点群**(修复轮 6): 原胞的谱函数按构造就在这个点群下
+    # 不变 ⇒ 投影有物理依据; 而"超胞还保留的那部分操作"只对保持对称的超胞
+    # 够用 —— 破坏对称性的超胞(如 3×1×1)只剩 4/12 个操作, 六重对称恢复不了。
     symmetrize = not getattr(args, "no_symmetrize", False)
+    full_ops = primitive_symmetry_ops(prim)
+    n_common = int(gm.ops.rotations.shape[0])
 
     _print_convention_line(unfolded, tr.det)
-    print("点群对称化    : " + ("已启用(按原胞点群轨道平均 A(k,E); "
-                               "--no-symmetrize 可关闭)" if symmetrize
+    print("点群对称化    : " + ("已启用(按**原胞完整点群**("
+                               f"{full_ops.rotations.shape[0]} 个操作)轨道平均 "
+                               "A(k,E); --no-symmetrize 可关闭)" if symmetrize
                                else "已关闭(--no-symmetrize) —— 谱权重是"
                                     "逐 (K,G) 的原始权重, 费米面带对称性破缺"))
+    print(f"公共对称操作  : {n_common} 个(原胞与超胞共有的; 超胞破坏掉的"
+          f" {full_ops.rotations.shape[0] - n_common} 个由完整点群补回)")
     print(f"VBM / CBM     : {vbm_txt}")
     print(f"E_F           : {e_f:.6f} eV  (--ef {args.ef}, "
           f"--delta {args.delta:g})")
@@ -582,7 +593,7 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     values = build_spectral_function(expanded, np.array([e_f]),
                                      args.sigma)[:, 0]
     if symmetrize:
-        values = symmetrize_spectral_function(values, gm)
+        values = symmetrize_spectral_function(values, gm, ops=full_ops)
     comments = _fs_comments(e_f, args, vbm, cbm)
 
     cube_path = os.path.join(args.outdir, "FS.cube")
@@ -593,10 +604,15 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     band_paths = write_fermisurfer_bands(args.outdir, expanded, b_prim, e_f)
     print(f"已写出        : {os.path.join(args.outdir, 'band.1')} ... "
           f"band.{len(band_paths)}")
+    print("逐带文件      : FS.bxsf / band.N **未**对称化 —— 逐带数据在对称相关"
+          "点上根本不是同一组带(实测 3×1×1 的 1T-TaS2: 19 条轨道里只有 1 条"
+          "的有效带数一致), 按带序号平均会把不同的带混在一起;"
+          "谱函数派生的输出(FS.cube / A(k,E).npz)是完全对称的)")
     e_grid = make_e_grid(e_f, _NPZ_HALF_WIDTH, _NPZ_N_POINTS)
     _write_spectral_npz(npz_path, expanded, b_prim, e_f, vbm=vbm, cbm=cbm,
                         e_grid=e_grid, sigma=args.sigma,
-                        symmetrize=gm if symmetrize else None)
+                        symmetrize=gm if symmetrize else None,
+                        ops=full_ops if symmetrize else None)
     print(f"已写出        : {npz_path}")
     # BXSF 只支持 Gamma 网格(见 docs/formats.md §3): MP 网格下跳过它,
     # 但把原因说清楚 —— 其余输出(FS.cube / band.N / npz)对 MP 网格都成立
@@ -770,11 +786,14 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
     energy, weight = assemble_band(unfolded, path.k_prim)
     # ★ 点群轨道对称化(默认开): 路径上**对称相关**的两点会给出不同的展开谱
     # 权重(docs/algorithms.md §15)⇒ 同一段路径的两半颜色不同。带能量不动。
+    #
+    # ★ 用**原胞的完整点群**(修复轮 6): 破坏对称性的超胞(如 3×1×1)只保留
+    # 4/12 个公共操作, 用公共子群做平均会漏掉路径上其余的对称相关点。
     symmetrize = not getattr(args, "no_symmetrize", False)
     if symmetrize:
         weight = symmetrize_band_weights(
             energy, weight, path.k_prim,
-            common_symmetry_ops(prim, tr.m_eff))
+            primitive_symmetry_ops(prim))
 
     outdir = args.outdir or "bandfs"
     os.makedirs(outdir, exist_ok=True)

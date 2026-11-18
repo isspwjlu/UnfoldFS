@@ -423,6 +423,36 @@ def test_symmetrize_band_weights_rejects_a_shape_mismatch():
                                      k_prim, _mirror_ops())
 
 
+def test_symmetrize_band_weights_finds_partners_the_common_subgroup_misses():
+    """完整点群比"公共子群"多找出路径上的对称相关点(修复轮 6)。
+
+    1H-MoS2 原胞(点群 D3h = 12 个操作)+ M=diag(3,1,1) ⇒ 公共操作只剩 4 个
+    (面内 C3 被超胞破坏)。路径上放一对**只有完整点群才看得见**的对称相关点:
+    公共子群看不见 ⇒ 权重不被平均; 完整点群看得见 ⇒ 被平均。
+    """
+    from unfoldfs.geometry import (common_symmetry_ops, primitive_symmetry_ops,
+                                   read_poscar)
+    prim = read_poscar(str(pathlib.Path(__file__).resolve().parent
+                            / "data" / "PRIMCELL.vasp"))
+    m = np.array([[3, 0, 0], [0, 1, 0], [0, 0, 1]])
+    full = primitive_symmetry_ops(prim)
+    common = common_symmetry_ops(prim, m)
+    assert full.rotations.shape[0] == 12
+    assert common.rotations.shape[0] == 4
+
+    # 这两个点互为 [[-1,1,0],[0,1,0],[0,0,±1]] 的像 —— 该操作**不在**公共子群里
+    k_prim = np.array([[1.0 / 3.0, 0.0, 0.0], [2.0 / 3.0, 1.0 / 3.0, 0.0]])
+    energy = np.array([[-1.0, -1.0]])
+    weight = np.array([[0.2, 0.8]])
+
+    w_full = band.symmetrize_band_weights(energy, weight, k_prim, full)
+    assert w_full[0, 0] == pytest.approx(0.5)
+    assert w_full[0, 1] == pytest.approx(0.5)
+    w_common = band.symmetrize_band_weights(energy, weight, k_prim, common)
+    assert w_common[0, 0] == pytest.approx(0.2)
+    assert w_common[0, 1] == pytest.approx(0.8)
+
+
 def test_spread_order_puts_the_sampled_k_points_apart():
     """相位约定只采样 k 列表的前 4 个点 —— 路径上这 4 个点必须分散。"""
     order = band.spread_order(30)

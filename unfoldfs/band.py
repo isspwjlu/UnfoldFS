@@ -31,6 +31,10 @@ MoS₂ 9.186e-01 / 1T-TaS₂ 1.000e+00), 而**带能量不受影响**(对称相�
 点群轨道平均(默认开启, ``--no-symmetrize`` 可关)。但它**只动权重**、且
 **只在路径上存在对称相关点时**才生效(泛路径点的轨道离开路径) ⇒ 见
 docs/algorithms.md §16.7。
+
+⇒ **修复轮 6**: 轨道平均用的是**原胞完整点群**(不是"原胞与超胞的公共对称
+操作")—— 破坏对称性的超胞只保留 4/12 个公共操作, 用公共子群会漏掉路径上
+其余的对称相关点。见 docs/algorithms.md §15.8。
 """
 from __future__ import annotations
 
@@ -392,7 +396,10 @@ def symmetrize_band_weights(energies: np.ndarray, weights: np.ndarray,
     energies : (n_band, n_k) 带能量(eV), 行 = 带、列 = 路径点
     weights  : (n_band, n_k) 带权重
     k_prim   : (n_k, 3) 路径点的原胞分数坐标
-    ops      : 对称操作(原胞与超胞的公共对称操作)
+    ops      : 对称操作(CLI 传的是**原胞完整点群** —— 见
+               ``geometry.primitive_symmetry_ops`` 与 docs/algorithms.md §15.8:
+               破坏对称性的超胞只保留 4/12 个公共操作, 用公共子群会漏掉路径上
+               其余的对称相关点)
     e_tol    : 带能量的匹配容差(eV) —— 只有**各成员同一行的带能量彼此相符**
                时才平均(否则那两行根本不是同一条带, 平均会把不同的带混起来)
 
