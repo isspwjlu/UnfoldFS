@@ -56,20 +56,55 @@ def primitive_grid_points(spec: GridSpec) -> np.ndarray:
     return mesh.reshape(-1, 3)
 
 
+def per_dimension_multiples(m_eff: np.ndarray) -> Optional[Tuple[int, int, int]]:
+    """对角 M 的**逐维**约束: 第 i 维要求 M_ii | P_i; 非对角 M 返回 None。
+
+    对角 M 时折叠是**逐分量**的(K = k'·M^T ⇒ K_i = k'_i·M_ii), 于是第 i 维
+    只要 P_i 是 |M_ii| 的倍数, 该维的 P_i 个网格点就**整除**成 P_i/|M_ii|
+    个不同的超胞 k ⇒ 逐维约束是**充要**条件(且保证 n_points = n_k·det(M))。
+
+    ⚠ **非对角 M 下逐维条件不成立**: 候选折叠矢量 g 跨维耦合
+    (``candidate_g_for_k`` 的候选集随 K 平移), 只有全局 LCM
+    (= comm(M^-1)) 才保证折叠一致 ⇒ 那时返回 None, 调用方用全局 LCM。
+    """
+    m = np.asarray(m_eff, dtype=float)
+    # rtol=0: "是不是对角"与"对角元是不是整数"都是**绝对**判据 ——
+    # 默认的 rtol=1e-5 会让大对角元(比如 1000)上的 1e-3 级非对角元被放过。
+    if not np.allclose(m, np.diag(np.diag(m)), atol=1e-8, rtol=0.0):
+        return None
+    diag = np.diag(m)
+    if not np.allclose(diag, np.rint(diag), atol=1e-8, rtol=0.0):
+        return None
+    d = np.abs(np.rint(diag)).astype(int)
+    if np.any(d < 1):
+        return None
+    return (int(d[0]), int(d[1]), int(d[2]))
+
+
 def choose_grid_points(lattice: np.ndarray, m_eff: np.ndarray,
                        resolution: float, grid_type: str = "gamma") -> GridSpec:
-    """按分辨率选网格点数, 并强制 P 为 comm(M^-1) 的倍数。
+    """按分辨率选网格点数, 并保证网格与超胞变换自洽。
 
     lattice  : 原胞晶格(行=实矢量)
     m_eff    : 变换矩阵(行约定, 用 resolve_transform 探测过的那个)
     resolution: 倒空间步长上限, 单位与 |B| 相同(含 2π), 即 2π/Å
+
+    **约束分两种**:
+
+    * **对角 M**: 逐维约束 M_ii | P_i(见 ``per_dimension_multiples``)。
+      第 i 维只有被放大时才需要它的倍数 —— 没被放大的那一维(如 monolayer
+      超胞的 c 轴 M_33=1)**不受约束**, 否则会白烧机时(全局 LCM 会把
+      P_3 强制成 3 的倍数, 真实 monolayer 只需要 1)。
+    * **非对角 M**: 全局 LCM = comm(M^-1)(逐维条件在那里不成立)。
     """
     b = reciprocal(lattice)
-    comm = matrix_denominator_lcm(m_eff)
+    per_dim = per_dimension_multiples(m_eff)
+    comm = matrix_denominator_lcm(m_eff) if per_dim is None else None
     p = []
     for i in range(3):
         n = max(int(np.ceil(np.linalg.norm(b[i]) / resolution)), 1)
-        while n % comm != 0:
+        mult = per_dim[i] if per_dim is not None else comm
+        while n % mult != 0:
             n += 1
         p.append(n)
     return GridSpec(tuple(p), grid_type, (0.0, 0.0, 0.0))

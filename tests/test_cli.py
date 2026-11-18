@@ -33,6 +33,7 @@ from unfoldfs.grid import (GridSpec, build_grid_map,
                            filter_ops_by_grid_detailed, load_grid_map,
                            primitive_grid_points, save_grid_map,
                            write_kpoints)
+from unfoldfs.vaspio import read_eigenval, read_procar
 from tests.conftest import FIXTURE_EIGENVAL
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -72,18 +73,22 @@ def _write_poscar(path, title, lattice, frac, species, counts):
             fh.write("  %22.16f %22.16f %22.16f\n" % tuple(p))
 
 
-def _supercell_frac():
-    """超胞 6 个原子的分数坐标(原胞原子 x 沿 a 的 3 个副本)。"""
-    a_sc = _M @ _A_PRIM
+def _supercell_frac(m=_M):
+    """超胞 6 个原子的分数坐标(原胞原子 x 沿 a 的 3 个副本)。
+
+    m = 单位阵时就是原胞自己(2 个原子, 无副本) —— 用于 det(M)=1 的直通模式。
+    """
+    n_copies = int(round(abs(np.linalg.det(np.asarray(m, dtype=float)))))
+    a_sc = np.asarray(m, dtype=float) @ _A_PRIM
     out = []
     for p in _PRIM_FRAC @ _A_PRIM:
-        for j in range(3):
+        for j in range(n_copies):
             out.append((p + j * _A_PRIM[0]) @ np.linalg.inv(a_sc))
     return np.array(out)
 
 
 def _write_mini_system(directory, occupations=None, band_energies=None,
-                       k_points=None, occ_per_k=None, dos_ef=None):
+                       k_points=None, occ_per_k=None, dos_ef=None, m=None):
     """写出一个自洽的迷你 VASP 计算目录。
 
     occupations: 4 个带的占据数(默认 1,1,0,0 -> 半导体);
@@ -95,8 +100,13 @@ def _write_mini_system(directory, occupations=None, band_energies=None,
         **多 k 点**才能测出"某带的占据在 k 上跨过阈值"(费米穿越)。
     occ_per_k: 每个 k 点一组占据数(给了 k_points 时必须给)。
     dos_ef: DOSCAR 里的 E_F(默认 _DOS_EF)。
+    m: 超胞变换矩阵(默认 _M = diag(3,1,1))。给**单位阵**时"超胞"就是原胞
+        —— det(M)=1, 用于原胞直通模式。
     """
     os.makedirs(directory, exist_ok=True)
+    m = _M if m is None else np.asarray(m, dtype=int)
+    n_copies = int(round(abs(np.linalg.det(m.astype(float)))))
+    n_ions = len(_PRIM_FRAC) * n_copies
     occ = occupations if occupations is not None else (1.0, 1.0, 0.0, 0.0)
     energies = band_energies if band_energies is not None else _BAND_ENERGIES
     kpts = [(0.0, 0.0, 0.0)] if k_points is None \
@@ -111,22 +121,21 @@ def _write_mini_system(directory, occupations=None, band_energies=None,
     assert len(energies_per_k) == len(kpts)
     energies = energies_per_k[0]
     ef = _DOS_EF if dos_ef is None else float(dos_ef)
-    a_sc = _M @ _A_PRIM
+    a_sc = m @ _A_PRIM
     _write_poscar(os.path.join(directory, "POSCAR"), "synthetic supercell",
-                  a_sc, _supercell_frac(), ["Si"], [6])
+                  a_sc, _supercell_frac(m), ["Si"], [n_ions])
     _write_poscar(os.path.join(directory, "PRIMCELL.vasp"),
                   "synthetic primitive", _A_PRIM, _PRIM_FRAC, ["Si"], [2])
     with open(os.path.join(directory, "TRANSMAT.in"), "w",
               encoding="utf-8") as fh:
         fh.write("Read transformation matrix from the TRANSMAT.in file "
                  "if it exists.\n")
-        fh.write("  3  0  0   # must be three integers\n")
-        fh.write("  0  1  0   # must be three integers\n")
-        fh.write("  0  0  1   # must be three integers\n")
+        for row in m:
+            fh.write("  %d  %d  %d   # must be three integers\n" % tuple(row))
 
     with open(os.path.join(directory, "EIGENVAL"), "w",
               encoding="utf-8") as fh:
-        fh.write("   6   6    1    1\n")
+        fh.write("   %d   %d    1    1\n" % (n_ions, n_ions))
         fh.write("  1.000000000000000E+02  0.000000000000000E+00"
                  "  0.000000000000000E+00  0.100000000000000E-08"
                  "  0.500000000000000E-15\n")
@@ -143,7 +152,7 @@ def _write_mini_system(directory, occupations=None, band_energies=None,
             fh.write("\n")
 
     with open(os.path.join(directory, "DOSCAR"), "w", encoding="utf-8") as fh:
-        fh.write("   6   6   1   0\n")
+        fh.write("   %d   %d   1   0\n" % (n_ions, n_ions))
         fh.write("  1.000000000000000E+02  0.000000000000000E+00"
                  "  0.000000000000000E+00  0.100000000000000E-08"
                  "  0.500000000000000E-15\n")
@@ -155,16 +164,17 @@ def _write_mini_system(directory, occupations=None, band_energies=None,
             fh.write("  %14.6f 0.0000E+00 0.0000E+00\n"
                      % (-10.0 + i * 20.0 / 300.0))
 
-    coeffs = np.zeros((len(energies), 6, 1), dtype=complex)
+    coeffs = np.zeros((len(energies), n_ions, 1), dtype=complex)
     for b, theta in enumerate(_THETA[:len(energies)]):
         at = np.array([1.0 + 0j, np.exp(1j * theta)])
-        for i in range(2):
-            for j in range(3):
-                coeffs[b, i * 3 + j, 0] = at[i] * _U[j]
+        for i in range(len(_PRIM_FRAC)):
+            for j in range(n_copies):
+                coeffs[b, i * n_copies + j, 0] = at[i] * _U[j]
     with open(os.path.join(directory, "PROCAR"), "w", encoding="utf-8") as fh:
         fh.write("PROCAR lm decomposed + phase\n")
         fh.write("# of k-points: %3d         # of bands:  %d"
-                 "         # of ions:    6\n" % (len(kpts), len(energies)))
+                 "         # of ions: %4d\n"
+                 % (len(kpts), len(energies), n_ions))
         fh.write("\n")
         for ik, kfrac in enumerate(kpts):
             fh.write(" k-point %5d :    %.8f %.8f %.8f"
@@ -177,13 +187,13 @@ def _write_mini_system(directory, occupations=None, band_energies=None,
                 fh.write("\n")
                 fh.write("ion      s     tot\n")
                 tot = 0.0
-                for i in range(6):
+                for i in range(n_ions):
                     m2 = abs(coeffs[b, i, 0]) ** 2
                     tot += m2
                     fh.write("  %3d  %12.8f  %12.8f\n" % (i + 1, m2, m2))
                 fh.write("tot   %12.8f  %12.8f\n" % (tot, tot))
                 fh.write("ion      s\n")
-                for i in range(6):
+                for i in range(n_ions):
                     c = coeffs[b, i, 0]
                     fh.write("  %3d %14.8f %14.8f %14.8f\n"
                              % (i + 1, c.real, c.imag, abs(c) ** 2))
@@ -344,8 +354,10 @@ def test_gen_grid_map_round_trips(tmp_path):
     src = _write_mini_system(str(tmp_path / "src"))
     cli.main(_gen_args(src, out, "--resolution", "1.6"))
     gm = load_grid_map(str(out / "grid_map.npz"))
-    assert gm.spec.p == (3, 3, 3)
-    assert gm.n_k == 9
+    # M = diag(3,1,1) ⇒ 逐维约束: 只有第 1 维必须是 3 的倍数, 第 2/3 维
+    # (没被放大)不受约束(旧的全局 LCM 会把它们也强制成 3 的倍数)。
+    assert gm.spec.p == (3, 1, 1)
+    assert gm.n_k == 1
     assert gm.n_ir >= 1
     assert int(gm.k_weight.sum()) == gm.spec.n_points
     # 再存一次再读回来, 数组逐位相同
@@ -507,6 +519,121 @@ def test_unfold_prints_fermi_energy(mini_run, capsys):
     out = capsys.readouterr().out
     assert "E_F" in out
     assert "-5.950000 eV" in out
+
+
+# ------------------------------------------------------------------ det(M)=1 直通模式
+
+def _primitive_run(directory):
+    """det(M)=1 的迷你计算目录: "超胞"就是原胞, 3 个 k 点(3x1x1 网格)。"""
+    _write_mini_system(directory, m=np.eye(3, dtype=int),
+                       k_points=[(0.0, 0.0, 0.0),
+                                 (1.0 / 3.0, 0.0, 0.0),
+                                 (2.0 / 3.0, 0.0, 0.0)])
+    _write_grid_map(directory)
+    return directory
+
+
+def test_unfold_works_for_a_primitive_cell_run(tmp_path):
+    """det(M)=1(原胞当超胞)时 unfold 必须**照常工作**, 4 个费米面文件齐全。
+
+    原来这里抛"4 种相位约定没有区分度"—— 用户要的正是原胞的费米面。
+    """
+    run = _primitive_run(str(tmp_path / "run"))
+    fs = tmp_path / "fs"
+    rc = cli.main(["unfold", "--dir", run, "--outdir", str(fs)])
+    assert rc == 0
+    for name in ("FS.cube", "FS.bxsf", "A(k,E).npz", "band.1"):
+        assert (fs / name).is_file(), name
+    cube = read_cube(str(fs / "FS.cube"))
+    assert cube["field"].size == 3          # 3 个网格点
+    npz = np.load(str(fs / "A(k,E).npz"))
+    assert npz["A"].shape == (3, 401)
+
+
+def test_unfold_reports_the_primitive_direct_mode(tmp_path, capsys):
+    """直通模式必须在输出里说清"没有展开、权重是轨道投影"。"""
+    run = _primitive_run(str(tmp_path / "run"))
+    rc = cli.main(["unfold", "--dir", run, "--outdir", str(tmp_path / "fs")])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "原胞直通" in out
+    assert "det(M)=1" in out
+    # 直通模式没有相位约定可择优 ⇒ 不能打印一个假的"主导度 1.0000"
+    assert "单 G 主导度" not in out
+
+
+def test_primitive_direct_weights_match_the_orbital_projection_sums(tmp_path):
+    """端到端核对: 直通模式的权重 = Σ_{ion,lm}|c|²(逐带逐 k)。
+
+    参照物是 PROCAR **自己报的** |c|²(复投影块最后一列)—— 两条独立的
+    路径(复系数求模方 vs VASP 直接打印)必须一致到打印精度。
+    """
+    run = _primitive_run(str(tmp_path / "run"))
+    fs = tmp_path / "fs"
+    assert cli.main(["unfold", "--dir", run, "--outdir", str(fs)]) == 0
+
+    procar = read_procar(os.path.join(run, "PROCAR"))
+    band = read_eigenval(os.path.join(run, "EIGENVAL"))
+    # 从 PROCAR 文本里独立地把"每个离子那一行的最后一列"(= |c|² 总和)读出来
+    printed = _procar_reported_c2(os.path.join(run, "PROCAR"))
+    expect = printed.sum(axis=2)                       # (n_k, n_band) Σ_ion |c|²
+    order = np.argsort(band.energies, axis=1, kind="stable")
+    expect = np.take_along_axis(expect, order, axis=1)
+
+    # 权重本身: 用 unfold 的内部接口再算一遍(与 npz 无关的独立核对)
+    weights = _primitive_direct_weights(run)
+    # PROCAR 只印 3 位小数 ⇒ 两条路径只能一致到打印精度(实测 ~1e-3)
+    assert np.allclose(weights, expect, rtol=5e-3, atol=1e-12)
+    # 而工具的权重与"从复系数现算的 Σ|c|²"是**精确**一致的
+    exact = np.sum(np.abs(procar.coeffs) ** 2, axis=(2, 3))
+    exact = np.take_along_axis(exact, order, axis=1)
+    assert np.allclose(weights, exact, rtol=1e-12, atol=0.0)
+
+
+def _procar_reported_c2(path):
+    """独立解析 PROCAR: 复投影块每一行**最后一列**(= VASP 报的 |c|²)。
+
+    只用文本解析, 不碰 unfoldfs.vaspio —— 目的是给工具的权重算一条
+    **独立**的参照路径。返回 (n_k, n_band, n_ions)。
+    """
+    lines = pathlib.Path(path).read_text(encoding="utf-8").splitlines()
+    head = lines[1]
+    n_k = int(head.split("# of k-points:")[1].split()[0])
+    n_band = int(head.split("# of bands:")[1].split()[0])
+    n_ions = int(head.split("# of ions:")[1].split()[0])
+    n_cplx = 4                       # 1 个轨道 -> (Re, Im) + |c|²
+    out = []
+    for line in lines:
+        s = line.strip()
+        if not s or not s[0].isdigit():
+            continue
+        parts = s.split()
+        if len(parts) != n_cplx:
+            continue
+        out.append(float(parts[-1]))
+    arr = np.array(out)
+    assert arr.size == n_k * n_band * n_ions, (arr.size, n_k, n_band, n_ions)
+    return arr.reshape(n_k, n_band, n_ions)
+
+
+def _primitive_direct_weights(run_dir):
+    """用工具自己的 unfold 路径再算一遍直通模式的权重(逐带逐 k)。"""
+    from unfoldfs.geometry import (read_poscar, read_transmat, reciprocal,
+                                   resolve_transform)
+    from unfoldfs.unfold import build_atom_copies, unfold_supercell
+    prim = read_poscar(os.path.join(run_dir, "PRIMCELL.vasp"))
+    sc = read_poscar(os.path.join(run_dir, "POSCAR"))
+    tr = resolve_transform(sc, prim,
+                           read_transmat(os.path.join(run_dir, "TRANSMAT.in")))
+    copies = build_atom_copies(prim, sc, tr)
+    band = read_eigenval(os.path.join(run_dir, "EIGENVAL"))
+    procar = read_procar(os.path.join(run_dir, "PROCAR"))
+    gm = load_grid_map(os.path.join(run_dir, "grid_map.npz"))
+    res = unfold_supercell(band, procar, tr, copies, tr.m_eff, prim.lattice,
+                            prim.positions @ prim.lattice,
+                            reciprocal(prim.lattice), reciprocal(sc.lattice),
+                            gm.k_super)
+    return res.weights[:, 0, :]
 
 
 def test_unfold_warns_when_the_highest_band_is_occupied(tmp_path, capsys):
