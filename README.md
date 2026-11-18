@@ -200,6 +200,11 @@ unfoldfs band --dir run/ --outdir bandfs/ [--ef auto|vbm|doscar|数值]
               [--no-symmetrize]
 ```
 
+> ⚠ 阶段 1 写出的 `KPOINTS` 里**没有重复 k 点**（按周期距离去重，表头计数 =
+> 实际行数）—— **VASP 6.6.0 读到含重复 k 点的显式列表会崩**（实测）。路径的
+> 相邻段共享端点、且不同的原胞 k 可能折到同一个超胞 k ⇒ 去重后的 k 点数
+> **少于**路径点数；两者都打在 stdout 里（"路径点总数" / "KPOINTS k 点"）。
+
 | 参数 | 阶段 | 默认 | 说明 |
 |---|---|---|---|
 | `--supercell` / `--primcell` / `--transmat` | 1 | — | 结构文件（阶段 2 默认从 `--dir` 里找） |
@@ -222,12 +227,18 @@ unfoldfs band --dir run/ --outdir bandfs/ [--ef auto|vbm|doscar|数值]
 | `WEIGHT.grd` | (n_band, n_k) 权重 |
 | `KLABELS` | 高对称点的标签 + 距离（**与 vaspkit 逐字节同格式**） |
 | `unfolded_band.dat` | 长表：路径距离 / E(eV) / 权重 / 带号（自用） |
-| `unfolded_band.png` | 加权能带图（自用，需 matplotlib） |
+| `unfolded_band.png` | 加权能带图（x 轴 = `k-path (2π/Å)`；图上标 E_F 的数值；图注给 `E_plot` 窗口）（自用，需 matplotlib） |
 
 前四个**就是 vaspkit 的文件名与布局** ⇒ 用户组现有的 MATLAB 脚本
 （`unfold_band_plot_mirror.m`）**不改一行**直接能画我们的数据。
 格式规范见 [`docs/formats.md`](docs/formats.md) §13。
 
+> ⚠ **路径点 ≠ 计算的 k 点**（修复轮 7）：上面四个文件里的**列**是**原始路径点**
+> （含重复端点），而阶段 1 写出的 `KPOINTS` 的**行**是**去重后**的待算超胞 k
+> —— 两个数一般不相等。**VASP 6.6.0 读到含重复 k 点的显式列表会崩**
+> （服务器实测：每次都在第一个 k 点算完后死掉）⇒ 写 KPOINTS 时按周期距离去重，
+> 表头计数 = 实际行数。见 [`docs/algorithms.md`](docs/algorithms.md) §16.1.1。
+>
 > ⚠ **`WEIGHT.grd` 的权重与 vaspkit 282 的不是同一件事**：本工具给的是 **Popescu
 > 投影法的 G 分辨权重**，vaspkit 282 给的是 **WAVECAR 平面波展开得到的原胞带
 > |c(k)|²**。两者都叫"权重"但物理含义不同、数值不可比（我们的不归一）。
@@ -398,7 +409,7 @@ E_F           : -2.026108 eV  (--ef auto, --delta 0.05)
 | `WEIGHT.grd` | 同上 | (n_band, n_k) 权重（**Popescu G 分辨权重，不归一**） |
 | `KLABELS` | 同上 | 高对称点的标签 + 距离（**与 vaspkit 逐字节同格式**） |
 | `unfolded_band.dat` | 自用 / 二次分析 | 长表：路径距离 / E(eV) / 权重 / 带号 |
-| `unfolded_band.png` | 自用 | 加权能带图（需 matplotlib） |
+| `unfolded_band.png` | 自用 | 加权能带图（x 轴 = `k-path (2π/Å)`；标 E_F 数值；图注给 `E_plot` 窗口）（需 matplotlib） |
 
 前四个与 vaspkit **同名同布局** ⇒ 那个 MATLAB 脚本不改一行就能画。
 逐字段规范见 [`docs/formats.md`](docs/formats.md) §13。
@@ -554,10 +565,13 @@ VASPKIT 的能带反折叠与费米面两个模块**没有交点**：
 
 9. ⚠ **相位约定的选择对采样敏感**：真实路径（1T-TaS₂，60 个路径点）上，
    4 种约定的主导度只差 **0.1 %～0.3 %**，可换成另一条约定会让 **66 % 的
-   (k,带) 换候选归属**（总权重差 56 %）。`unfoldfs band` 与 `unfold` 在同一组
-   超胞 k 上选出的是**同一个** `(s1, s2)` ✓，但"全路径采样"会选出另一个 ⇒
-   看到 stderr 里的"落在退化区"告警时，请把结果当**不可复现**处理。
-   → [`docs/algorithms.md`](docs/algorithms.md) §15.6。
+   (k,带) 换候选归属**（总权重差 56 %）。**修复轮 7**: `unfoldfs band` 与
+   `unfold` 现在用**同一条**采样口径（k 列表的前 min(4, n_k) 个点）⇒ 同一组
+   超胞 k 上必然给出**同一个** `(s1, s2)` ✓（旧的"全路径采样"机制已删除）。
+   ⚠ 代价：路径的前 4 个点挨在一起 ⇒ 择优**更容易**落在退化区（真实数据实测
+   相对差 9.54e-04 < 1e-3 ⇒ 告警照旧可见）⇒ 看到 stderr 里的"落在退化区"
+   告警时，请把结果当**不可复现**处理。
+   → [`docs/algorithms.md`](docs/algorithms.md) §15.6 / §16.4。
 
 10. ⚠ **展开能带（`unfoldfs band`）同样受上面的协变性缺陷影响**：**能带能量可信**
    （对称相关点吻合到 8e-6 eV），**权重的 k 依赖原本不可信** ⇒ 能带的"形状/对称性"
@@ -566,6 +580,19 @@ VASPKIT 的能带反折叠与费米面两个模块**没有交点**：
    另有一条**格式层面的**区别：`WEIGHT.grd` 里的权重是
    **Popescu G 分辨权重**，不是 vaspkit 282 的 WAVECAR 平面波展开 |c(k)|²
    ⇒ 两者的数值不可比（见 §2.3 与 `docs/formats.md` §13.5）。
+
+11. ⚠ ★ **对称化修好了"对称性"，但没修好"绝对谱形状"**（修复轮 7 的实测）：
+   1T-TaS₂ 的 3×1×1 超胞、完整点群对称化之后 —— 协变性偏差
+   **1.000e+00 → 0.000e+00**、`A(k,E_F)` 的轨道离散度
+   **1.000e+00 → 0.000e+00**（**对称性已恢复** ✓），但与原胞直接计算的
+   Pearson 相关只有 **0.313 → 0.720**（**绝对谱形状仍不同** ✗）。
+   ⇒ **面内整数倍超胞（3×1×1）的绝对形状不能当定量费米面用**；要做**定量**的
+   费米面，请用 **√3×√3 R30°** 之类的**保持完整点群**的超胞，或**直接算原胞**。
+   → [`docs/algorithms.md`](docs/algorithms.md) §14 第 11 条。
+
+12. ⚠ **VASP 6.6.0 读到含重复 k 点的显式列表会崩**（修复轮 7 的实测）：本工具
+   写出的 KPOINTS 已按周期距离去重（表头计数 = 实际行数）；但**用户自己拼的
+   KPOINTS 不受此保护** —— 手工写重复 k 点仍会让 VASP 崩。
 
 完整的限制清单与全部实测数字 → [`docs/algorithms.md`](docs/algorithms.md) §14。
 

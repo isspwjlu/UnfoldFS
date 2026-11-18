@@ -30,9 +30,9 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 
-from .band import (assemble_band, path_distances, path_labels,
+from .band import (assemble_band, dedup_k_points, path_distances, path_labels,
                    path_to_super_k, plot_band, read_klabels, read_kpath,
-                   reorder_unfolded, spread_order, symmetrize_band_weights,
+                   symmetrize_band_weights,
                    write_band_dat, write_grd, write_klabels,
                    write_kpoints_explicit)
 from .expand import (build_spectral_function, expand_to_full_grid,
@@ -674,10 +674,16 @@ def cmd_band_prepare(args: argparse.Namespace) -> int:
     labels = path_labels(path, dist)
     # K = k'·Mᵀ (mod 1): 路径点用的是**原胞**分数坐标, VASP 算的是**超胞** k
     k_super = path_to_super_k(path.k_prim, tr.m_eff)
+    # ★ 写进 KPOINTS 的 k 点必须**去重**(修复轮 7 / B1): 路径的相邻段共享
+    # 端点, 且不同的原胞 k 可能折到同一个超胞 k ⇒ VASP 6.6.0 读到含重复 k 点
+    # 的显式列表会崩(服务器实测: 每次都在第一个 k 点算完后死掉)。表头计数
+    # 必须等于实际写出的行数。
+    k_unique, _index_map = dedup_k_points(k_super)
 
     outdir = args.outdir or "run"
     os.makedirs(outdir, exist_ok=True)
     kpoints_path = os.path.join(outdir, "KPOINTS")
+    # 传**原始**列表: 去重由写文件的那一步统一做(单一出处)
     write_kpoints_explicit(kpoints_path, k_super)
 
     nelect, n_bands_prim, unknown = _valence_estimate(prim.species)
@@ -687,9 +693,10 @@ def cmd_band_prepare(args: argparse.Namespace) -> int:
     incar_path = os.path.join(outdir, "INCAR.suggested")
     with open(incar_path, "w", newline="\n", encoding="utf-8") as fh:
         fh.write(_incar_suggested(
-            _IncarContext(n_k=int(k_super.shape[0]), det=tr.det,
-                          desc=f"能带路径: {path.n_k} 个路径点"
-                               "(原胞分数坐标 -> 超胞分数坐标)",
+            _IncarContext(n_k=int(k_unique.shape[0]), det=tr.det,
+                          desc=f"能带路径: {path.n_k} 个路径点 -> "
+                               f"{k_unique.shape[0]} 个待算的超胞 k"
+                               "(原胞分数坐标 -> 超胞分数坐标, 重复端点只算一次)",
                           n_occ_est=n_occ_est),
             n_bands, args.encut, args.kpar, unknown))
 
@@ -709,6 +716,8 @@ def cmd_band_prepare(args: argparse.Namespace) -> int:
     print(f"路径段数      : {len(path.segments)}(每段 {path.n_points_per_segment} "
           f"个采样点, 含两端)")
     print(f"路径点总数    : {path.n_k}")
+    print(f"KPOINTS k 点  : {k_unique.shape[0]}(去重后 —— 重复端点与折到同一"
+          "超胞 k 的点只算一次)")
     print(f"高对称点      : {', '.join(lab for lab, _ in labels)}")
     print(f"路径总长度    : {float(dist[-1]):.6f} (2π/Å)")
     print(f"超胞变换      : det(M) = {tr.det}")
@@ -772,18 +781,22 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
     if os.path.exists(klabels_in):
         _check_klabels_consistent(klabels_in, labels)
     k_super = path_to_super_k(path.k_prim, tr.m_eff)
+    # ★ 计算的 k 点与**路径点**不是一回事(修复轮 7 / B1): 路径的相邻段共享
+    # 端点, 且不同的原胞 k 可能折到同一个超胞 k ⇒ VASP 算的是**去重后**的
+    # k 列表(与阶段 1 写进 KPOINTS 的完全一致), 路径点则保持原样(KLABELS /
+    # unfolded_band.dat 仍是原始路径点数)。index_map 把路径点映射回已计算的 k。
+    k_unique, index_map = dedup_k_points(k_super)
 
-    # 相位约定择优只采样 k 列表的前 4 个点(见 unfold.CONVENTION_SAMPLE_N_K)。
-    # 路径上前 4 个点挨得太近 ⇒ 4 种约定给不出区分(择优落在退化区) ⇒
-    # 这里把路径点重排, 让采样的 4 个点分布在路径的不同位置, 算完再还原
-    # 顺序(输出的列序仍与路径一致)。
-    order = spread_order(int(k_super.shape[0]))
+    # 相位约定择优用**原型口径**: k 列表的**前 min(4, n_k) 个点** × 前
+    # min(n_band, 40) 条带(见 unfold.CONVENTION_SAMPLE_N_K)。**与 `unfold`
+    # 完全同一条规则** —— 修复轮 7 / B4: `band` 曾经把路径点摊开再采样,
+    # 于是两个子命令在同一组超胞 k 上选出了不同的 (s1, s2)
+    # (实测 band=(-1,+1) vs unfold=(+1,-1))⇒ 结果不可复现。
     unfolded = unfold_supercell(
         band_data, procar, tr, copies, tr.m_eff, prim.lattice,
-        prim.positions @ prim.lattice, b_prim, b_super, k_super[order],
+        prim.positions @ prim.lattice, b_prim, b_super, k_unique,
         strict_dominance=args.strict_dominance)
-    unfolded = reorder_unfolded(unfolded, order)
-    energy, weight = assemble_band(unfolded, path.k_prim)
+    energy, weight = assemble_band(unfolded, path.k_prim, index_map=index_map)
     # ★ 点群轨道对称化(默认开): 路径上**对称相关**的两点会给出不同的展开谱
     # 权重(docs/algorithms.md §15)⇒ 同一段路径的两半颜色不同。带能量不动。
     #

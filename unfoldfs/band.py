@@ -51,7 +51,8 @@ __all__ = [
     "path_to_super_k", "write_kpoints_explicit", "write_grd", "write_klabels",
     "write_band_dat", "select_zero_candidate", "assemble_band", "mirror_path",
     "plot_band", "read_klabels", "KLABELS_HEADER", "KLABELS_TIP",
-    "GRD_FIELD_WIDTH", "CANDIDATE_TOL", "spread_order", "reorder_unfolded",
+    "GRD_FIELD_WIDTH", "CANDIDATE_TOL", "KPOINT_DEDUP_TOL", "dedup_k_points",
+    "K_PATH_AXIS_LABEL", "plot_caption",
     "symmetrize_band_weights",
 ]
 
@@ -67,6 +68,12 @@ KLABELS_TIP = ("* Tip: Please label each high symmetry point in KPOINTS "
 
 # 候选匹配容差(分数坐标下的周期距离)
 CANDIDATE_TOL = 1e-6
+
+# KPOINTS 去重容差(分数坐标下的周期距离)
+KPOINT_DEDUP_TOL = 1e-6
+
+# PNG 的 x 轴标签: 路径距离的单位是 **2π/Å**(与 MOMENTUM.grd / KLABELS 一致)
+K_PATH_AXIS_LABEL = "k-path (2π/Å)"
 
 
 # ------------------------------------------------------------------ 路径
@@ -205,6 +212,42 @@ def path_to_super_k(k_prim: np.ndarray, m_eff: np.ndarray) -> np.ndarray:
 
 # ------------------------------------------------------------------ 写出
 
+def dedup_k_points(k_super: np.ndarray, tol: float = KPOINT_DEDUP_TOL
+                   ) -> Tuple[np.ndarray, np.ndarray]:
+    """按**周期距离**去重超胞 k 点 -> (去重后的 k, 每个输入点对应的行号)。
+
+    **为什么必须去重**: VASP 6.6.0 读到含**重复 k 点**的显式列表会崩
+    (服务器实测 2026-11-18: 控制器连续四次用 `unfoldfs band` 生成的 KPOINTS
+    跑 VASP, 每次都在第一个 k 点算完后死掉 —— OUTCAR 停在
+    "writing wavefunctions", EIGENVAL 里只有 1 个 k 点; 手工去重并把表头
+    计数改成 33 之后, 同一次计算 194 s 跑完全部 33 个 k 点 ✓)。
+
+    重复的来源有**两个**:
+      1. 路径的**相邻段共享端点**(M 既是第 1 段的终点又是第 2 段的起点);
+      2. **折叠**到超胞后重合(不同的原胞 k 折到同一个超胞 k —— 这不是重复
+         计算, 而是同一个超胞 k 只算一次, 展开时再各自取自己的候选)。
+
+    判定用**周期距离**(分数坐标, 容差 1e-6)⇒ 0.9999999999 与 0.0 是同一个点。
+    行序 = **首次出现顺序** ⇒ 路径的前几个点仍是前几个点(相位约定择优的
+    采样口径依赖这一点)。
+    """
+    k = np.atleast_2d(np.asarray(k_super, dtype=float))
+    keep: List[np.ndarray] = []
+    index = np.empty(k.shape[0], dtype=int)
+    for i in range(k.shape[0]):
+        if keep:
+            d = periodic_distance(k[i][None, :], np.array(keep))[0]
+            j = int(np.argmin(d))
+            if float(d[j]) <= tol:
+                index[i] = j
+                continue
+        index[i] = len(keep)
+        keep.append(k[i])
+    unique = (np.array(keep, dtype=float) if keep
+              else np.zeros((0, 3), dtype=float))
+    return unique, index
+
+
 def write_kpoints_explicit(path: str, k_super: np.ndarray) -> None:
     """写"显式 k 点列表"格式的 KPOINTS。
 
@@ -213,8 +256,12 @@ def write_kpoints_explicit(path: str, k_super: np.ndarray) -> None:
     该首行格式的事实来源是 ``grid.write_kpoints(..., explicit=True)``;
     这里照抄它的布局(注释首行 + 点数 + "Reciprocal lattice" + 每行
     ``kx ky kz weight``), 不另起炉灶。
+
+    ⚠ **写出的 k 点按周期距离去重**(见 ``dedup_k_points``): VASP 6.6.0 读到
+    含重复 k 点的显式列表会崩(服务器实测)。表头的 k 点计数 = **实际写出的
+    行数**(去重后的数量)✓。
     """
-    k = np.atleast_2d(np.asarray(k_super, dtype=float))
+    k, _index = dedup_k_points(k_super)
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write(f"unfoldfs: explicit k-point list (do not edit) -- "
                  f"band path, {k.shape[0]} points\n")
@@ -309,7 +356,8 @@ def select_zero_candidate(k_cand: np.ndarray, k_prim_point: np.ndarray,
     return j
 
 
-def assemble_band(unfolded, k_prim: np.ndarray, tol: float = CANDIDATE_TOL
+def assemble_band(unfolded, k_prim: np.ndarray, tol: float = CANDIDATE_TOL,
+                  *, index_map: Optional[np.ndarray] = None
                   ) -> Tuple[np.ndarray, np.ndarray]:
     """把展开结果组装成 (n_band, n_k) 的能带与权重矩阵。
 
@@ -317,24 +365,39 @@ def assemble_band(unfolded, k_prim: np.ndarray, tol: float = CANDIDATE_TOL
     候选内的带按能量升序。**各路径点的带数可能不同**(展开把态摊到不同候选上),
     故取全路径的最大值作为行数, 不足的行用"该 k 的最高带能量 + 权重 0"补位 ——
     权重 0 ⇒ 在加权图里不显色。
+
+    ``index_map``: 路径点 -> 展开结果的行号(``dedup_k_points`` 给出的映射)。
+    **路径点可以比计算的 k 点多**: 路径的相邻段共享端点(同一个 k 算一次),
+    且不同的原胞 k 可能折到同一个超胞 k ⇒ 多个路径点映射到**同一个**已计算的
+    k, 各自再取自己的候选(同一个超胞 k 的不同 G)。缺省时是恒等映射(每个
+    路径点对应展开结果的一行)。
     """
     k_prim = np.atleast_2d(np.asarray(k_prim, dtype=float))
-    n_k = k_prim.shape[0]
-    if unfolded.k_cand.shape[0] != n_k:
+    n_path = k_prim.shape[0]
+    if index_map is None:
+        index_map = np.arange(n_path)
+    index_map = np.asarray(index_map, dtype=int)
+    if index_map.shape != (n_path,):
         raise ValueError(
-            f"展开结果的 k 点数 {unfolded.k_cand.shape[0]} != 路径点数 {n_k}")
+            f"index_map 的长度 {index_map.shape[0]} != 路径点数 {n_path}")
+    n_calc = int(unfolded.k_cand.shape[0])
+    n_used = int(index_map.max()) + 1 if n_path else 0
+    if n_calc != n_used:
+        raise ValueError(
+            f"展开结果的 k 点数 {n_calc} != 路径点映射到的计算 k 点数 {n_used}")
     per_k: List[Tuple[np.ndarray, np.ndarray]] = []
-    for i in range(n_k):
-        j = select_zero_candidate(unfolded.k_cand[i], k_prim[i], tol)
-        valid = unfolded.valid[i, j]
-        e = np.asarray(unfolded.energies[i, j], dtype=float)[valid]
-        w = np.asarray(unfolded.weights[i, j], dtype=float)[valid]
+    for i in range(n_path):
+        row = int(index_map[i])
+        j = select_zero_candidate(unfolded.k_cand[row], k_prim[i], tol)
+        valid = unfolded.valid[row, j]
+        e = np.asarray(unfolded.energies[row, j], dtype=float)[valid]
+        w = np.asarray(unfolded.weights[row, j], dtype=float)[valid]
         per_k.append((e, w))
     n_band = max((e.size for e, _ in per_k), default=0)
     if n_band == 0:
         raise ValueError("所有路径点的候选里都没有有效的带 —— 展开结果为空")
-    energies = np.zeros((n_band, n_k))
-    weights = np.zeros((n_band, n_k))
+    energies = np.zeros((n_band, n_path))
+    weights = np.zeros((n_band, n_path))
     for i, (e, w) in enumerate(per_k):
         m = int(e.size)
         energies[:m, i] = e
@@ -435,47 +498,6 @@ def symmetrize_band_weights(energies: np.ndarray, weights: np.ndarray,
     return out
 
 
-def spread_order(n: int, n_sample: int = 4) -> np.ndarray:
-    """给 n 个路径点排一个序, 让**前 n_sample 个尽量分散**。
-
-    ``unfold_supercell`` 的相位约定择优只采样"列表里的前 4 个 k 点"
-    (``unfold.CONVENTION_SAMPLE_N_K``)。对**网格**来说那 4 个点本来就在
-    BZ 的不同角落; 但对**路径**来说前 4 个点是路径上挨在一起的 4 个点 ——
-    相位几乎不变, 4 种约定给出的主导度几乎相同 ⇒ 择优落在退化区
-    (实测告警: 相对差 9.09e-05 < 1e-03, "由噪声主导, 结果不可复现")。
-
-    ⇒ 这里把路径点重排一下, 让前 4 个点分布在路径的不同位置上, 择优才有
-    区分度。**结果按原路径顺序还原**(见 ``reorder_unfolded``), 所以输出的
-    列序仍然与路径一致。
-    """
-    n = int(n)
-    if n <= n_sample:
-        return np.arange(n)
-    picks = [int(round(i * (n - 1) / (n_sample - 1))) for i in range(n_sample)]
-    seen = set()
-    head = []
-    for p in picks:
-        if p not in seen:
-            seen.add(p)
-            head.append(p)
-    tail = [i for i in range(n) if i not in seen]
-    return np.array(head + tail, dtype=int)
-
-
-def reorder_unfolded(unfolded, order: np.ndarray):
-    """把 ``unfolded`` 的 k 维按 ``order`` 还原成路径顺序。"""
-    import dataclasses
-    order = np.asarray(order, dtype=int)
-    inv = np.argsort(order)
-    return dataclasses.replace(
-        unfolded,
-        k_cand=unfolded.k_cand[inv],
-        energies=unfolded.energies[inv],
-        weights=unfolded.weights[inv],
-        valid=(None if unfolded.valid is None else unfolded.valid[inv]),
-    )
-
-
 def mirror_path(distances: np.ndarray, energies: np.ndarray, weights: np.ndarray
                 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """镜像路径: 路径反过来走, 距离取负(与 MATLAB 脚本的 IsPlotMirror 一致)。"""
@@ -505,10 +527,40 @@ def plot_band(distances: np.ndarray, energies: np.ndarray, weights: np.ndarray,
               e_max: Optional[float] = None, mirror: bool = False) -> str:
     """画 E-vs-路径距离 的加权能带图, 存成 PNG。
 
+    画图本身在 ``_band_figure``, 图注在 ``plot_caption``。
+    """
+    _require_matplotlib()
+    import matplotlib.pyplot as plt
+    fig, _ax = _band_figure(distances, energies, weights, labels, e_f,
+                             e_min=e_min, e_max=e_max, mirror=mirror)
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+    return out_path
+
+
+def plot_caption(e_f: float, e_lo: float, e_hi: float) -> str:
+    """图注: 费米能与**画出来的**能量窗口(eV)。
+
+    ``e_lo`` / ``e_hi`` = 画布上的 y 轴范围(= ``--e-min`` / ``--e-max``,
+    没给时是数据的极值)⇒ 读者不用猜图上到底画了哪一段能量。
+    """
+    return (f"E_F = {float(e_f):.6f} eV; "
+            f"E_plot = [{float(e_lo):.3f}, {float(e_hi):.3f}] eV")
+
+
+def _band_figure(distances: np.ndarray, energies: np.ndarray,
+                 weights: np.ndarray, labels: Sequence[Tuple[str, float]],
+                 e_f: float, e_min: Optional[float] = None,
+                 e_max: Optional[float] = None, mirror: bool = False):
+    """画 E-vs-路径距离 的加权能带图 -> (fig, ax)。
+
     * 按权重着色(jet, 与 MATLAB 脚本的 ``colormap('jet')`` 同风格)并用线宽
       体现权重;
-    * E_F 处画水平虚线;
+    * E_F 处画水平虚线, 并在图上标出 E_F 的**数值**(修复轮 7 / B3);
     * 高对称点处画竖线与标签;
+    * 图注写明**画出来的**能量窗口(E_plot_min / E_plot_max)(同上);
+    * x 轴的单位是 **2π/Å**(与 ``MOMENTUM.grd`` / ``KLABELS`` 一致;
+      修复轮 7 / B2 —— 旧实现写的是 "1/Angstrom", 与本工具其它输出矛盾);
     * ``mirror=True`` 时把镜像路径(距离取负、顺序反过来)也画上。
     """
     _require_matplotlib()
@@ -543,8 +595,19 @@ def plot_band(distances: np.ndarray, energies: np.ndarray, weights: np.ndarray,
         ax.add_collection(lc)
         lw = 0.4 + 1.8 * np.array(cols)
         lc.set_linewidth(lw)
+    lo = e_min if e_min is not None else float(np.min(energy))
+    hi = e_max if e_max is not None else float(np.max(energy))
+    ax.set_ylim(lo, hi)
+    # x 轴范围要覆盖镜像路径(距离取负)—— 否则镜像那一半会被裁掉
+    x_lo = min(float(np.min(d)) for d, _e, _w in groups)
+    x_hi = max(float(np.max(d)) for d, _e, _w in groups)
+    ax.set_xlim(x_lo, x_hi)
     if np.isfinite(e_f):
         ax.axhline(float(e_f), color="k", linestyle="--", linewidth=0.8, zorder=3)
+        if lo <= float(e_f) <= hi:
+            ax.text(0.995, float(e_f), f"E_F = {float(e_f):.6f} eV",
+                    transform=ax.get_yaxis_transform(), ha="right", va="bottom",
+                    fontsize=8, color="k", zorder=4)
     for label, d in labels:
         ax.axvline(float(d), color="0.6", linewidth=0.6, zorder=1)
         ax.text(float(d), 1.01, label, transform=ax.get_xaxis_transform(),
@@ -554,16 +617,9 @@ def plot_band(distances: np.ndarray, energies: np.ndarray, weights: np.ndarray,
             ax.axvline(-float(d), color="0.6", linewidth=0.6, zorder=1)
             ax.text(-float(d), 1.01, label, transform=ax.get_xaxis_transform(),
                     ha="center", va="bottom", fontsize=9)
-    lo = e_min if e_min is not None else float(np.min(energy))
-    hi = e_max if e_max is not None else float(np.max(energy))
-    ax.set_ylim(lo, hi)
-    # x 轴范围要覆盖镜像路径(距离取负)—— 否则镜像那一半会被裁掉
-    x_lo = min(float(np.min(d)) for d, _e, _w in groups)
-    x_hi = max(float(np.max(d)) for d, _e, _w in groups)
-    ax.set_xlim(x_lo, x_hi)
-    ax.set_xlabel("k-path (1/Angstrom)")
+    ax.set_xlabel(K_PATH_AXIS_LABEL)
     ax.set_ylabel("Energy (eV)")
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=300)
-    plt.close(fig)
-    return out_path
+    fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
+    fig.text(0.5, 0.015, plot_caption(e_f, lo, hi), ha="center", va="bottom",
+             fontsize=8)
+    return fig, ax

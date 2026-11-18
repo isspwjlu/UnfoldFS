@@ -443,6 +443,34 @@ def test_unfold_supercell_selects_the_same_convention_as_the_validated_prototype
             proto[conv], rel=1e-9, abs=1e-12)
 
 
+def test_unfold_supercell_samples_the_first_k_points_for_the_convention(
+        monkeypatch):
+    """相位约定择优的采样口径 = k 列表的**前 min(4, n_k) 个点**(原型口径)。
+
+    `unfold` 与 `band` 必须用**同一条**规则 —— 否则同一组超胞 k 上两个
+    子命令会选出不同的 (s1, s2)(修复轮 7 / B4: 实测 band=(-1,+1) vs
+    unfold=(+1,-1))⇒ 结果不可复现。
+    """
+    import unfoldfs.unfold as unfold_mod
+    seen = []
+    real = unfold_mod._evaluate_conventions
+
+    def _spy(samples, *args, **kwargs):
+        seen.append([np.asarray(s[0], dtype=float) for s in samples])
+        return real(samples, *args, **kwargs)
+
+    monkeypatch.setattr(unfold_mod, "_evaluate_conventions", _spy)
+    fx = _fixture()
+    k_list = fx["band"].kpoints
+    _unfold_supercell(fx, k_list=k_list)
+    assert len(seen) == 1
+    sampled = seen[0]
+    n_sample = min(4, k_list.shape[0])
+    assert len(sampled) == n_sample
+    for got, want in zip(sampled, k_list[:n_sample]):
+        np.testing.assert_allclose(got, want, atol=1e-12)
+
+
 def test_unfold_supercell_matches_naive_reference_on_the_full_path():
     """交叉核对改走 unfold_supercell 全路径(评审 Important 1)。
 

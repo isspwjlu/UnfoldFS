@@ -22,7 +22,8 @@ import re
 import numpy as np
 import pytest
 
-from unfoldfs import band, cli
+from unfoldfs import band, cli, unfold
+from unfoldfs.geometry import periodic_distance
 
 # ------------------------------------------------------------------ 样例
 
@@ -211,6 +212,48 @@ def test_write_kpoints_explicit_matches_the_gen_first_line_style(tmp_path):
     first = pathlib.Path(out).read_text(encoding="utf-8").splitlines()[0]
     assert "Parameters to Generate KPOINTS" not in first
     assert first.lower().startswith("unfoldfs")
+
+
+# ------------------------------------------------------------------ KPOINTS 去重(修复轮 7)
+
+def test_dedup_k_points_keeps_the_first_occurrence_order():
+    """去重按**周期距离**判定; 行序 = 首次出现顺序(相位约定的采样依赖它)。"""
+    k = np.array([[0.0, 0.0, 0.0], [0.25, 0.0, 0.0], [0.0, 0.0, 0.0],
+                  [0.9999999999, 0.0, 0.0], [0.5, 0.0, 0.0]])
+    uniq, index = band.dedup_k_points(k)
+    assert uniq.shape == (3, 3)
+    np.testing.assert_allclose(uniq[0], [0.0, 0.0, 0.0])
+    np.testing.assert_allclose(uniq[1], [0.25, 0.0, 0.0])
+    np.testing.assert_allclose(uniq[2], [0.5, 0.0, 0.0])
+    assert list(index) == [0, 1, 0, 0, 2]
+
+
+def test_dedup_k_points_of_a_unique_list_is_the_identity():
+    k = np.array([[0.0, 0.0, 0.0], [0.25, 0.0, 0.0]])
+    uniq, index = band.dedup_k_points(k)
+    np.testing.assert_allclose(uniq, k)
+    assert list(index) == [0, 1]
+
+
+def test_write_kpoints_explicit_never_writes_a_duplicate_k_point(tmp_path):
+    """VASP 6.6.0 读到含**重复 k 点**的显式列表会崩(服务器实测 2026-11-18)。
+
+    控制器连续四次用 `unfoldfs band` 生成的 KPOINTS 跑 VASP, 每次都在第一个
+    k 点算完后死掉(OUTCAR 停在 "writing wavefunctions", EIGENVAL 只有 1 个
+    k 点); 手工去重后(表头计数改成 33)同一次计算 194 s 跑完全部 33 个 k 点。
+    """
+    out = str(tmp_path / "KPOINTS")
+    k = np.array([[0.0, 0.0, 0.0], [0.25, 0.0, 0.0], [0.0, 0.0, 0.0],
+                  [0.9999999999, 0.0, 0.0], [0.5, 0.0, 0.0]])
+    band.write_kpoints_explicit(out, k)
+    lines = pathlib.Path(out).read_text(encoding="utf-8").splitlines()
+    n = int(lines[1].split()[0])
+    rows = np.array([[float(x) for x in ln.split()[:3]] for ln in lines[3:]])
+    # 表头计数 == 实际行数
+    assert n == len(rows) == 3
+    # 没有两个 k 点的周期距离 <= 1e-6
+    d = periodic_distance(rows, rows)
+    assert np.all(d[~np.eye(n, dtype=bool)] > 1e-6)
 
 
 # ------------------------------------------------------------------ 候选匹配
@@ -453,45 +496,17 @@ def test_symmetrize_band_weights_finds_partners_the_common_subgroup_misses():
     assert w_common[0, 1] == pytest.approx(0.8)
 
 
-def test_spread_order_puts_the_sampled_k_points_apart():
-    """相位约定只采样 k 列表的前 4 个点 —— 路径上这 4 个点必须分散。"""
-    order = band.spread_order(30)
-    assert sorted(order.tolist()) == list(range(30))
-    # 被采样的就是前 4 个 -> 必须分散在整条路径上
-    assert order[0] == 0 and order[3] == 29
-    assert order[1] - order[0] > 5
-    assert order[2] - order[1] > 5
-    assert order[3] - order[2] > 5
+def test_band_has_no_path_wide_sampling_mechanism():
+    """修复轮 7 / B4: **全路径采样**的机制已从模块里删掉。
 
+    旧的 ``band.spread_order`` / ``band.reorder_unfolded`` 让 `band` 把路径点
+    摊开后再采样相位约定 ⇒ 两个子命令在同一组超胞 k 上选出不同的 (s1, s2)
+    (实测 band=(-1,+1) vs unfold=(+1,-1))⇒ 结果不可复现。
 
-def test_spread_order_of_a_short_path_is_the_identity():
-    np.testing.assert_array_equal(band.spread_order(3), np.arange(3))
-    np.testing.assert_array_equal(band.spread_order(1), np.arange(1))
-
-
-def test_reorder_unfolded_restores_the_path_order():
-    import dataclasses
-    from unfoldfs.unfold import UnfoldedResult
-    n_k, n_cand, n_band = 4, 2, 3
-    original = UnfoldedResult(
-        k_cand=np.arange(n_k * n_cand * 3, dtype=float).reshape(n_k, n_cand, 3),
-        energies=np.arange(n_k * n_cand * n_band, dtype=float).reshape(
-            n_k, n_cand, n_band),
-        weights=np.zeros((n_k, n_cand, n_band)),
-        valid=np.ones((n_k, n_cand, n_band), dtype=bool))
-    order = np.array([2, 0, 3, 1])
-    # unfold_supercell 拿到的是重排后的 k 列表 -> 结果也是重排后的
-    permuted = dataclasses.replace(
-        original,
-        k_cand=original.k_cand[order],
-        energies=original.energies[order],
-        weights=original.weights[order],
-        valid=original.valid[order])
-    out = band.reorder_unfolded(permuted, order)
-    # 还原之后必须与原始顺序完全一致(输出的列序 = 路径顺序)
-    np.testing.assert_allclose(out.k_cand, original.k_cand)
-    np.testing.assert_allclose(out.energies, original.energies)
-    np.testing.assert_allclose(out.weights, original.weights)
+    机制**删掉**而不是"不用": 留着就等于留着一个把 bug 引进来的入口。
+    """
+    assert not hasattr(band, "spread_order")
+    assert not hasattr(band, "reorder_unfolded")
 
 
 def test_mirror_path_reverses_and_negates_the_distance():
@@ -547,6 +562,50 @@ def test_plot_band_mirror_draws_both_branches(tmp_path):
     band.plot_band(dist, energy, weight, [("M", 0.0), ("G", 2.0)], e_f=0.0,
                    out_path=out, mirror=True)
     assert os.path.isfile(out)
+
+
+# ---------------- B2 / B3: x 轴单位 + E_F 与能量窗口的标注 ----------------
+
+def _dummy_band_data():
+    dist = np.linspace(0.0, 3.0, 7)
+    energy = np.array([[1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2],
+                       [3.0, 2.8, 2.6, 2.4, 2.2, 2.0, 1.8]])
+    weight = np.array([[0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3],
+                       [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]])
+    labels = [("M", 0.0), ("GAMMA", 3.0)]
+    return dist, energy, weight, labels
+
+
+def test_plot_band_labels_the_x_axis_in_2pi_per_angstrom():
+    """路径距离的单位是 **2π/Å**(与 MOMENTUM.grd / KLABELS 一致)。
+
+    旧实现写的是 "1/Angstrom" —— 与本工具其它输出不一致(修复轮 7 / B2)。
+    """
+    pytest.importorskip("matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
+    dist, energy, weight, labels = _dummy_band_data()
+    fig, ax = band._band_figure(dist, energy, weight, labels, e_f=0.5)
+    assert ax.get_xlabel() == "k-path (2π/Å)"
+
+
+def test_plot_band_annotates_the_fermi_energy_and_the_energy_window():
+    """E_F 的**数值**要标在图上; E_plot 的窗口要写进图注(修复轮 7 / B3)。"""
+    pytest.importorskip("matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
+    dist, energy, weight, labels = _dummy_band_data()
+    fig, ax = band._band_figure(dist, energy, weight, labels, e_f=0.5,
+                                 e_min=-1.0, e_max=4.0)
+    texts = [t.get_text() for t in list(ax.texts) + list(fig.texts)]
+    assert any("E_F" in t and "0.500000" in t for t in texts), texts
+    assert any("E_plot" in t and "-1.000" in t and "4.000" in t for t in texts), \
+        texts
+
+
+def test_plot_caption_reports_the_drawn_window():
+    assert band.plot_caption(0.5, -1.0, 4.0) == \
+        "E_F = 0.500000 eV; E_plot = [-1.000, 4.000] eV"
 
 
 # ------------------------------------------------------------------ CLI
@@ -665,6 +724,27 @@ def _super_k_of_path():
     return np.mod(k_prim @ _M.T, 1.0)
 
 
+# 两段路径(第 1 段的终点 M = 第 2 段的起点)—— 修复轮 7 的 B1 夹具:
+# 路径点里天然含**重复的端点**, 而折叠到超胞后还会出现更多的重合。
+KPATH_TWO_SEGMENTS = """K-Path Generated by VASPKIT.
+    4
+Line-Mode
+Reciprocal
+ 0.0000000000   0.0000000000   0.0000000000     GAMMA
+ 0.5000000000   0.0000000000   0.0000000000     M
+
+ 0.5000000000   0.0000000000   0.0000000000     M
+ 0.0000000000   0.0000000000   0.5000000000     A
+"""
+
+
+def _two_segment_super_k(tmp_path):
+    """两段路径的超胞 k(含重复端点)与去重后的结果。"""
+    path = band.read_kpath(_write(tmp_path / "KPATH.in", KPATH_TWO_SEGMENTS))
+    k_super = band.path_to_super_k(path.k_prim, _M)
+    return k_super, band.dedup_k_points(k_super)
+
+
 @pytest.fixture()
 def band_run(tmp_path):
     """阶段 1 + 阶段 2 都能跑的自洽目录。"""
@@ -712,6 +792,112 @@ def test_band_prepare_writes_kpoints_incar_and_klabels(tmp_path):
     assert n == len(_PATH_K)
     got = np.array([[float(x) for x in ln.split()[:3]] for ln in lines[3:3 + n]])
     np.testing.assert_allclose(got, _super_k_of_path(), atol=1e-9)
+
+
+# ---------------- B1: 重复端点 -> KPOINTS 去重, 路径点不去重 ----------------
+
+def test_band_prepare_deduplicates_the_kpoints_of_a_path_with_a_shared_end(
+        tmp_path):
+    """路径的**重复端点**不能进 KPOINTS(VASP 6.6.0 读到会崩)。
+
+    表头计数必须等于实际写出的行数(控制器实测: 手工去重后把计数从 36 改成
+    33, VASP 一次跑完全部 33 个 k 点)。
+    """
+    run = tmp_path / "run"
+    k_super, (k_unique, _index) = _two_segment_super_k(tmp_path)
+    assert k_unique.shape[0] < k_super.shape[0]        # 确实有重复
+    _write_band_system(str(run), k_unique)
+    kpath = _write(tmp_path / "KPATH.in", KPATH_TWO_SEGMENTS)
+    rc = cli.main(["band",
+                   "--supercell", os.path.join(str(run), "POSCAR"),
+                   "--primcell", os.path.join(str(run), "PRIMCELL.vasp"),
+                   "--transmat", os.path.join(str(run), "TRANSMAT.in"),
+                   "--kpath", kpath,
+                   "--outdir", str(run)])
+    assert rc == 0
+    lines = (run / "KPOINTS").read_text(encoding="utf-8").splitlines()
+    n = int(lines[1].split()[0])
+    rows = np.array([[float(x) for x in ln.split()[:3]] for ln in lines[3:]])
+    assert n == len(rows) == k_unique.shape[0]          # 表头计数 == 行数
+    # 没有重复 k 点(周期距离 > 1e-6)
+    d = periodic_distance(rows, rows)
+    assert np.all(d[~np.eye(n, dtype=bool)] > 1e-6)
+    np.testing.assert_allclose(rows, k_unique, atol=1e-9)
+
+
+def test_band_keeps_the_path_points_but_computes_each_k_point_once(tmp_path,
+                                                                    capsys):
+    """**路径点**不去重(KLABELS / unfolded_band.dat 仍是原始路径点数),
+    **计算的 k 点**去重(两个子命令在阶段 1/2 用的是同一份 KPOINTS)。
+    """
+    run = tmp_path / "run"
+    k_super, (k_unique, _index) = _two_segment_super_k(tmp_path)
+    _write_band_system(str(run), k_unique)
+    kpath = _write(tmp_path / "KPATH.in", KPATH_TWO_SEGMENTS)
+    assert cli.main(["band",
+                     "--supercell", os.path.join(str(run), "POSCAR"),
+                     "--primcell", os.path.join(str(run), "PRIMCELL.vasp"),
+                     "--transmat", os.path.join(str(run), "TRANSMAT.in"),
+                     "--kpath", kpath,
+                     "--outdir", str(run)]) == 0
+    capsys.readouterr()
+    out = tmp_path / "bandfs"
+    assert cli.main(["band", "--dir", str(run), "--outdir", str(out)]) == 0
+    energy = np.loadtxt(str(out / "ENERGY.grd"))
+    momentum = np.loadtxt(str(out / "MOMENTUM.grd"))
+    weight = np.loadtxt(str(out / "WEIGHT.grd"))
+    n_path = k_super.shape[0]
+    # .grd 的列 = **路径点**(含重复端点)
+    assert energy.shape[1] == momentum.shape[1] == weight.shape[1] == n_path
+    # 长表也是路径点(它的表头是中文 ⇒ 必须按 UTF-8 读)
+    dat = np.loadtxt(str(out / "unfolded_band.dat"), encoding="utf-8")
+    assert dat.shape[0] == n_path * energy.shape[0]
+    # KLABELS 的标签 = 高对称点(不是路径点)
+    labels = _matlab_klabels(str(out / "KLABELS"))
+    assert [lab for lab, _ in labels] == ["GAMMA", "M", "A"]
+
+
+def test_band_stage_two_maps_a_shared_endpoint_back_to_one_computed_k(tmp_path):
+    """重复端点必须映射回**同一个**已计算的 k(两列的数据逐位相同)。"""
+    run = tmp_path / "run"
+    k_super, (k_unique, _index) = _two_segment_super_k(tmp_path)
+    _write_band_system(str(run), k_unique)
+    kpath = _write(tmp_path / "KPATH.in", KPATH_TWO_SEGMENTS)
+    assert cli.main(["band",
+                     "--supercell", os.path.join(str(run), "POSCAR"),
+                     "--primcell", os.path.join(str(run), "PRIMCELL.vasp"),
+                     "--transmat", os.path.join(str(run), "TRANSMAT.in"),
+                     "--kpath", kpath,
+                     "--outdir", str(run)]) == 0
+    out = tmp_path / "bandfs"
+    assert cli.main(["band", "--dir", str(run), "--outdir", str(out)]) == 0
+    energy = np.loadtxt(str(out / "ENERGY.grd"))
+    weight = np.loadtxt(str(out / "WEIGHT.grd"))
+    # 第 1 段的终点(下标 3)与第 2 段的起点(下标 4)是同一个路径点
+    np.testing.assert_allclose(energy[:, 3], energy[:, 4])
+    np.testing.assert_allclose(weight[:, 3], weight[:, 4])
+    # 距离序列在交界点上不增加(与路径点重复一致)
+    momentum = np.loadtxt(str(out / "MOMENTUM.grd"))
+    assert momentum[0][3] == pytest.approx(momentum[0][4])
+
+
+def test_band_stage_one_to_stage_two_round_trip(tmp_path):
+    """回归锁: 阶段 1 -> 阶段 2(含重复端点的路径)产出齐全。"""
+    run = tmp_path / "run"
+    _k_super, (k_unique, _index) = _two_segment_super_k(tmp_path)
+    _write_band_system(str(run), k_unique)
+    kpath = _write(tmp_path / "KPATH.in", KPATH_TWO_SEGMENTS)
+    assert cli.main(["band",
+                     "--supercell", os.path.join(str(run), "POSCAR"),
+                     "--primcell", os.path.join(str(run), "PRIMCELL.vasp"),
+                     "--transmat", os.path.join(str(run), "TRANSMAT.in"),
+                     "--kpath", kpath,
+                     "--outdir", str(run)]) == 0
+    out = tmp_path / "bandfs"
+    assert cli.main(["band", "--dir", str(run), "--outdir", str(out)]) == 0
+    for name in ("ENERGY.grd", "MOMENTUM.grd", "WEIGHT.grd", "KLABELS",
+                 "unfolded_band.dat"):
+        assert (out / name).is_file(), name
 
 
 def test_band_unfold_writes_the_four_vaspkit_files(band_run, tmp_path):
@@ -836,3 +1022,69 @@ def test_band_reports_the_symmetrization_state(band_run, tmp_path, capsys):
               "--no-symmetrize"])
     out = capsys.readouterr().out
     assert "已关闭" in out
+
+
+# ---------------- B4: 相位约定的采样口径与 `unfold` 一致 ----------------
+
+def test_band_samples_the_first_k_points_for_the_phase_convention(monkeypatch,
+                                                                    band_run,
+                                                                    tmp_path):
+    """相位约定择优必须用**原型口径**(k 列表的前 min(4, n_k) 个点)。
+
+    修复轮 7 / B4: `band` 曾经把路径点**摊开**再采样(旧 ``band.spread_order``),
+    于是两个子命令在同一组超胞 k 上选出了不同的 (s1, s2)(控制器实测:
+    band=(-1,+1) vs unfold=(+1,-1))⇒ 结果不可复现、两个子命令互相打架。
+    """
+    seen = []
+    real = unfold._evaluate_conventions
+
+    def _spy(samples, *args, **kwargs):
+        seen.append(np.array([np.asarray(s[0], dtype=float) for s in samples]))
+        return real(samples, *args, **kwargs)
+
+    monkeypatch.setattr(unfold, "_evaluate_conventions", _spy)
+    run, _kpath = band_run
+    assert cli.main(["band", "--dir", str(run),
+                     "--outdir", str(tmp_path / "b")]) == 0
+    assert len(seen) == 1
+    # 采样的是 k 列表的**前 4 个点**(路径顺序), 不是摊开后的 4 个
+    np.testing.assert_allclose(seen[0], _super_k_of_path()[:4], atol=1e-12)
+
+
+def _unfold_convention_for(run, k_super):
+    """`unfoldfs unfold` 的口径: 同一份 k 列表 -> (s1, s2)。
+
+    与 `cmd_band_unfold` 用**同一个** ``unfold_supercell`` 与**同一份** k 列表
+    —— 差别只在调用方(``unfold`` 传 grid_map 的 k_super, ``band`` 传路径的
+    k 列表)。⇒ 两者对**同一组**超胞 k 必然给出同一个 (s1, s2) ✓
+    """
+    from unfoldfs.geometry import read_poscar, read_transmat, reciprocal
+    from unfoldfs.geometry import resolve_transform
+    from unfoldfs.unfold import build_atom_copies
+    from unfoldfs.vaspio import read_eigenval, read_procar
+    prim = read_poscar(os.path.join(run, "PRIMCELL.vasp"))
+    sc = read_poscar(os.path.join(run, "POSCAR"))
+    tr = resolve_transform(sc, prim, read_transmat(os.path.join(run,
+                                                                "TRANSMAT.in")))
+    copies = build_atom_copies(prim, sc, tr)
+    res = unfold.unfold_supercell(
+        read_eigenval(os.path.join(run, "EIGENVAL")),
+        read_procar(os.path.join(run, "PROCAR")),
+        tr, copies, tr.m_eff, prim.lattice,
+        prim.positions @ prim.lattice, reciprocal(prim.lattice),
+        reciprocal(sc.lattice), k_super)
+    return (int(res.s1), int(res.s2))
+
+
+def test_band_and_unfold_select_the_same_convention_for_the_same_k_list(
+        band_run, tmp_path, capsys):
+    """**同一组**超胞 k ⇒ **同一个** (s1, s2)(控制器实测过它们曾经不一致)。"""
+    run, _kpath = band_run
+    assert cli.main(["band", "--dir", str(run),
+                     "--outdir", str(tmp_path / "b")]) == 0
+    out = capsys.readouterr().out
+    m = re.search(r"s1 = ([+-]?\d+), s2 = ([+-]?\d+)", out)
+    assert m is not None, out
+    band_conv = (int(m.group(1)), int(m.group(2)))
+    unfold_conv = _unfold_convention_for(str(run), _super_k_of_path())
+    assert band_conv == unfold_conv
