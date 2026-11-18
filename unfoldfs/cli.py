@@ -32,15 +32,18 @@ import numpy as np
 
 from .band import (assemble_band, path_distances, path_labels,
                    path_to_super_k, plot_band, read_klabels, read_kpath,
-                   reorder_unfolded, spread_order, write_band_dat, write_grd,
-                   write_klabels, write_kpoints_explicit)
-from .expand import build_spectral_function, expand_to_full_grid
+                   reorder_unfolded, spread_order, symmetrize_band_weights,
+                   write_band_dat, write_grd, write_klabels,
+                   write_kpoints_explicit)
+from .expand import (build_spectral_function, expand_to_full_grid,
+                     symmetrize_spectral_function)
 from .fsout import (band_edges, has_fermi_crossing, make_e_grid,
                     select_fermi_energy, write_bxsf,
                     write_cube, write_fermisurfer_bands,
                     write_spectral_npz)
-from .geometry import (common_symmetry_ops_detailed, read_poscar,
-                       read_transmat, reciprocal, resolve_transform)
+from .geometry import (common_symmetry_ops, common_symmetry_ops_detailed,
+                       read_poscar, read_transmat, reciprocal,
+                       resolve_transform)
 from .grid import (GridSpec, build_grid_map, choose_grid_points,
                    filter_ops_by_grid_detailed, load_grid_map,
                    primitive_grid_points, save_grid_map, write_kpoints)
@@ -435,6 +438,31 @@ def _print_convention_line(unfolded, det: int) -> None:
           f"(单 G 主导度 {unfolded.dominance:.4f})")
 
 
+def _write_spectral_npz(path: str, expanded, b_prim: np.ndarray, e_f: float, *,
+                        vbm: float, cbm: float, e_grid: np.ndarray, sigma: float,
+                        symmetrize=None) -> None:
+    """写 ``A(k,E).npz``; 给定 ``symmetrize`` 时把文件里的 A 换成**对称化后**的。
+
+    ``fsout.write_spectral_npz`` 自己从 ``expanded`` 重算 A(k,E) —— 而对称化是
+    **投影**(不可逆: 逐带数据在对称相关点上根本不是同一组带, 见
+    docs/algorithms.md §15.7)⇒ 无法由对称化后的 band_e/band_w 重算 ⇒ 这里在
+    写完之后把 A 换掉, 其余键原样保留。
+
+    ⇒ npz 里的 ``A`` 是**对称化后**的谱函数, 而 ``band_e``/``band_w`` 是
+    **原始**展开数据(见 docs/formats.md)。
+    """
+    write_spectral_npz(path, expanded, b_prim, e_f, vbm=vbm, cbm=cbm,
+                       e_grid=e_grid, sigma=sigma)
+    if symmetrize is None:
+        return
+    a = symmetrize_spectral_function(
+        build_spectral_function(expanded, e_grid, sigma), symmetrize)
+    with np.load(path) as data:
+        arrays = {key: data[key] for key in data.files}
+    arrays["A"] = a
+    np.savez_compressed(path, **arrays)
+
+
 def cmd_unfold(args: argparse.Namespace) -> int:
     """读 VASP 输出 -> 反折叠 -> 对称扩展 -> 写费米面文件。"""
     run_dir = args.dir
@@ -536,7 +564,16 @@ def cmd_unfold(args: argparse.Namespace) -> int:
         strict_dominance=args.strict_dominance)
     expanded = expand_to_full_grid(unfolded, gm)
 
+    # ★ 点群轨道对称化(默认开): 把展开谱 A(k,E) 投影到"对称不变子空间" ——
+    # 展开得到的谱权重在点群下**不协变**(docs/algorithms.md §15), 不对称化
+    # 的话费米面的等值面相对晶体对称性是畸变的。
+    symmetrize = not getattr(args, "no_symmetrize", False)
+
     _print_convention_line(unfolded, tr.det)
+    print("点群对称化    : " + ("已启用(按原胞点群轨道平均 A(k,E); "
+                               "--no-symmetrize 可关闭)" if symmetrize
+                               else "已关闭(--no-symmetrize) —— 谱权重是"
+                                    "逐 (K,G) 的原始权重, 费米面带对称性破缺"))
     print(f"VBM / CBM     : {vbm_txt}")
     print(f"E_F           : {e_f:.6f} eV  (--ef {args.ef}, "
           f"--delta {args.delta:g})")
@@ -544,6 +581,8 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     os.makedirs(args.outdir, exist_ok=True)
     values = build_spectral_function(expanded, np.array([e_f]),
                                      args.sigma)[:, 0]
+    if symmetrize:
+        values = symmetrize_spectral_function(values, gm)
     comments = _fs_comments(e_f, args, vbm, cbm)
 
     cube_path = os.path.join(args.outdir, "FS.cube")
@@ -555,8 +594,9 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     print(f"已写出        : {os.path.join(args.outdir, 'band.1')} ... "
           f"band.{len(band_paths)}")
     e_grid = make_e_grid(e_f, _NPZ_HALF_WIDTH, _NPZ_N_POINTS)
-    write_spectral_npz(npz_path, expanded, b_prim, e_f, vbm=vbm, cbm=cbm,
-                       e_grid=e_grid, sigma=args.sigma)
+    _write_spectral_npz(npz_path, expanded, b_prim, e_f, vbm=vbm, cbm=cbm,
+                        e_grid=e_grid, sigma=args.sigma,
+                        symmetrize=gm if symmetrize else None)
     print(f"已写出        : {npz_path}")
     # BXSF 只支持 Gamma 网格(见 docs/formats.md §3): MP 网格下跳过它,
     # 但把原因说清楚 —— 其余输出(FS.cube / band.N / npz)对 MP 网格都成立
@@ -728,6 +768,13 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
         strict_dominance=args.strict_dominance)
     unfolded = reorder_unfolded(unfolded, order)
     energy, weight = assemble_band(unfolded, path.k_prim)
+    # ★ 点群轨道对称化(默认开): 路径上**对称相关**的两点会给出不同的展开谱
+    # 权重(docs/algorithms.md §15)⇒ 同一段路径的两半颜色不同。带能量不动。
+    symmetrize = not getattr(args, "no_symmetrize", False)
+    if symmetrize:
+        weight = symmetrize_band_weights(
+            energy, weight, path.k_prim,
+            common_symmetry_ops(prim, tr.m_eff))
 
     outdir = args.outdir or "bandfs"
     os.makedirs(outdir, exist_ok=True)
@@ -743,6 +790,9 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
     write_band_dat(dat_path, dist, energy, weight)
 
     _print_convention_line(unfolded, tr.det)
+    print("点群对称化    : " + ("已启用(按点群轨道平均路径上对称相关点的权重; "
+                               "--no-symmetrize 可关闭)" if symmetrize
+                               else "已关闭(--no-symmetrize)"))
     print(f"E_F           : {e_f:.6f} eV  (--ef {args.ef}, --delta {args.delta:g})")
     print(f"路径点        : {path.n_k}(高对称点 "
           f"{', '.join(lab for lab, _ in labels)})")
@@ -868,6 +918,10 @@ def _add_unfold_args(p: argparse.ArgumentParser) -> None:
                    help="谱函数展宽 (eV)")
     p.add_argument("--strict-dominance", action="store_true",
                    help="要求每个态的单 G 主导度 >= 0.5(严格模式)")
+    p.add_argument("--no-symmetrize", action="store_true",
+                   help="**不做**点群轨道对称化: A(k,E) 保持逐 (K,G) 的原始"
+                        "谱权重(此时费米面带对称性破缺, 见 docs/algorithms.md "
+                        "§15)。默认是对称化后的(投影到对称不变子空间)")
     p.add_argument("--outdir", default="fs", help="费米面文件输出目录")
 
 
@@ -906,6 +960,10 @@ def _add_band_args(p: argparse.ArgumentParser) -> None:
                         "(对应 MATLAB 脚本里的 IsPlotMirror)")
     p.add_argument("--strict-dominance", action="store_true",
                    help="要求每个态的单 G 主导度 >= 0.5(严格模式)")
+    p.add_argument("--no-symmetrize", action="store_true",
+                   help="**不做**点群轨道对称化: 路径上对称相关点的展开谱权重"
+                        "保持原始值(见 docs/algorithms.md §16.7)。默认是对称化"
+                        "后的")
     p.add_argument("--no-plot", action="store_true",
                    help="不画 PNG(不需要 matplotlib)")
 
@@ -939,8 +997,9 @@ def build_parser() -> argparse.ArgumentParser:
             "(路径点上取原胞 k 等于该路径点的那个候选的投影权重),\n"
             "   **不是** vaspkit 282 用 WAVECAR 平面波展开得到的原胞带 |c(k)|² —— "
             "两者都叫权重但含义不同。\n"
-            "⚠ 展开谱权重在晶体点群下不协变(带能量不受影响) => "
-            "能带曲线可信、能带形状不可信。"))
+            "⚠ 展开谱权重在晶体点群下**天然不协变**(带能量不受影响) => "
+            "默认对路径上对称相关的点做轨道平均(--no-symmetrize 可关); "
+            "能带曲线可信、能带形状仍不可信。"))
     _add_band_args(p_band)
     p_band.set_defaults(func=cmd_band)
 

@@ -367,6 +367,62 @@ def test_assemble_band_raises_when_a_k_point_has_no_candidate():
         band.assemble_band(r, k_prim)
 
 
+# ------------------------------------------------------------------ 点群轨道对称化
+
+def _mirror_ops():
+    """恒等 + 面内镜(x -> -x): 把 0.1 映到 0.9。"""
+    from unfoldfs.geometry import SymmetryOps
+    return SymmetryOps(
+        rotations=np.array([[[1, 0, 0], [0, 1, 0], [0, 0, 1]],
+                             [[-1, 0, 0], [0, 1, 0], [0, 0, 1]]]),
+        translations=np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]))
+
+
+def test_symmetrize_band_weights_averages_the_weights_over_the_orbit():
+    """路径上对称相关的两点: 权重被平均(能量不动)。"""
+    k_prim = np.array([[0.1, 0.0, 0.0], [0.9, 0.0, 0.0]])
+    energy = np.array([[1.0, 1.0], [2.0, 2.0]])
+    weight = np.array([[0.5, 0.1], [0.2, 0.3]])
+    out = band.symmetrize_band_weights(energy, weight, k_prim, _mirror_ops())
+    assert out[0, 0] == pytest.approx(0.3)
+    assert out[0, 1] == pytest.approx(0.3)
+    assert out[1, 0] == pytest.approx(0.25)
+    assert out[1, 1] == pytest.approx(0.25)
+    # 能量**不动**(带能量本来就是对称的)
+    assert np.array_equal(energy, np.array([[1.0, 1.0], [2.0, 2.0]]))
+
+
+def test_symmetrize_band_weights_is_a_no_op_without_orbit_partners():
+    """路径上**没有**对称相关的点时, 对称化必须逐位无操作。"""
+    k_prim = np.array([[0.1, 0.0, 0.0], [0.2, 0.0, 0.0]])
+    energy = np.array([[1.0, 1.5], [2.0, 2.5]])
+    weight = np.array([[0.5, 0.1], [0.2, 0.3]])
+    out = band.symmetrize_band_weights(energy, weight, k_prim, _mirror_ops())
+    assert np.array_equal(out, weight)
+
+
+def test_symmetrize_band_weights_only_averages_rows_that_are_the_same_band():
+    """能量对不上的两行不是同一条带 => 不得平均(否则把不同的带混起来)。"""
+    k_prim = np.array([[0.1, 0.0, 0.0], [0.9, 0.0, 0.0]])
+    energy = np.array([[1.0, 5.0], [2.0, 2.0]])
+    weight = np.array([[0.5, 0.1], [0.2, 0.3]])
+    out = band.symmetrize_band_weights(energy, weight, k_prim, _mirror_ops())
+    assert out[0, 0] == pytest.approx(0.5)      # 第 0 行不参与平均
+    assert out[0, 1] == pytest.approx(0.1)
+    assert out[1, 0] == pytest.approx(0.25)     # 第 1 行参与
+    assert out[1, 1] == pytest.approx(0.25)
+
+
+def test_symmetrize_band_weights_rejects_a_shape_mismatch():
+    k_prim = np.array([[0.1, 0.0, 0.0]])
+    with pytest.raises(ValueError, match="形状"):
+        band.symmetrize_band_weights(np.zeros((2, 1)), np.zeros((3, 1)),
+                                     k_prim, _mirror_ops())
+    with pytest.raises(ValueError, match="路径点数"):
+        band.symmetrize_band_weights(np.zeros((2, 2)), np.zeros((2, 2)),
+                                     k_prim, _mirror_ops())
+
+
 def test_spread_order_puts_the_sampled_k_points_apart():
     """相位约定只采样 k 列表的前 4 个点 —— 路径上这 4 个点必须分散。"""
     order = band.spread_order(30)
@@ -719,3 +775,34 @@ def test_band_help_mentions_the_weight_semantics(capsys):
         cli.main(["band", "--help"])
     out = capsys.readouterr().out
     assert "权重" in out
+
+
+def test_band_symmetrization_is_a_no_op_for_a_path_without_related_points(
+        band_run, tmp_path):
+    """路径上**没有**对称相关的点时, 对称化是**无操作**(输出逐位相同)。
+
+    这不是 bug: 泛路径点的点群轨道**离开**路径 ⇒ 没有可比较的伙伴
+    (docs/algorithms.md §16.7)。
+    """
+    run, _kpath = band_run
+    out_sym = tmp_path / "bandfs_sym"
+    out_raw = tmp_path / "bandfs_raw"
+    assert cli.main(["band", "--dir", str(run),
+                     "--outdir", str(out_sym)]) == 0
+    assert cli.main(["band", "--dir", str(run), "--outdir", str(out_raw),
+                     "--no-symmetrize"]) == 0
+    w_sym = np.loadtxt(str(out_sym / "WEIGHT.grd"))
+    w_raw = np.loadtxt(str(out_raw / "WEIGHT.grd"))
+    assert np.array_equal(w_sym, w_raw)
+
+
+def test_band_reports_the_symmetrization_state(band_run, tmp_path, capsys):
+    run, _kpath = band_run
+    cli.main(["band", "--dir", str(run), "--outdir", str(tmp_path / "b1")])
+    out = capsys.readouterr().out
+    assert "点群对称化" in out
+    assert "已启用" in out
+    cli.main(["band", "--dir", str(run), "--outdir", str(tmp_path / "b2"),
+              "--no-symmetrize"])
+    out = capsys.readouterr().out
+    assert "已关闭" in out
