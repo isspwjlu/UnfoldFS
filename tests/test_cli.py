@@ -1266,3 +1266,19 @@ def test_unfold_reports_the_full_point_group_size(tmp_path, capsys):
     assert "12 个操作" in out
     assert "公共对称操作" in out
 
+
+
+# ------------------------------------------------------------------ band 颜色标度
+
+def test_band_weight_scale_flag_defaults_to_linear_and_accepts_log():
+    parser = cli.build_parser()
+    args = parser.parse_args(["band", "--dir", "x"])
+    assert args.weight_scale == "linear"
+    args = parser.parse_args(["band", "--dir", "x", "--weight-scale", "log"])
+    assert args.weight_scale == "log"
+
+
+def test_band_weight_scale_rejects_an_unknown_value():
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["band", "--dir", "x", "--weight-scale", "sqrt"])
