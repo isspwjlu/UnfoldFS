@@ -849,7 +849,8 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
         plot_band(dist, energy, weight, labels, e_f=e_f, out_path=png_path,
                   e_min=args.e_min, e_max=args.e_max, mirror=args.mirror,
                   weight_scale=weight_scale,
-                  style=getattr(args, "plot_style", "line"))
+                  style=getattr(args, "plot_style", "line"),
+                  sigma=getattr(args, "sigma", 0.06))
     except ValueError as exc:
         raise ValueError(
             f"{exc}\n      (四个 vaspkit 文件已经写好了, 只是画不出 PNG)") from exc
@@ -990,7 +991,8 @@ def _add_band_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--delta", type=float, default=0.05,
                    help="半导体时 VBM + delta 的偏移 (eV)")
     p.add_argument("--sigma", type=float, default=0.06,
-                   help="谱函数展宽 (eV); 只用于判断 E_F 是否落在带隙里")
+                   help="谱函数展宽 (eV); 用于判断 E_F 是否落在带隙里, "
+                        "也是 --plot-style heatmap 的展宽")
     p.add_argument("--e-min", type=float, default=None,
                    help="图的能量下限 (eV, 绝对值)")
     p.add_argument("--e-max", type=float, default=None,
