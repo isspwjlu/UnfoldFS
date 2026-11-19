@@ -271,7 +271,8 @@ def cmd_gen(args: argparse.Namespace) -> int:
                                args.grid_type)
     grid = primitive_grid_points(spec)
     # 公共对称集 + 被剔除的操作与原因(spec §7: info 里要列出剔除项)
-    all_ops, dropped = common_symmetry_ops_detailed(prim, tr.m_eff)
+    all_ops, dropped = common_symmetry_ops_detailed(
+        prim, tr.m_eff, _symprec(args))
     ops, dropped_grid = filter_ops_by_grid_detailed(all_ops, grid)
     gm = build_grid_map(spec, grid, ops, tr, b_prim, b_super,
                         dropped=tuple(dropped) + tuple(dropped_grid))
@@ -575,7 +576,7 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     # 不变 ⇒ 投影有物理依据; 而"超胞还保留的那部分操作"只对保持对称的超胞
     # 够用 —— 破坏对称性的超胞(如 3×1×1)只剩 4/12 个操作, 六重对称恢复不了。
     symmetrize = not getattr(args, "no_symmetrize", False)
-    full_ops = primitive_symmetry_ops(prim)
+    full_ops = primitive_symmetry_ops(prim, _symprec(args))
     n_common = int(gm.ops.rotations.shape[0])
 
     _print_convention_line(unfolded, tr.det)
@@ -807,7 +808,7 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
     if symmetrize:
         weight = symmetrize_band_weights(
             energy, weight, path.k_prim,
-            primitive_symmetry_ops(prim))
+            primitive_symmetry_ops(prim, _symprec(args)))
 
     outdir = args.outdir or "bandfs"
     os.makedirs(outdir, exist_ok=True)
@@ -959,6 +960,11 @@ def _add_unfold_args(p: argparse.ArgumentParser) -> None:
                    help="谱函数展宽 (eV)")
     p.add_argument("--strict-dominance", action="store_true",
                    help="要求每个态的单 G 主导度 >= 0.5(严格模式)")
+    p.add_argument("--symprec", type=float, default=1e-5,
+                   help="对称性判定的容差(Angstrom; spglib 的 symprec)。"
+                        "结构坐标有 1e-5 级噪声时 1e-5 会漏掉大部分操作"
+                        "(实测 1H-NbSe2: 1e-5 -> 4 个操作, 1e-4 -> 12 个) "
+                        "=> 弛豫过的结构通常要放宽")
     p.add_argument("--no-symmetrize", action="store_true",
                    help="**不做**点群轨道对称化: A(k,E) 保持逐 (K,G) 的原始"
                         "谱权重(此时费米面带对称性破缺, 见 docs/algorithms.md "
@@ -1002,6 +1008,11 @@ def _add_band_args(p: argparse.ArgumentParser) -> None:
                         "(对应 MATLAB 脚本里的 IsPlotMirror)")
     p.add_argument("--strict-dominance", action="store_true",
                    help="要求每个态的单 G 主导度 >= 0.5(严格模式)")
+    p.add_argument("--symprec", type=float, default=1e-5,
+                   help="对称性判定的容差(Angstrom; spglib 的 symprec)。"
+                        "结构坐标有 1e-5 级噪声时 1e-5 会漏掉大部分操作"
+                        "(实测 1H-NbSe2: 1e-5 -> 4 个操作, 1e-4 -> 12 个) "
+                        "=> 弛豫过的结构通常要放宽")
     p.add_argument("--no-symmetrize", action="store_true",
                    help="**不做**点群轨道对称化: 路径上对称相关点的展开谱权重"
                         "保持原始值(见 docs/algorithms.md §16.7)。默认是对称化"
@@ -1059,6 +1070,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="grid_map.npz(默认 <dir>/grid_map.npz)")
     p_info.set_defaults(func=cmd_info)
     return parser
+
+
+def _symprec(args) -> float:
+    """对称性容差(spglib 的 symprec, 单位 Angstrom)。"""
+    return float(getattr(args, "symprec", 1e-5))
 
 
 def _force_utf8_output() -> None:
