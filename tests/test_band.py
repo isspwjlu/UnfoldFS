@@ -1304,3 +1304,27 @@ def test_assemble_band_rejects_an_unknown_mode():
                             valid=np.ones((1, 1, 1), dtype=bool))
     with pytest.raises(ValueError):
         band.assemble_band(res, np.array([[0.0, 0.0, 0.0]]), mode="nope")
+
+
+def test_band_color_scale_is_normalized_by_the_plotted_window():
+    """色标只由**画窗内**的带定 —— 窗外那条权重极大的强局域带不能把整幅图压暗。
+
+    实测 1T-TaS2 的 3x1x1: +10.8 eV 的平带 w = 9.23, 而 E_F 附近只有 0.26~1.12
+    => 全局线性色标下 E_F 附近只剩 3%~12% => 一片深蓝。
+    """
+    w = np.array([[9.0, 9.0],       # 窗外那条权重极大的带
+                  [0.5, 1.0]])       # 画窗内的带
+    # 掩码: 只让第二行参与定标度
+    mask = np.array([[False, False], [True, True]])
+    cols = band._band_figure_colors(w, "linear", mask=mask)
+    assert cols[2] == pytest.approx(0.5)      # 0.5 / 1.0
+    assert cols[3] == pytest.approx(1.0)      # 1.0 / 1.0
+    assert cols[0] == pytest.approx(1.0)      # 窗外那条按同一把尺子取值(被截到 1)
+
+
+def test_band_color_scale_mask_may_be_broadcast():
+    w = np.array([[1.0, 2.0], [0.5, 0.25]])
+    mask = np.array([[False], [True]])         # (n_band, 1) 广播
+    cols = band._band_figure_colors(w, "linear", mask=mask)
+    assert cols[2] == pytest.approx(1.0)      # 0.5 / 0.5
+    assert cols[3] == pytest.approx(0.5)      # 0.25 / 0.5

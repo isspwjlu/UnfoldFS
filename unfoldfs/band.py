@@ -540,17 +540,23 @@ def _require_matplotlib():
     return matplotlib
 
 
-def _band_figure_colors(weight: np.ndarray, scale: str = "linear") -> np.ndarray:
+def _band_figure_colors(weight: np.ndarray, scale: str = "linear",
+                         mask: Optional[np.ndarray] = None) -> np.ndarray:
     """把 (n_band, n_k) 的权重矩阵变成 0~1 的颜色值(按行优先展平)。
 
-    * ``linear``：``w / max(w)``（全局）—— 原来的做法；
+    * ``linear``：``w / max(w)``；
     * ``log``：``log10(w)`` 在 ``[w_min⁺, w_max]`` 上线性映射到 0~1（w = 0 -> 0）。
 
-    为什么要 ``log``：权重是**投影量**, 绝对值在不同带之间可以差两个量级
-    （实测 1T-TaS₂ 的 3×1×1 展开能带：+10.8 eV 那条强局域平带 w = 9.23，
-    而 E_F 附近的带只有 0.26~1.12）⇒ 全局线性色标会把 E_F 附近压到
-    色标的 3%~12% ⇒ 图上"看不到权重"。
+    ``mask``: (n_band, n_k) 的布尔掩码, 指出**哪些条目参与定标度**(其余条目
+    仍按同一把尺子取值)。画能带时传"能量落在画窗内的带"⇒ 色标只由**画出来
+    的那段能量**决定, 不会被窗外那条权重极大的强局域带(实测 1T-TaS₂ 的
+    +10.8 eV 平带 w = 9.23)把整幅图压成深蓝。
 
+    为什么要 ``log``：权重是**投影量**, 绝对值在不同带之间可以差两个量级
+    ⇒ 线性色标会把弱的那部分压成一片深蓝。但 log 又会把**弱副本**抬到
+    中等亮度(实测 1H-NbSe₂ 的 full 模式: 弱副本 w < 0.1、强带 0.5~1.35,
+    log 之后两者拉不开)⇒ 想同时看清"强带亮 + 弱副本可见但暗", 用
+    **按画窗归一化的线性色标**最合适。
     """
     w = np.asarray(weight, dtype=float)
     if scale not in ("linear", "log"):
@@ -559,12 +565,22 @@ def _band_figure_colors(weight: np.ndarray, scale: str = "linear") -> np.ndarray
     flat = w.ravel()
     if flat.size == 0:
         return np.zeros(0)
+    sel = flat
+    if mask is not None:
+        m = np.asarray(mask, dtype=bool)
+        if m.shape != w.shape:          # 掩码可以只给"每条带一行"(n_band, 1)
+            try:
+                m = np.broadcast_to(m, w.shape)
+            except ValueError:
+                m = None
+        if m is not None and m.any():
+            sel = flat[m.ravel()]
     if scale == "linear":
-        wmax = float(np.max(flat))
+        wmax = float(np.max(sel)) if sel.size else 0.0
         if wmax <= 0:
             return np.zeros(flat.size)
-        return flat / wmax
-    pos = flat[flat > 0]
+        return np.clip(flat / wmax, 0.0, 1.0)
+    pos = sel[sel > 0]
     if pos.size == 0:
         return np.zeros(flat.size)
     wmax = float(np.max(pos))
@@ -694,10 +710,17 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
     energy = np.atleast_2d(np.asarray(energies, dtype=float))
     weight = np.atleast_2d(np.asarray(weights, dtype=float))
 
+    lo = e_min if e_min is not None else float(np.min(energy))
+    hi = e_max if e_max is not None else float(np.max(energy))
+
     def _segments(d: np.ndarray, e: np.ndarray, w: np.ndarray):
         segs, cols = [], []
         # 颜色按**点**算(与 _band_figure_colors 同一口径), 段上取两端平均
-        pt = _band_figure_colors(w, weight_scale).reshape(w.shape)
+        # 掩码: 只有**能量与画窗有交集**的带参与定标度(见 _band_figure_colors)
+        band_lo = np.nanmin(e, axis=1)[:, None]
+        band_hi = np.nanmax(e, axis=1)[:, None]
+        mask = (band_hi >= lo) & (band_lo <= hi)
+        pt = _band_figure_colors(w, weight_scale, mask=mask).reshape(w.shape)
         for b in range(e.shape[0]):
             for j in range(e.shape[1] - 1):
                 segs.append([(d[j], e[b, j]), (d[j + 1], e[b, j + 1])])
@@ -718,8 +741,6 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
         ax.add_collection(lc)
         lw = 0.4 + 1.8 * np.array(cols)
         lc.set_linewidth(lw)
-    lo = e_min if e_min is not None else float(np.min(energy))
-    hi = e_max if e_max is not None else float(np.max(energy))
     ax.set_ylim(lo, hi)
     # x 轴范围要覆盖镜像路径(距离取负)—— 否则镜像那一半会被裁掉
     x_lo = min(float(np.min(d)) for d, _e, _w in groups)
@@ -807,7 +828,12 @@ def _band_heatmap_figure(distances: np.ndarray, energies: np.ndarray,
         groups.append(mirror_path(dist, energy, weight))
     for d, e, w in groups:
         # 每条带的**颜色**先归一化(与线图同一口径), 再展宽 => 0~1 有界
-        wcol = _band_figure_colors(w, weight_scale).reshape(w.shape)
+        # 掩码: 只有**能量落在画窗内**的带参与定标度 ⇒ 窗外那条权重极大的
+        # 强局域带(实测 1T-TaS2 的 +10.8 eV 平带 w = 9.23)不会把整幅图压暗
+        band_lo = np.nanmin(e, axis=1)[:, None]
+        band_hi = np.nanmax(e, axis=1)[:, None]
+        mask = (band_hi >= lo) & (band_lo <= hi)
+        wcol = _band_figure_colors(w, weight_scale, mask=mask).reshape(w.shape)
         A = band_spectral_function(d, e, wcol, e_grid, sigma)
         ax.pcolormesh(d, e_grid, A, cmap=cmap, vmin=0.0, vmax=1.0,
                       shading="auto")
