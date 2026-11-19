@@ -853,7 +853,8 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
                   e_min=args.e_min, e_max=args.e_max, mirror=args.mirror,
                   weight_scale=weight_scale,
                   style=getattr(args, "plot_style", "line"),
-                  sigma=getattr(args, "sigma", 0.06))
+                  sigma=getattr(args, "sigma", 0.06),
+                  e_ref=getattr(args, "e_ref", "abs"))
     except ValueError as exc:
         raise ValueError(
             f"{exc}\n      (四个 vaspkit 文件已经写好了, 只是画不出 PNG)") from exc
@@ -962,6 +963,9 @@ def _add_unfold_args(p: argparse.ArgumentParser) -> None:
                    help="谱函数展宽 (eV)")
     p.add_argument("--strict-dominance", action="store_true",
                    help="要求每个态的单 G 主导度 >= 0.5(严格模式)")
+    p.add_argument("--e-ref", choices=("abs", "ef"), default="abs",
+                   help="PNG 的 y 轴参考: abs = 绝对能量(默认); "
+                        "ef = E - E_F(E_F 落在 0, 与论文里的画法一致)")
     p.add_argument("--unfold-mode", choices=("assign", "full"),
                    default="assign",
                    help="能带图的展开方式: assign = 每个路径点只画**归属到该 k'** 的带"
@@ -1015,6 +1019,9 @@ def _add_band_args(p: argparse.ArgumentParser) -> None:
                         "(对应 MATLAB 脚本里的 IsPlotMirror)")
     p.add_argument("--strict-dominance", action="store_true",
                    help="要求每个态的单 G 主导度 >= 0.5(严格模式)")
+    p.add_argument("--e-ref", choices=("abs", "ef"), default="abs",
+                   help="PNG 的 y 轴参考: abs = 绝对能量(默认); "
+                        "ef = E - E_F(E_F 落在 0, 与论文里的画法一致)")
     p.add_argument("--unfold-mode", choices=("assign", "full"),
                    default="assign",
                    help="能带图的展开方式: assign = 每个路径点只画**归属到该 k'** 的带"

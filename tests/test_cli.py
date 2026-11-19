@@ -1314,3 +1314,9 @@ def test_band_unfold_mode_flag_defaults_to_assign_and_accepts_full():
     assert parser.parse_args(["band", "--dir", "x"]).unfold_mode == "assign"
     assert parser.parse_args(
         ["band", "--dir", "x", "--unfold-mode", "full"]).unfold_mode == "full"
+
+
+def test_band_e_ref_flag_defaults_to_abs_and_accepts_ef():
+    parser = cli.build_parser()
+    assert parser.parse_args(["band", "--dir", "x"]).e_ref == "abs"
+    assert parser.parse_args(["band", "--dir", "x", "--e-ref", "ef"]).e_ref == "ef"

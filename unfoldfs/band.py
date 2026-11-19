@@ -644,7 +644,7 @@ def plot_band(distances: np.ndarray, energies: np.ndarray, weights: np.ndarray,
               out_path: str, e_min: Optional[float] = None,
               e_max: Optional[float] = None, mirror: bool = False,
               weight_scale: str = "linear", style: str = "line",
-              sigma: float = 0.06) -> str:
+              sigma: float = 0.06, e_ref: str = "abs") -> str:
     """画 E-vs-路径距离 的加权能带图, 存成 PNG。
 
     画图本身在 ``_band_figure``（线图）/ ``_band_heatmap_figure``（热图）,
@@ -654,6 +654,7 @@ def plot_band(distances: np.ndarray, energies: np.ndarray, weights: np.ndarray,
     ``style``: ``line``（带线 + 顶部色条）或 ``heatmap``（A(k,E) 热图 +
     底部色条, 与用户的参考截图同款）。
     ``sigma``: 热图风格的展宽(eV)。
+    ``e_ref``: ``abs``(默认, y 轴是绝对能量)或 ``ef``(y 轴 = E - E_F, E_F 在 0)。
     """
     _require_matplotlib()
     import matplotlib.pyplot as plt
@@ -662,11 +663,11 @@ def plot_band(distances: np.ndarray, energies: np.ndarray, weights: np.ndarray,
                                          e_f, e_min=e_min, e_max=e_max,
                                          mirror=mirror,
                                          weight_scale=weight_scale,
-                                         sigma=sigma)
+                                         sigma=sigma, e_ref=e_ref)
     elif style == "line":
         fig, _ax = _band_figure(distances, energies, weights, labels, e_f,
                                  e_min=e_min, e_max=e_max, mirror=mirror,
-                                 weight_scale=weight_scale)
+                                 weight_scale=weight_scale, e_ref=e_ref)
     else:
         raise ValueError(f"style 只能是 'line' 或 'heatmap', 给出 {style!r}")
     fig.savefig(out_path, dpi=300)
@@ -688,7 +689,7 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
                  weights: np.ndarray, labels: Sequence[Tuple[str, float]],
                  e_f: float, e_min: Optional[float] = None,
                  e_max: Optional[float] = None, mirror: bool = False,
-                 weight_scale: str = "linear"):
+                 weight_scale: str = "linear", e_ref: str = "abs"):
     """画 E-vs-路径距离 的加权能带图 -> (fig, ax)。
 
     * 按权重着色(jet, 与 MATLAB 脚本的 ``colormap('jet')`` 同风格)并用线宽
@@ -712,8 +713,14 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
     energy = np.atleast_2d(np.asarray(energies, dtype=float))
     weight = np.atleast_2d(np.asarray(weights, dtype=float))
 
-    lo = e_min if e_min is not None else float(np.min(energy))
-    hi = e_max if e_max is not None else float(np.max(energy))
+    lo_abs = e_min if e_min is not None else float(np.min(energy))
+    hi_abs = e_max if e_max is not None else float(np.max(energy))
+    # e_ref="ef": y 轴 = E - E_F(E_F 落在 0); .grd/.dat 仍是绝对能量
+    shift = float(e_f) if e_ref == "ef" else 0.0
+    if shift:
+        energy = energy - shift
+    lo, hi = lo_abs - shift, hi_abs - shift
+    ylabel = "Energy − E_F (eV)" if e_ref == "ef" else "Energy (eV)"
 
     def _segments(d: np.ndarray, e: np.ndarray, w: np.ndarray):
         segs, cols = [], []
@@ -749,9 +756,10 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
     x_hi = max(float(np.max(d)) for d, _e, _w in groups)
     ax.set_xlim(x_lo, x_hi)
     if np.isfinite(e_f):
-        ax.axhline(float(e_f), color="k", linestyle="--", linewidth=0.8, zorder=3)
+        ax.axhline(float(e_f) - shift, color="k", linestyle="--", linewidth=0.8,
+                   zorder=3)
         if lo <= float(e_f) <= hi:
-            ax.text(0.995, float(e_f), f"E_F = {float(e_f):.6f} eV",
+            ax.text(0.995, float(e_f) - shift, f"E_F = {float(e_f):.6f} eV",
                     transform=ax.get_yaxis_transform(), ha="right", va="bottom",
                     fontsize=8, color="k", zorder=4)
     for label, d in labels:
@@ -760,7 +768,7 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
         for label, d in labels:
             ax.axvline(-float(d), color="0.6", linewidth=0.6, zorder=1)
     ax.set_xlabel(K_PATH_AXIS_LABEL)
-    ax.set_ylabel("Energy (eV)")
+    ax.set_ylabel(ylabel)
     # 顶部横向 colorbar(用户参考截图的样式: 左 Low / 右 High, jet, 无刻度)。
     # 布局自上而下: 高对称点标签行 -> colorbar 行 -> 能带曲线区。
     # 色条与标签的位置都依赖主轴的最终位置 => 必须等 tight_layout 之后再算。
@@ -790,8 +798,8 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
             ax.text(-float(d), label_y, label,
                     transform=ax.get_xaxis_transform(),
                     ha="center", va="bottom", fontsize=9)
-    fig.text(0.5, 0.015, plot_caption(e_f, lo, hi), ha="center", va="bottom",
-             fontsize=8)
+    fig.text(0.5, 0.015, plot_caption(e_f, lo_abs, hi_abs), ha="center",
+             va="bottom", fontsize=8)
     return fig, ax
 
 
@@ -799,7 +807,8 @@ def _band_heatmap_figure(distances: np.ndarray, energies: np.ndarray,
                           weights: np.ndarray, labels: Sequence[Tuple[str, float]],
                           e_f: float, e_min: Optional[float] = None,
                           e_max: Optional[float] = None, mirror: bool = False,
-                          weight_scale: str = "linear", sigma: float = 0.06):
+                          weight_scale: str = "linear", sigma: float = 0.06,
+                          e_ref: str = "abs"):
     """画**谱函数热图** A(k,E) -> (fig, ax)。
 
     布局照用户给的参考截图：x = k-path 距离, y = 能量(eV), jet 配色,
@@ -818,8 +827,13 @@ def _band_heatmap_figure(distances: np.ndarray, energies: np.ndarray,
     dist = np.asarray(distances, dtype=float)
     energy = np.atleast_2d(np.asarray(energies, dtype=float))
     weight = np.atleast_2d(np.asarray(weights, dtype=float))
-    lo = e_min if e_min is not None else float(np.nanmin(energy))
-    hi = e_max if e_max is not None else float(np.nanmax(energy))
+    lo_abs = e_min if e_min is not None else float(np.nanmin(energy))
+    hi_abs = e_max if e_max is not None else float(np.nanmax(energy))
+    shift = float(e_f) if e_ref == "ef" else 0.0
+    if shift:
+        energy = energy - shift
+    lo, hi = lo_abs - shift, hi_abs - shift
+    ylabel = "Energy − E_F (eV)" if e_ref == "ef" else "Energy (eV)"
     step = max((hi - lo) / 1200.0, 1e-3)
     e_grid = np.arange(lo, hi + 0.5 * step, step)
 
@@ -849,7 +863,7 @@ def _band_heatmap_figure(distances: np.ndarray, energies: np.ndarray,
     x_hi = max(float(np.max(d)) for d, _e, _w in groups)
     ax.set_xlim(x_lo, x_hi)
     if np.isfinite(e_f) and lo <= float(e_f) <= hi:
-        ax.axhline(float(e_f), color="w", linestyle="--", linewidth=0.9,
+        ax.axhline(float(e_f) - shift, color="w", linestyle="--", linewidth=0.9,
                    zorder=3)
     # 高对称点标签: 在 x 轴**下面**(参考截图的样式); 没有数字 x 轴
     ax.set_xticks([])
@@ -863,7 +877,7 @@ def _band_heatmap_figure(distances: np.ndarray, energies: np.ndarray,
             ax.text(-float(d), -0.015, label,
                     transform=ax.get_xaxis_transform(),
                     ha="center", va="top", fontsize=10, color="k")
-    ax.set_ylabel("Energy (eV)")
+    ax.set_ylabel(ylabel)
     # 底部横向 colorbar(左 Low 右 High, 无刻度) —— 参考截图的样式
     fig.subplots_adjust(bottom=0.26, top=0.90)
     pos = ax.get_position()
