@@ -1033,10 +1033,11 @@ def _add_band_args(p: argparse.ArgumentParser) -> None:
                    help="PNG 的画法: line = 加权能带线图(默认); "
                         "heatmap = A(k,E) 谱函数热图(x=k-path, y=能量, 颜色=权重, "
                         "底部色条, 与论文里常见的展开能带热图同款)")
-    p.add_argument("--weight-scale", choices=("linear", "log"),
+    p.add_argument("--weight-scale", choices=("linear", "sqrt", "log"),
                    default="linear",
-                   help="PNG 的颜色标度: linear = 全局 w/w_max(默认); "
-                        "log = log10(w) 映射(权重跨量级时用, 否则 E_F 附近全是深蓝)")
+                   help="PNG 的颜色标度: linear = w/w_max; sqrt = sqrt(w/w_max)"
+                        "(强带亮、弱副本暗但可见, 推荐); log = log10(w) 映射"
+                        "(会把弱副本抬成高权重)")
     p.add_argument("--no-plot", action="store_true",
                    help="不画 PNG(不需要 matplotlib)")
 

@@ -1328,3 +1328,17 @@ def test_band_color_scale_mask_may_be_broadcast():
     cols = band._band_figure_colors(w, "linear", mask=mask)
     assert cols[2] == pytest.approx(1.0)      # 0.5 / 0.5
     assert cols[3] == pytest.approx(0.5)      # 0.25 / 0.5
+
+
+def test_band_color_scale_supports_sqrt():
+    """sqrt 标度 = 强带亮、弱副本暗但可见(两种极端之间的"中间")。"""
+    w = np.array([[1.0, 0.25, 0.0]])
+    cols = band._band_figure_colors(w, "sqrt")
+    assert cols[0] == pytest.approx(1.0)
+    assert cols[1] == pytest.approx(0.5)      # sqrt(0.25)
+    assert cols[2] == pytest.approx(0.0)
+
+
+def test_band_color_scale_rejects_an_unknown_name():
+    with pytest.raises(ValueError):
+        band._band_figure_colors(np.array([[1.0, 2.0]]), "cubic")
