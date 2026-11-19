@@ -608,6 +608,56 @@ def test_plot_caption_reports_the_drawn_window():
         "E_F = 0.500000 eV; E_plot = [-1.000, 4.000] eV"
 
 
+# ------------------------------------------------------------------ 颜色标度
+#
+# 权重是**投影量**, 绝对值在不同带之间差很多(实测 1T-TaS2 的 3x1x1 展开能带:
+# +10.8 eV 那条强局域平带 w=9.23, 而 E_F 附近的带只有 0.26~1.12) =>
+# 全局线性色标 (w/w_max) 会把 E_F 附近压到色标的 3%~12% => 图上"没有颜色"。
+# => 增加 log 色标: log10(w) 在 [w_min+, w_max] 上线性映射到 0~1。
+
+def _segments_and_colors(weight, scale):
+    """复算 _band_figure 内部的段与颜色(测试用)。"""
+    return band._band_figure_colors(np.asarray(weight, dtype=float), scale)
+
+
+def test_band_linear_color_scale_is_the_global_max_normalization():
+    w = np.array([[1.0, 2.0], [0.25, 0.5]])
+    cols = _segments_and_colors(w, "linear")
+    assert list(cols) == pytest.approx([0.5, 1.0, 0.125, 0.25])   # w / 全局 max
+
+
+def test_band_log_color_scale_spreads_a_skewed_distribution():
+    w = np.array([[1.0, 9.0], [0.1, 0.01]])
+    cols = _segments_and_colors(w, "log")
+    # log10(w) 在 [w_min+ = 0.01, w_max = 9] 上线性映射到 0~1
+    span = np.log10(9.0) - np.log10(0.01)
+    assert cols[1] == pytest.approx(1.0)                       # w = 9   -> 1
+    assert cols[3] == pytest.approx(0.0)                       # w = 0.01-> 0
+    assert cols[0] == pytest.approx((0.0 + 2.0) / span)        # w = 1
+    assert cols[2] == pytest.approx((-1.0 + 2.0) / span)       # w = 0.1
+
+
+
+def test_band_log_color_scale_survives_zero_weights():
+    w = np.array([[0.0, 0.0], [0.0, 4.0]])
+    cols = _segments_and_colors(w, "log")
+    assert all(0.0 <= c <= 1.0 for c in cols)
+    assert cols[-1] == pytest.approx(1.0)
+
+
+def test_band_color_scale_rejects_an_unknown_name():
+    with pytest.raises(ValueError):
+        _segments_and_colors(np.array([[1.0, 2.0]]), "sqrt")
+
+
+def test_band_weight_scale_skew_is_reported():
+    """权重跨了 1.5 个量级以上 => 必须提醒(w/w_max 的线性色标会糊掉)。"""
+    w = np.array([[1.0, 900.0], [0.01, 0.02]])      # max/median = 1764
+    assert band.weight_scale_is_skewed(w)
+    assert not band.weight_scale_is_skewed(np.array([[1.0, 2.0], [0.5, 1.5]]))
+
+
+
 # ------------------------------------------------------------------ 顶部色条
 #
 # 用户在自己的参考截图里用的是「顶部横向 colorbar + 左 Low 右 High + 无刻度」

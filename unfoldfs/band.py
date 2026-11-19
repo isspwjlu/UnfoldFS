@@ -521,18 +521,73 @@ def _require_matplotlib():
     return matplotlib
 
 
+def _band_figure_colors(weight: np.ndarray, scale: str = "linear") -> np.ndarray:
+    """把 (n_band, n_k) 的权重矩阵变成 0~1 的颜色值(按行优先展平)。
+
+    * ``linear``：``w / max(w)``（全局）—— 原来的做法；
+    * ``log``：``log10(w)`` 在 ``[w_min⁺, w_max]`` 上线性映射到 0~1（w = 0 -> 0）。
+
+    为什么要 ``log``：权重是**投影量**, 绝对值在不同带之间可以差两个量级
+    （实测 1T-TaS₂ 的 3×1×1 展开能带：+10.8 eV 那条强局域平带 w = 9.23，
+    而 E_F 附近的带只有 0.26~1.12）⇒ 全局线性色标会把 E_F 附近压到
+    色标的 3%~12% ⇒ 图上"看不到权重"。
+
+    """
+    w = np.asarray(weight, dtype=float)
+    if scale not in ("linear", "log"):
+        raise ValueError(
+            f"weight_scale 只能是 'linear' 或 'log', 给出 {scale!r}")
+    flat = w.ravel()
+    if flat.size == 0:
+        return np.zeros(0)
+    if scale == "linear":
+        wmax = float(np.max(flat))
+        if wmax <= 0:
+            return np.zeros(flat.size)
+        return flat / wmax
+    pos = flat[flat > 0]
+    if pos.size == 0:
+        return np.zeros(flat.size)
+    wmax = float(np.max(pos))
+    wmin = float(np.min(pos))
+    if wmax <= wmin:                     # 只有一个非零值 => 它就是满格
+        return np.where(flat > 0, 1.0, 0.0)
+    lo, hi = np.log10(wmin), np.log10(wmax)
+    out = np.zeros(flat.size)
+    m = flat > 0
+    out[m] = (np.log10(flat[m]) - lo) / (hi - lo)
+    return out
+
+
+def weight_scale_is_skewed(weight: np.ndarray, factor: float = 30.0) -> bool:
+    """权重是否跨了 1.5 个量级以上（=> 全局线性色标会把大多数带压成深蓝）。
+
+    判据：``max(w) / median(w>0) >= factor``。实测 1T-TaS₂：3×1×1 展开能带
+    **175.6**、原胞直通 **76.2**（都会触发提醒）；量级相近的常规情形不会。
+    """
+    w = np.asarray(weight, dtype=float)
+    pos = w[w > 0]
+    if pos.size == 0:
+        return False
+    return float(np.max(pos)) / float(np.median(pos)) >= factor
+
+
 def plot_band(distances: np.ndarray, energies: np.ndarray, weights: np.ndarray,
               labels: Sequence[Tuple[str, float]], e_f: float,
               out_path: str, e_min: Optional[float] = None,
-              e_max: Optional[float] = None, mirror: bool = False) -> str:
+              e_max: Optional[float] = None, mirror: bool = False,
+              weight_scale: str = "linear") -> str:
     """画 E-vs-路径距离 的加权能带图, 存成 PNG。
 
     画图本身在 ``_band_figure``, 图注在 ``plot_caption``。
+    ``weight_scale``: ``linear``（全局 w/w_max）或 ``log``（见
+    ``_band_figure_colors``）。
     """
     _require_matplotlib()
     import matplotlib.pyplot as plt
     fig, _ax = _band_figure(distances, energies, weights, labels, e_f,
-                             e_min=e_min, e_max=e_max, mirror=mirror)
+                             e_min=e_min, e_max=e_max, mirror=mirror,
+                             weight_scale=weight_scale)
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
     return out_path
@@ -551,7 +606,8 @@ def plot_caption(e_f: float, e_lo: float, e_hi: float) -> str:
 def _band_figure(distances: np.ndarray, energies: np.ndarray,
                  weights: np.ndarray, labels: Sequence[Tuple[str, float]],
                  e_f: float, e_min: Optional[float] = None,
-                 e_max: Optional[float] = None, mirror: bool = False):
+                 e_max: Optional[float] = None, mirror: bool = False,
+                 weight_scale: str = "linear"):
     """画 E-vs-路径距离 的加权能带图 -> (fig, ax)。
 
     * 按权重着色(jet, 与 MATLAB 脚本的 ``colormap('jet')`` 同风格)并用线宽
@@ -561,7 +617,9 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
     * 图注写明**画出来的**能量窗口(E_plot_min / E_plot_max)(同上);
     * x 轴的单位是 **2π/Å**(与 ``MOMENTUM.grd`` / ``KLABELS`` 一致;
       修复轮 7 / B2 —— 旧实现写的是 "1/Angstrom", 与本工具其它输出矛盾);
-    * ``mirror=True`` 时把镜像路径(距离取负、顺序反过来)也画上。
+    * ``mirror=True`` 时把镜像路径(距离取负、顺序反过来)也画上;
+    * ``weight_scale``: ``linear``（全局 w/w_max）或 ``log``（见
+      ``_band_figure_colors`` —— 权重跨量级时用 log 才看得到颜色）。
     """
     _require_matplotlib()
     import matplotlib.pyplot as plt
@@ -575,12 +633,12 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
 
     def _segments(d: np.ndarray, e: np.ndarray, w: np.ndarray):
         segs, cols = [], []
-        wmax = float(np.max(w)) if w.size else 0.0
+        # 颜色按**点**算(与 _band_figure_colors 同一口径), 段上取两端平均
+        pt = _band_figure_colors(w, weight_scale).reshape(w.shape)
         for b in range(e.shape[0]):
             for j in range(e.shape[1] - 1):
                 segs.append([(d[j], e[b, j]), (d[j + 1], e[b, j + 1])])
-                wm = 0.5 * (w[b, j] + w[b, j + 1])
-                cols.append(wm / wmax if wmax > 0 else 0.0)
+                cols.append(0.5 * (pt[b, j] + pt[b, j + 1]))
         return segs, cols
 
     fig, ax = plt.subplots(figsize=(6.0, 4.5))
@@ -629,7 +687,9 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
     cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
     cb.set_ticks([])
     cb.outline.set_visible(False)
-    cax.set_xlabel("spectral weight", fontsize=8, labelpad=1)
+    cax.set_xlabel("spectral weight"
+                   + (" (log scale)" if weight_scale == "log" else ""),
+                   fontsize=8, labelpad=1)
     cax.text(-0.008, 0.5, "Low", transform=cax.transAxes, ha="right",
              va="center", fontsize=9)
     cax.text(1.008, 0.5, "High", transform=cax.transAxes, ha="left",

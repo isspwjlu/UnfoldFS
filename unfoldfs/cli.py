@@ -32,6 +32,7 @@ import numpy as np
 
 from .band import (assemble_band, dedup_k_points, path_distances, path_labels,
                    path_to_super_k, plot_band, read_klabels, read_kpath,
+                   weight_scale_is_skewed,
                    symmetrize_band_weights,
                    write_band_dat, write_grd, write_klabels,
                    write_kpoints_explicit)
@@ -839,9 +840,15 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
         print("已跳过        : PNG(--no-plot)")
         return 0
     png_path = os.path.join(outdir, "unfolded_band.png")
+    weight_scale = getattr(args, "weight_scale", "linear")
+    if weight_scale == "linear" and weight_scale_is_skewed(weight):
+        print("提示          : 权重跨了 1.5 个量级以上(max/中位 >= 30) —— "
+              "线性色标(w/w_max)会把绝大多数带压成深蓝, 看不到权重。"
+              "建议加 --weight-scale log")
     try:
         plot_band(dist, energy, weight, labels, e_f=e_f, out_path=png_path,
-                  e_min=args.e_min, e_max=args.e_max, mirror=args.mirror)
+                  e_min=args.e_min, e_max=args.e_max, mirror=args.mirror,
+                  weight_scale=weight_scale)
     except ValueError as exc:
         raise ValueError(
             f"{exc}\n      (四个 vaspkit 文件已经写好了, 只是画不出 PNG)") from exc
@@ -996,6 +1003,10 @@ def _add_band_args(p: argparse.ArgumentParser) -> None:
                    help="**不做**点群轨道对称化: 路径上对称相关点的展开谱权重"
                         "保持原始值(见 docs/algorithms.md §16.7)。默认是对称化"
                         "后的")
+    p.add_argument("--weight-scale", choices=("linear", "log"),
+                   default="linear",
+                   help="PNG 的颜色标度: linear = 全局 w/w_max(默认); "
+                        "log = log10(w) 映射(权重跨量级时用, 否则 E_F 附近全是深蓝)")
     p.add_argument("--no-plot", action="store_true",
                    help="不画 PNG(不需要 matplotlib)")
 
