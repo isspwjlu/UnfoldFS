@@ -1251,3 +1251,56 @@ def test_band_heatmap_figure_has_an_image_and_a_colorbar():
         texts += [t.get_text() for t in extra.texts]
     assert any("Low" in t for t in texts), texts
     assert any("High" in t for t in texts), texts
+
+
+# ------------------------------------------------------------------ 展开模式
+#
+# 经典 Popescu 展开能带图: 每个路径点画**全部**超胞带, 颜色 = 该带在"匹配
+# 候选通道"上的权重 => 强带 = 原胞在 k' 的带, 弱带 = 别的 k' 的带(折叠副本),
+# 于是谱有"低权重色散"的弥散背景。
+# 旧实现("assign")只画**归属到匹配候选**的带 => 图看起来就是原胞的能带,
+# 没有弱副本、没有弥散度。
+
+def test_assemble_band_full_mode_keeps_every_band_with_the_matching_weight():
+    """full 模式: 带的条数 = 超胞的总带数, 权重取自匹配通道。"""
+    from unfoldfs import unfold as U
+    # 2 个候选, 每个候选 2 条带; 超胞一共 4 条带
+    k_cand = np.array([[[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]]])
+    energies = np.array([[[1.0, 2.0], [3.0, 4.0]]])       # (1, detM, 2)
+    weights = np.array([[[0.9, 0.1], [0.2, 0.8]]])
+    valid = np.ones((1, 2, 2), dtype=bool)
+    res = U.UnfoldedResult(k_cand=k_cand, energies=energies, weights=weights,
+                            valid=valid,
+                            band_energies=np.array([[1.0, 2.0, 3.0, 4.0]]),
+                            band_weights=np.array([[[0.9, 0.1, 0.2, 0.8],
+                                                    [0.05, 0.05, 0.8, 0.8]]]))
+    # 路径点 k' = (0,0,0) => 匹配的候选是 0
+    e, w = band.assemble_band(res, np.array([[0.0, 0.0, 0.0]]), mode="full")
+    assert e.shape == (4, 1)
+    assert list(e[:, 0]) == [1.0, 2.0, 3.0, 4.0]
+    # 权重取的是**匹配通道**(候选 0)那一列
+    assert list(w[:, 0]) == [0.9, 0.1, 0.2, 0.8]
+
+
+def test_assemble_band_assign_mode_only_keeps_the_assigned_bands():
+    from unfoldfs import unfold as U
+    k_cand = np.array([[[0.0, 0.0, 0.0], [0.5, 0.0, 0.0]]])
+    energies = np.array([[[1.0, 2.0], [3.0, 4.0]]])
+    weights = np.array([[[0.9, 0.1], [0.2, 0.8]]])
+    valid = np.ones((1, 2, 2), dtype=bool)
+    res = U.UnfoldedResult(k_cand=k_cand, energies=energies, weights=weights,
+                            valid=valid)
+    e, w = band.assemble_band(res, np.array([[0.0, 0.0, 0.0]]),
+                              mode="assign")
+    assert e.shape == (2, 1)          # 只有归属到候选 0 的两条
+    assert list(e[:, 0]) == [1.0, 2.0]
+
+
+def test_assemble_band_rejects_an_unknown_mode():
+    from unfoldfs import unfold as U
+    res = U.UnfoldedResult(k_cand=np.zeros((1, 1, 3)),
+                            energies=np.zeros((1, 1, 1)),
+                            weights=np.zeros((1, 1, 1)),
+                            valid=np.ones((1, 1, 1), dtype=bool))
+    with pytest.raises(ValueError):
+        band.assemble_band(res, np.array([[0.0, 0.0, 0.0]]), mode="nope")

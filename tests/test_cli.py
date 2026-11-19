@@ -1307,3 +1307,10 @@ def test_symprec_option_defaults_to_1e_5_and_is_passed_through():
     assert parser.parse_args(["unfold", "--dir", "x"]).symprec == 1e-5
     assert parser.parse_args(
         ["band", "--dir", "x", "--symprec", "1e-4"]).symprec == 1e-4
+
+
+def test_band_unfold_mode_flag_defaults_to_assign_and_accepts_full():
+    parser = cli.build_parser()
+    assert parser.parse_args(["band", "--dir", "x"]).unfold_mode == "assign"
+    assert parser.parse_args(
+        ["band", "--dir", "x", "--unfold-mode", "full"]).unfold_mode == "full"
