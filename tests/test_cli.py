@@ -1281,7 +1281,7 @@ def test_band_weight_scale_flag_defaults_to_linear_and_accepts_log():
 def test_band_weight_scale_rejects_an_unknown_value():
     parser = cli.build_parser()
     with pytest.raises(SystemExit):
-        parser.parse_args(["band", "--dir", "x", "--weight-scale", "sqrt"])
+        parser.parse_args(["band", "--dir", "x", "--weight-scale", "cubic"])
 
 
 def test_band_plot_style_flag_defaults_to_line_and_accepts_heatmap():

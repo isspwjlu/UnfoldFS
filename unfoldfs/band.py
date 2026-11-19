@@ -545,6 +545,7 @@ def _band_figure_colors(weight: np.ndarray, scale: str = "linear",
     """把 (n_band, n_k) 的权重矩阵变成 0~1 的颜色值(按行优先展平)。
 
     * ``linear``：``w / max(w)``；
+    * ``sqrt``：``sqrt(w / max(w))`` —— **强带亮、弱副本暗但可见**的"中间"标度；
     * ``log``：``log10(w)`` 在 ``[w_min⁺, w_max]`` 上线性映射到 0~1（w = 0 -> 0）。
 
     ``mask``: (n_band, n_k) 的布尔掩码, 指出**哪些条目参与定标度**(其余条目
@@ -559,9 +560,9 @@ def _band_figure_colors(weight: np.ndarray, scale: str = "linear",
     **按画窗归一化的线性色标**最合适。
     """
     w = np.asarray(weight, dtype=float)
-    if scale not in ("linear", "log"):
+    if scale not in ("linear", "sqrt", "log"):
         raise ValueError(
-            f"weight_scale 只能是 'linear' 或 'log', 给出 {scale!r}")
+            f"weight_scale 只能是 'linear' / 'sqrt' / 'log', 给出 {scale!r}")
     flat = w.ravel()
     if flat.size == 0:
         return np.zeros(0)
@@ -575,11 +576,12 @@ def _band_figure_colors(weight: np.ndarray, scale: str = "linear",
                 m = None
         if m is not None and m.any():
             sel = flat[m.ravel()]
-    if scale == "linear":
+    if scale in ("linear", "sqrt"):
         wmax = float(np.max(sel)) if sel.size else 0.0
         if wmax <= 0:
             return np.zeros(flat.size)
-        return np.clip(flat / wmax, 0.0, 1.0)
+        rel = np.clip(flat / wmax, 0.0, 1.0)
+        return np.sqrt(rel) if scale == "sqrt" else rel
     pos = sel[sel > 0]
     if pos.size == 0:
         return np.zeros(flat.size)
@@ -827,6 +829,11 @@ def _band_heatmap_figure(distances: np.ndarray, energies: np.ndarray,
     if mirror:
         groups.append(mirror_path(dist, energy, weight))
     for d, e, w in groups:
+        # 路径的相邻段共享端点 => 同一个 k 出现两次 => pcolormesh 会画出退化格
+        # (灰条)。重复的两列数据完全相同, 直接去重即可。
+        keep = (np.concatenate([[True], np.diff(d) > 0]) if d.size
+                else np.zeros(0, dtype=bool))
+        d, e, w = d[keep], e[:, keep], w[:, keep]
         # 每条带的**颜色**先归一化(与线图同一口径), 再展宽 => 0~1 有界
         # 掩码: 只有**能量落在画窗内**的带参与定标度 ⇒ 窗外那条权重极大的
         # 强局域带(实测 1T-TaS2 的 +10.8 eV 平带 w = 9.23)不会把整幅图压暗
