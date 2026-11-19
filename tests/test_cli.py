@@ -1295,3 +1295,15 @@ def test_band_plot_style_rejects_an_unknown_value():
     parser = cli.build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["band", "--dir", "x", "--plot-style", "3d"])
+
+
+def test_symprec_option_defaults_to_1e_5_and_is_passed_through():
+    """结构坐标有 1e-5 级噪声时, spglib 会漏掉大部分对称操作。
+
+    实测 1H-NbSe2 单层(用户组的 POSCAR): symprec=1e-5 -> 只认出 4 个操作(Amm2),
+    symprec=1e-4 -> 12 个(P-6m2 = D3h) => 对称化必须能用更松的容差。
+    """
+    parser = cli.build_parser()
+    assert parser.parse_args(["unfold", "--dir", "x"]).symprec == 1e-5
+    assert parser.parse_args(
+        ["band", "--dir", "x", "--symprec", "1e-4"]).symprec == 1e-4
