@@ -716,7 +716,7 @@ A(k,E_F) 峰值 / 全局峰值 = 0.134
 | `WEIGHT.grd` | (n_band, n_k) 权重 | 同上 |
 | `KLABELS` | 高对称点的标签 + 距离 | 同上 |
 | `unfolded_band.dat` | 长表：路径距离 / E(eV) / 权重 / 带号 | 自用（二次分析） |
-| `unfolded_band.png` | matplotlib 画的加权能带图（x 轴 = `k-path (2π/Å)`；图上标出 E_F 的**数值**；图注给出**画出来的**能量窗口 `E_plot`） | 自用（没有 MATLAB 时） |
+| `unfolded_band.png` | matplotlib 画的加权能带图（x 轴 = `k-path (2π/Å)`；**顶部一条横向 colorbar：左 Low 右 High、jet 配色、无数值刻度，颜色 = 归一化后的谱权重**；高对称点标签在色条**上方**；图上标出 E_F 的**数值**；图注给出**画出来的**能量窗口 `E_plot`） | 自用（没有 MATLAB 时） |
 
 **前四个的文件名与布局与 vaspkit 完全一致** ⇒ 用户组现有的 MATLAB 脚本
 （`unfold_band_plot_mirror.m`）**不改一行**就能画我们的数据。

@@ -227,7 +227,7 @@ unfoldfs band --dir run/ --outdir bandfs/ [--ef auto|vbm|doscar|数值]
 | `WEIGHT.grd` | (n_band, n_k) 权重 |
 | `KLABELS` | 高对称点的标签 + 距离（**与 vaspkit 逐字节同格式**） |
 | `unfolded_band.dat` | 长表：路径距离 / E(eV) / 权重 / 带号（自用） |
-| `unfolded_band.png` | 加权能带图（x 轴 = `k-path (2π/Å)`；图上标 E_F 的数值；图注给 `E_plot` 窗口）（自用，需 matplotlib） |
+| `unfolded_band.png` | 加权能带图（x 轴 = `k-path (2π/Å)`；**顶部横向 colorbar：左 Low 右 High、jet 配色、无数值刻度，颜色 = 归一化谱权重**；图上标 E_F 的数值；图注给 `E_plot` 窗口）（自用，需 matplotlib） |
 
 前四个**就是 vaspkit 的文件名与布局** ⇒ 用户组现有的 MATLAB 脚本
 （`unfold_band_plot_mirror.m`）**不改一行**直接能画我们的数据。
@@ -409,7 +409,7 @@ E_F           : -2.026108 eV  (--ef auto, --delta 0.05)
 | `WEIGHT.grd` | 同上 | (n_band, n_k) 权重（**Popescu G 分辨权重，不归一**） |
 | `KLABELS` | 同上 | 高对称点的标签 + 距离（**与 vaspkit 逐字节同格式**） |
 | `unfolded_band.dat` | 自用 / 二次分析 | 长表：路径距离 / E(eV) / 权重 / 带号 |
-| `unfolded_band.png` | 自用 | 加权能带图（x 轴 = `k-path (2π/Å)`；标 E_F 数值；图注给 `E_plot` 窗口）（需 matplotlib） |
+| `unfolded_band.png` | 自用 | 加权能带图（x 轴 = `k-path (2π/Å)`；**顶部横向 colorbar：左 Low 右 High、jet 配色、无数值刻度**；标 E_F 数值；图注给 `E_plot` 窗口）（需 matplotlib） |
 
 前四个与 vaspkit **同名同布局** ⇒ 那个 MATLAB 脚本不改一行就能画。
 逐字段规范见 [`docs/formats.md`](docs/formats.md) §13。

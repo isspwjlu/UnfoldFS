@@ -608,6 +608,75 @@ def test_plot_caption_reports_the_drawn_window():
         "E_F = 0.500000 eV; E_plot = [-1.000, 4.000] eV"
 
 
+# ------------------------------------------------------------------ 顶部色条
+#
+# 用户在自己的参考截图里用的是「顶部横向 colorbar + 左 Low 右 High + 无刻度」
+# 的样式(截图已核实)。本组测试锁住这条要求:
+#   * 色条存在、在主坐标区**上方**、与主轴**同宽**、是横向细条;
+#   * 左右有 "Low" / "High";
+#   * **无数值刻度**;
+#   * 高对称点标签在色条**上面**(两者不许重叠)。
+
+def _colorbar_axes(fig, ax):
+    """返回 (色条坐标区, 主坐标区); 没有色条则第一个元素为 None。"""
+    others = [a for a in fig.axes if a is not ax]
+    if not others:
+        return None, ax
+    # 色条是那个又宽又扁的轴
+    cax = max(others, key=lambda a: a.get_position().width)
+    return cax, ax
+
+
+def test_plot_band_draws_a_horizontal_colorbar_above_the_axes():
+    pytest.importorskip("matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
+    dist, energy, weight, labels = _dummy_band_data()
+    fig, ax = band._band_figure(dist, energy, weight, labels, e_f=0.5)
+    cax, _ = _colorbar_axes(fig, ax)
+    assert cax is not None, "图里没有色条坐标区"
+    p_ax = ax.get_position()
+    p_cb = cax.get_position()
+    assert p_cb.y0 > p_ax.y1, "色条必须画在主坐标区上方"
+    assert abs(p_cb.width - p_ax.width) < 0.02, "色条应与主坐标区同宽"
+    assert p_cb.height < 0.08 and p_cb.width > 0.3, "色条应是横向的细条"
+
+
+def test_plot_band_colorbar_is_labelled_low_high_without_numeric_ticks():
+    pytest.importorskip("matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
+    dist, energy, weight, labels = _dummy_band_data()
+    fig, ax = band._band_figure(dist, energy, weight, labels, e_f=0.5)
+    cax, _ = _colorbar_axes(fig, ax)
+    assert cax is not None
+    texts = [t.get_text() for t in list(fig.texts) + list(cax.texts)]
+    assert "Low" in texts, texts
+    assert "High" in texts, texts
+    assert len(cax.get_xticks()) == 0, "色条不该有数值刻度"
+
+
+def test_plot_band_symmetry_labels_are_above_the_colorbar():
+    """高对称点标签(M Γ M)必须在色条**上面**, 不许被色条压住。"""
+    pytest.importorskip("matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
+    dist, energy, weight, labels = _dummy_band_data()
+    fig, ax = band._band_figure(dist, energy, weight, labels, e_f=0.5)
+    cax, _ = _colorbar_axes(fig, ax)
+    assert cax is not None
+    p_ax = ax.get_position()
+    p_cb = cax.get_position()
+    # 色条顶边换算成主轴的 y 坐标(主轴的 y 坐标是 0~1)
+    cb_top_axes = (p_cb.y1 - p_ax.y0) / p_ax.height
+    label_ys = [t.get_position()[1] for t in ax.texts
+                if t.get_text() in ("M", "GAMMA")]
+    assert label_ys, "没找到高对称点标签"
+    assert min(label_ys) > cb_top_axes, \
+        "高对称点标签必须在色条上方: %s vs %s" % (label_ys, cb_top_axes)
+
+
+
 # ------------------------------------------------------------------ CLI
 
 _A_PRIM = np.diag([3.0, 4.0, 5.0])

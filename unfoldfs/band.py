@@ -565,7 +565,9 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
     """
     _require_matplotlib()
     import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
     from matplotlib.collections import LineCollection
+    from matplotlib.colors import Normalize
 
     dist = np.asarray(distances, dtype=float)
     energy = np.atleast_2d(np.asarray(energies, dtype=float))
@@ -610,16 +612,38 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
                     fontsize=8, color="k", zorder=4)
     for label, d in labels:
         ax.axvline(float(d), color="0.6", linewidth=0.6, zorder=1)
-        ax.text(float(d), 1.01, label, transform=ax.get_xaxis_transform(),
-                ha="center", va="bottom", fontsize=9)
     if mirror:
         for label, d in labels:
             ax.axvline(-float(d), color="0.6", linewidth=0.6, zorder=1)
-            ax.text(-float(d), 1.01, label, transform=ax.get_xaxis_transform(),
-                    ha="center", va="bottom", fontsize=9)
     ax.set_xlabel(K_PATH_AXIS_LABEL)
     ax.set_ylabel("Energy (eV)")
-    fig.tight_layout(rect=(0.0, 0.06, 1.0, 1.0))
+    # 顶部横向 colorbar(用户参考截图的样式: 左 Low / 右 High, jet, 无刻度)。
+    # 布局自上而下: 高对称点标签行 -> colorbar 行 -> 能带曲线区。
+    # 色条与标签的位置都依赖主轴的最终位置 => 必须等 tight_layout 之后再算。
+    # 右侧留 8% 给色条右端的 "High"(否则它会被画布边缘裁掉)。
+    fig.tight_layout(rect=(0.0, 0.06, 0.92, 0.86))
+    pos = ax.get_position()
+    cax = fig.add_axes([pos.x0, pos.y1 + 0.040, pos.width, 0.018])
+    sm = ScalarMappable(norm=Normalize(0.0, 1.0), cmap=cmap)
+    sm.set_array(np.linspace(0.0, 1.0, 256))
+    cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
+    cb.set_ticks([])
+    cb.outline.set_visible(False)
+    cax.set_xlabel("spectral weight", fontsize=8, labelpad=1)
+    cax.text(-0.008, 0.5, "Low", transform=cax.transAxes, ha="right",
+             va="center", fontsize=9)
+    cax.text(1.008, 0.5, "High", transform=cax.transAxes, ha="left",
+             va="center", fontsize=9)
+    # 高对称点标签: 放在色条**上方**(坐标是主轴的 y 坐标 0~1)
+    label_y = (cax.get_position().y1 - pos.y0) / pos.height + 0.012
+    for label, d in labels:
+        ax.text(float(d), label_y, label, transform=ax.get_xaxis_transform(),
+                ha="center", va="bottom", fontsize=9)
+    if mirror:
+        for label, d in labels:
+            ax.text(-float(d), label_y, label,
+                    transform=ax.get_xaxis_transform(),
+                    ha="center", va="bottom", fontsize=9)
     fig.text(0.5, 0.015, plot_caption(e_f, lo, hi), ha="center", va="bottom",
              fontsize=8)
     return fig, ax
