@@ -1342,3 +1342,30 @@ def test_band_color_scale_supports_sqrt():
 def test_band_color_scale_rejects_an_unknown_name():
     with pytest.raises(ValueError):
         band._band_figure_colors(np.array([[1.0, 2.0]]), "cubic")
+
+
+def test_band_e_ref_shifts_the_png_axis_to_ef_zero():
+    """--e-ref ef: PNG 的 y 轴 = E - E_F(0 在 E_F 处), .grd/.dat 仍是绝对能量。"""
+    pytest.importorskip("matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
+    dist, energy, weight, labels = _dummy_band_data()
+    fig, ax = band._band_figure(dist, energy, weight, labels, e_f=0.5,
+                                 e_min=-1.0, e_max=4.0, e_ref="ef")
+    assert ax.get_ylabel() == "Energy − E_F (eV)"
+    # E_F = 0.5 => 画出来的坐标要整体减 0.5
+    assert ax.get_ylim() == pytest.approx((-1.5, 3.5))
+    # E_F 处的虚线落在 0
+    line = [ln for ln in ax.lines if ln.get_linestyle() == "--"][0]
+    assert list(line.get_ydata()) == pytest.approx([0.0, 0.0])
+
+
+def test_band_e_ref_abs_is_the_default():
+    pytest.importorskip("matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
+    dist, energy, weight, labels = _dummy_band_data()
+    fig, ax = band._band_figure(dist, energy, weight, labels, e_f=0.5,
+                                 e_min=-1.0, e_max=4.0)
+    assert ax.get_ylabel() == "Energy (eV)"
+    assert ax.get_ylim() == pytest.approx((-1.0, 4.0))
