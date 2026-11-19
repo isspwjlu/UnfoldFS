@@ -1282,3 +1282,16 @@ def test_band_weight_scale_rejects_an_unknown_value():
     parser = cli.build_parser()
     with pytest.raises(SystemExit):
         parser.parse_args(["band", "--dir", "x", "--weight-scale", "sqrt"])
+
+
+def test_band_plot_style_flag_defaults_to_line_and_accepts_heatmap():
+    parser = cli.build_parser()
+    assert parser.parse_args(["band", "--dir", "x"]).plot_style == "line"
+    assert parser.parse_args(
+        ["band", "--dir", "x", "--plot-style", "heatmap"]).plot_style == "heatmap"
+
+
+def test_band_plot_style_rejects_an_unknown_value():
+    parser = cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["band", "--dir", "x", "--plot-style", "3d"])

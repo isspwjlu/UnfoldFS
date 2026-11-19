@@ -848,7 +848,8 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
     try:
         plot_band(dist, energy, weight, labels, e_f=e_f, out_path=png_path,
                   e_min=args.e_min, e_max=args.e_max, mirror=args.mirror,
-                  weight_scale=weight_scale)
+                  weight_scale=weight_scale,
+                  style=getattr(args, "plot_style", "line"))
     except ValueError as exc:
         raise ValueError(
             f"{exc}\n      (四个 vaspkit 文件已经写好了, 只是画不出 PNG)") from exc
@@ -1003,6 +1004,10 @@ def _add_band_args(p: argparse.ArgumentParser) -> None:
                    help="**不做**点群轨道对称化: 路径上对称相关点的展开谱权重"
                         "保持原始值(见 docs/algorithms.md §16.7)。默认是对称化"
                         "后的")
+    p.add_argument("--plot-style", choices=("line", "heatmap"), default="line",
+                   help="PNG 的画法: line = 加权能带线图(默认); "
+                        "heatmap = A(k,E) 谱函数热图(x=k-path, y=能量, 颜色=权重, "
+                        "底部色条, 与论文里常见的展开能带热图同款)")
     p.add_argument("--weight-scale", choices=("linear", "log"),
                    default="linear",
                    help="PNG 的颜色标度: linear = 全局 w/w_max(默认); "

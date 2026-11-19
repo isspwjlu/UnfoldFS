@@ -572,22 +572,63 @@ def weight_scale_is_skewed(weight: np.ndarray, factor: float = 30.0) -> bool:
     return float(np.max(pos)) / float(np.median(pos)) >= factor
 
 
+def band_spectral_function(distances: np.ndarray, energies: np.ndarray,
+                           weights: np.ndarray, e_grid: np.ndarray,
+                           sigma: float) -> np.ndarray:
+    """沿 k 路径的**谱函数** A(k,E) = Σ_b w_b(k)·exp(−(E−E_b(k))²/2σ²)。
+
+    返回 (n_E, n_k)。这是"热图风格"的展开能带图画的东西：x = 路径距离,
+    y = 能量, 颜色 = 谱权重（与网格模式 `unfold` 的 A(k,E) 同一个定义 ✓）。
+
+    ``energies`` / ``weights`` 是 (n_band, n_k)；带数不足的行(补位槽)按
+    能量 0、权重 0 处理 ⇒ 不贡献 ✓。
+    """
+    e = np.atleast_1d(np.asarray(e_grid, dtype=float))
+    en = np.atleast_2d(np.asarray(energies, dtype=float))
+    w = np.atleast_2d(np.asarray(weights, dtype=float))
+    if en.shape != w.shape:
+        raise ValueError(f"energies {en.shape} 与 weights {w.shape} 形状不一致")
+    sigma = float(sigma)
+    if not sigma > 0.0:
+        raise ValueError(f"sigma 必须为正, 给出 {sigma}")
+    valid = np.isfinite(en)
+    en = np.where(valid, en, 0.0)
+    w = np.where(valid, w, 0.0)
+    out = np.zeros((e.size, en.shape[1]))
+    for j in range(en.shape[1]):
+        d = e[:, None] - en[:, j][None, :]
+        out[:, j] = (np.exp(-d * d / (2.0 * sigma * sigma))
+                     * w[:, j][None, :]).sum(axis=1)
+    return out
+
+
 def plot_band(distances: np.ndarray, energies: np.ndarray, weights: np.ndarray,
               labels: Sequence[Tuple[str, float]], e_f: float,
               out_path: str, e_min: Optional[float] = None,
               e_max: Optional[float] = None, mirror: bool = False,
-              weight_scale: str = "linear") -> str:
+              weight_scale: str = "linear", style: str = "line") -> str:
     """画 E-vs-路径距离 的加权能带图, 存成 PNG。
 
-    画图本身在 ``_band_figure``, 图注在 ``plot_caption``。
+    画图本身在 ``_band_figure``（线图）/ ``_band_heatmap_figure``（热图）,
+    图注在 ``plot_caption``。
     ``weight_scale``: ``linear``（全局 w/w_max）或 ``log``（见
     ``_band_figure_colors``）。
+    ``style``: ``line``（带线 + 顶部色条）或 ``heatmap``（A(k,E) 热图 +
+    底部色条, 与用户的参考截图同款）。
     """
     _require_matplotlib()
     import matplotlib.pyplot as plt
-    fig, _ax = _band_figure(distances, energies, weights, labels, e_f,
-                             e_min=e_min, e_max=e_max, mirror=mirror,
-                             weight_scale=weight_scale)
+    if style == "heatmap":
+        fig, _ax = _band_heatmap_figure(distances, energies, weights, labels,
+                                         e_f, e_min=e_min, e_max=e_max,
+                                         mirror=mirror,
+                                         weight_scale=weight_scale)
+    elif style == "line":
+        fig, _ax = _band_figure(distances, energies, weights, labels, e_f,
+                                 e_min=e_min, e_max=e_max, mirror=mirror,
+                                 weight_scale=weight_scale)
+    else:
+        raise ValueError(f"style 只能是 'line' 或 'heatmap', 给出 {style!r}")
     fig.savefig(out_path, dpi=300)
     plt.close(fig)
     return out_path
@@ -704,6 +745,82 @@ def _band_figure(distances: np.ndarray, energies: np.ndarray,
             ax.text(-float(d), label_y, label,
                     transform=ax.get_xaxis_transform(),
                     ha="center", va="bottom", fontsize=9)
+    fig.text(0.5, 0.015, plot_caption(e_f, lo, hi), ha="center", va="bottom",
+             fontsize=8)
+    return fig, ax
+
+
+def _band_heatmap_figure(distances: np.ndarray, energies: np.ndarray,
+                          weights: np.ndarray, labels: Sequence[Tuple[str, float]],
+                          e_f: float, e_min: Optional[float] = None,
+                          e_max: Optional[float] = None, mirror: bool = False,
+                          weight_scale: str = "linear", sigma: float = 0.06):
+    """画**谱函数热图** A(k,E) -> (fig, ax)。
+
+    布局照用户给的参考截图：x = k-path 距离, y = 能量(eV), jet 配色,
+    E_F 处一条**白色**虚线, 高对称点标签在 x 轴下面, **底部**一条横向
+    colorbar(左 Low 右 High, 无刻度)。
+
+    颜色 = A(k,E) 按 ``weight_scale`` 归一化后的值（与线图同一口径）✓
+    """
+    _require_matplotlib()
+    import matplotlib.pyplot as plt
+    from matplotlib.cm import ScalarMappable
+    from matplotlib.colors import Normalize
+
+    dist = np.asarray(distances, dtype=float)
+    energy = np.atleast_2d(np.asarray(energies, dtype=float))
+    weight = np.atleast_2d(np.asarray(weights, dtype=float))
+    lo = e_min if e_min is not None else float(np.nanmin(energy))
+    hi = e_max if e_max is not None else float(np.nanmax(energy))
+    step = max((hi - lo) / 1200.0, 1e-3)
+    e_grid = np.arange(lo, hi + 0.5 * step, step)
+
+    fig, ax = plt.subplots(figsize=(6.0, 4.5))
+    cmap = plt.get_cmap("jet")
+    groups = [(dist, energy, weight)]
+    if mirror:
+        groups.append(mirror_path(dist, energy, weight))
+    for d, e, w in groups:
+        A = band_spectral_function(d, e, w, e_grid, sigma)
+        scaled = _band_figure_colors(A, weight_scale).reshape(A.shape)
+        ax.pcolormesh(d, e_grid, scaled, cmap=cmap, vmin=0.0, vmax=1.0,
+                      shading="auto")
+    ax.set_ylim(lo, hi)
+    x_lo = min(float(np.min(d)) for d, _e, _w in groups)
+    x_hi = max(float(np.max(d)) for d, _e, _w in groups)
+    ax.set_xlim(x_lo, x_hi)
+    if np.isfinite(e_f) and lo <= float(e_f) <= hi:
+        ax.axhline(float(e_f), color="w", linestyle="--", linewidth=0.9,
+                   zorder=3)
+    # 高对称点标签: 在 x 轴**下面**(参考截图的样式)
+    for label, d in labels:
+        ax.axvline(float(d), color="w", linewidth=0.5, alpha=0.6, zorder=2)
+        ax.text(float(d), -0.012, label, transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=9, color="k")
+    if mirror:
+        for label, d in labels:
+            ax.axvline(-float(d), color="w", linewidth=0.5, alpha=0.6, zorder=2)
+            ax.text(-float(d), -0.012, label, transform=ax.get_xaxis_transform(),
+                    ha="center", va="top", fontsize=9, color="k")
+    ax.set_xlabel(K_PATH_AXIS_LABEL)
+    ax.set_ylabel("Energy (eV)")
+    # 底部横向 colorbar(左 Low 右 High, 无刻度) —— 参考截图的样式
+    pos = ax.get_position()
+    cax = fig.add_axes([pos.x0 + 0.18 * pos.width, pos.y0 - 0.115,
+                         0.64 * pos.width, 0.022])
+    sm = ScalarMappable(norm=Normalize(0.0, 1.0), cmap=cmap)
+    sm.set_array(np.linspace(0.0, 1.0, 256))
+    cb = fig.colorbar(sm, cax=cax, orientation="horizontal")
+    cb.set_ticks([])
+    cb.outline.set_visible(False)
+    cax.text(-0.01, 0.5, "Low", transform=cax.transAxes, ha="right",
+             va="center", fontsize=10)
+    cax.text(1.01, 0.5, "High", transform=cax.transAxes, ha="left",
+             va="center", fontsize=10)
+    cax.set_xlabel("spectral weight"
+                   + (" (log scale)" if weight_scale == "log" else ""),
+                   fontsize=8, labelpad=1)
     fig.text(0.5, 0.015, plot_caption(e_f, lo, hi), ha="center", va="bottom",
              fontsize=8)
     return fig, ax
