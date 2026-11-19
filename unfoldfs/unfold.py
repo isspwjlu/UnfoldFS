@@ -181,6 +181,10 @@ class UnfoldedResult:
     dominance: float = float("nan")   # 选定约定下的单 G 主导度(均值)
     valid: Optional[np.ndarray] = None
     dominance_report: Optional[DominanceReport] = None
+    # --- 经典 Popescu 展开能带图需要的**完整**带表(可选) ---
+    band_energies: Optional[np.ndarray] = None   # (n_k, n_band) 全部超胞带能量
+    band_weights: Optional[np.ndarray] = None    # (n_k, detM, n_band)
+    #   每条超胞带在**每个**候选通道上的权重(不是只保留归属到该候选的那些带)
 
 
 @dataclass(frozen=True)
@@ -686,4 +690,5 @@ def unfold_supercell(band: BandData, procar: ProcarData, tr: Transform,
             valid[ik, j, :e.size] = True
     return UnfoldedResult(k_cand=k_cand, energies=energies, weights=weights,
                            s1=int(s1), s2=int(s2), dominance=dominance,
-                           valid=valid, dominance_report=report)
+                           valid=valid, dominance_report=report,
+                           band_energies=e_all, band_weights=w_best)

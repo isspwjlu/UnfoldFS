@@ -798,7 +798,9 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
         band_data, procar, tr, copies, tr.m_eff, prim.lattice,
         prim.positions @ prim.lattice, b_prim, b_super, k_unique,
         strict_dominance=args.strict_dominance)
-    energy, weight = assemble_band(unfolded, path.k_prim, index_map=index_map)
+    unfold_mode = getattr(args, "unfold_mode", "assign")
+    energy, weight = assemble_band(unfolded, path.k_prim, index_map=index_map,
+                                   mode=unfold_mode)
     # ★ 点群轨道对称化(默认开): 路径上**对称相关**的两点会给出不同的展开谱
     # 权重(docs/algorithms.md §15)⇒ 同一段路径的两半颜色不同。带能量不动。
     #
@@ -960,6 +962,11 @@ def _add_unfold_args(p: argparse.ArgumentParser) -> None:
                    help="谱函数展宽 (eV)")
     p.add_argument("--strict-dominance", action="store_true",
                    help="要求每个态的单 G 主导度 >= 0.5(严格模式)")
+    p.add_argument("--unfold-mode", choices=("assign", "full"),
+                   default="assign",
+                   help="能带图的展开方式: assign = 每个路径点只画**归属到该 k'** 的带"
+                        "(干净, 但没有折叠副本); full = 画**全部**超胞带, 颜色 = 该带在"
+                        "k' 通道的权重(经典 Popescu 展开能带图: 有低权重色散的弥散背景)")
     p.add_argument("--symprec", type=float, default=1e-5,
                    help="对称性判定的容差(Angstrom; spglib 的 symprec)。"
                         "结构坐标有 1e-5 级噪声时 1e-5 会漏掉大部分操作"
@@ -1008,6 +1015,11 @@ def _add_band_args(p: argparse.ArgumentParser) -> None:
                         "(对应 MATLAB 脚本里的 IsPlotMirror)")
     p.add_argument("--strict-dominance", action="store_true",
                    help="要求每个态的单 G 主导度 >= 0.5(严格模式)")
+    p.add_argument("--unfold-mode", choices=("assign", "full"),
+                   default="assign",
+                   help="能带图的展开方式: assign = 每个路径点只画**归属到该 k'** 的带"
+                        "(干净, 但没有折叠副本); full = 画**全部**超胞带, 颜色 = 该带在"
+                        "k' 通道的权重(经典 Popescu 展开能带图: 有低权重色散的弥散背景)")
     p.add_argument("--symprec", type=float, default=1e-5,
                    help="对称性判定的容差(Angstrom; spglib 的 symprec)。"
                         "结构坐标有 1e-5 级噪声时 1e-5 会漏掉大部分操作"

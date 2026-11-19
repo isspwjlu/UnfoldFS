@@ -357,14 +357,22 @@ def select_zero_candidate(k_cand: np.ndarray, k_prim_point: np.ndarray,
 
 
 def assemble_band(unfolded, k_prim: np.ndarray, tol: float = CANDIDATE_TOL,
-                  *, index_map: Optional[np.ndarray] = None
+                  *, index_map: Optional[np.ndarray] = None,
+                  mode: str = "assign"
                   ) -> Tuple[np.ndarray, np.ndarray]:
     """把展开结果组装成 (n_band, n_k) 的能带与权重矩阵。
 
-    每个路径点取"原胞 k 等于该路径点"的候选(见 ``select_zero_candidate``),
-    候选内的带按能量升序。**各路径点的带数可能不同**(展开把态摊到不同候选上),
-    故取全路径的最大值作为行数, 不足的行用"该 k 的最高带能量 + 权重 0"补位 ——
-    权重 0 ⇒ 在加权图里不显色。
+    **两种模式**：
+
+    * ``assign``（默认）：每个路径点取"原胞 k 等于该路径点"的候选(见
+      ``select_zero_candidate``), 候选内的带按能量升序 ⇒ 画出来**就是原胞的
+      能带 + 它的 Popescu 权重**（干净, 但没有折叠副本 ⇒ 没有低权重色散背景）。
+    * ``full``（经典 Popescu 展开能带图）：每个路径点画**全部**超胞带, 颜色 =
+      该带在**匹配通道**上的权重 ⇒ 强带 = 原胞在 k' 的带, 弱带 = 别的 k' 的带
+      （折叠副本）⇒ 谱有"低权重色散"的弥散背景, 与论文里的展开能带图一致。
+
+    **各路径点的带数可能不同**, 故取全路径的最大值作为行数, 不足的行用
+    "该 k 的最高带能量 + 权重 0"补位 —— 权重 0 ⇒ 在加权图里不显色。
 
     ``index_map``: 路径点 -> 展开结果的行号(``dedup_k_points`` 给出的映射)。
     **路径点可以比计算的 k 点多**: 路径的相邻段共享端点(同一个 k 算一次),
@@ -372,6 +380,8 @@ def assemble_band(unfolded, k_prim: np.ndarray, tol: float = CANDIDATE_TOL,
     k, 各自再取自己的候选(同一个超胞 k 的不同 G)。缺省时是恒等映射(每个
     路径点对应展开结果的一行)。
     """
+    if mode not in ("assign", "full"):
+        raise ValueError(f"mode 只能是 'assign' 或 'full', 给出 {mode!r}")
     k_prim = np.atleast_2d(np.asarray(k_prim, dtype=float))
     n_path = k_prim.shape[0]
     if index_map is None:
@@ -385,13 +395,22 @@ def assemble_band(unfolded, k_prim: np.ndarray, tol: float = CANDIDATE_TOL,
     if n_calc != n_used:
         raise ValueError(
             f"展开结果的 k 点数 {n_calc} != 路径点映射到的计算 k 点数 {n_used}")
+    if mode == "full" and (unfolded.band_energies is None
+                           or unfolded.band_weights is None):
+        raise ValueError(
+            "full 模式需要完整带表(unfolded.band_energies / band_weights) —— "
+            "请用 unfold_supercell 的结果")
     per_k: List[Tuple[np.ndarray, np.ndarray]] = []
     for i in range(n_path):
         row = int(index_map[i])
         j = select_zero_candidate(unfolded.k_cand[row], k_prim[i], tol)
-        valid = unfolded.valid[row, j]
-        e = np.asarray(unfolded.energies[row, j], dtype=float)[valid]
-        w = np.asarray(unfolded.weights[row, j], dtype=float)[valid]
+        if mode == "full":
+            e = np.asarray(unfolded.band_energies[row], dtype=float)
+            w = np.asarray(unfolded.band_weights[row, j], dtype=float)
+        else:
+            valid = unfolded.valid[row, j]
+            e = np.asarray(unfolded.energies[row, j], dtype=float)[valid]
+            w = np.asarray(unfolded.weights[row, j], dtype=float)[valid]
         per_k.append((e, w))
     n_band = max((e.size for e, _ in per_k), default=0)
     if n_band == 0:
