@@ -1207,3 +1207,47 @@ def test_band_and_unfold_select_the_same_convention_for_the_same_k_list(
     band_conv = (int(m.group(1)), int(m.group(2)))
     unfold_conv = _unfold_convention_for(str(run), _super_k_of_path())
     assert band_conv == unfold_conv
+
+
+# ------------------------------------------------------------------ 热图风格
+#
+# 用户给的参考图是**谱函数热图**: x = k-path, y = 能量, 颜色 = 谱权重,
+# 底部一条横向 colorbar(左 Low 右 High, 无刻度), E_F 处白色虚线。
+
+def test_band_spectral_function_peaks_at_the_band_energy():
+    e_grid = np.linspace(-1.0, 3.0, 401)
+    en = np.array([[1.0, 2.0]])
+    w = np.array([[0.5, 0.25]])
+    A = band.band_spectral_function(np.array([0.0, 1.0]), en, w, e_grid, 0.06)
+    assert A.shape == (401, 2)
+    i1 = int(np.argmin(np.abs(e_grid - 1.0)))
+    i2 = int(np.argmin(np.abs(e_grid - 2.0)))
+    assert A[i1, 0] == pytest.approx(0.5, abs=1e-6)
+    assert A[i2, 1] == pytest.approx(0.25, abs=1e-6)
+    # 远离带的地方趋于 0
+    i0 = int(np.argmin(np.abs(e_grid - (-1.0))))
+    assert A[i0, 0] < 1e-12
+
+
+def test_band_spectral_function_adds_up_bands_at_the_same_k():
+    e_grid = np.array([0.0])
+    en = np.array([[0.0], [0.0]])
+    w = np.array([[0.3], [0.2]])
+    A = band.band_spectral_function(np.array([0.0]), en, w, e_grid, 0.06)
+    assert A[0, 0] == pytest.approx(0.5, abs=1e-9)
+
+
+def test_band_heatmap_figure_has_an_image_and_a_colorbar():
+    pytest.importorskip("matplotlib")
+    import matplotlib
+    matplotlib.use("Agg")
+    dist, energy, weight, labels = _dummy_band_data()
+    fig, ax = band._band_heatmap_figure(dist, energy, weight, labels, e_f=0.5,
+                                         e_min=-1.0, e_max=4.0, sigma=0.06)
+    assert len(fig.axes) >= 2, "热图必须有色条坐标区"
+    assert ax.collections or ax.images, "主轴上应有热图"
+    texts = [t.get_text() for t in list(fig.texts) + list(ax.texts)]
+    for extra in fig.axes[1:]:
+        texts += [t.get_text() for t in extra.texts]
+    assert any("Low" in t for t in texts), texts
+    assert any("High" in t for t in texts), texts
