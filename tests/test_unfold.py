@@ -1,7 +1,7 @@
 """unfold 模块测试: Popescu 投影法展开、副本相位还原平均、候选 G 重组。
 
 fixture = 3x3x1 MoS2 超胞 (27 原子) + 原胞 (3 原子), M = diag(3,3,1), det(M)=9。
-数值基线均来自 fixture 实测(与仓库根目录已验证的原型 unfold_procar.py 同源):
+数值基线均来自 fixture 实测(与已验证的原型 examples/prototypes/unfold_procar.py 同源):
   * Γ 点最低带: 9 个候选中第 0 个单 G 主导(主导度 1.0), 其余权重 ~1e-33;
   * k=(0.1,0,0) 第 32 带: 4 种相位约定的主导度差异最大(0.52 / 0.96 / 0.98 / 0.70)。
 """
@@ -65,7 +65,7 @@ def _dominance(w):
 
 def _naive_weights(k_frac, coeffs, copies, m_eff, a_prim, prim_cart,
                    b_prim, b_super, s1, s2):
-    """原型 unfold_procar.py 的逐元素实现(独立于模块的向量化实现)。
+    """原型 examples/prototypes/unfold_procar.py 的逐元素实现(独立于模块的向量化实现)。
 
     用来交叉核对模块: 两条代码路径独立, 权重必须逐位一致。
     """
@@ -467,13 +467,13 @@ def test_unfold_supercell_rejects_k_point_absent_from_eigenval():
 # fix round 1/5 —— 相位约定的**生产路径**必须与已验证原型同口径
 #
 # 评审 Important 1: 旧的 unfold_supercell 用**全部 k × 全部带**择优,
-# 原型 unfold_procar.py 只用 **首 4 个 k × 首 40 条带**; 两者在 fixture 上
+# 原型 examples/prototypes/unfold_procar.py 只用 **首 4 个 k × 首 40 条带**; 两者在 fixture 上
 # 选出**不同**的约定 -> 164/240 个 (k,带) 的候选归属改变 -> 重组后的
 # 能带结构(即费米面)随之改变。
 # ==================================================================
 
 def _prototype_convention_scores(fx):
-    """照抄原型 unfold_procar.py 的 [conv] 择优循环(独立代码路径)。
+    """照抄原型 examples/prototypes/unfold_procar.py 的 [conv] 择优循环(独立代码路径)。
 
     原型口径: k 取前 min(4, nk) 个, 带取前 min(nband, 40) 条;
     每个 (k, 带) 算单 G 主导度 max(w)/sum(w)(总权重 > 1e-12 才计入),
@@ -500,7 +500,7 @@ def _prototype_convention_scores(fx):
 
 
 def test_unfold_supercell_selects_the_same_convention_as_the_validated_prototype():
-    """约定择优的生产路径必须与原型 unfold_procar.py 同口径(评审 Important 1)。
+    """约定择优的生产路径必须与原型 examples/prototypes/unfold_procar.py 同口径(评审 Important 1)。
 
     原型在 fixture 上选 (s1=-1, s2=+1); 旧的"全部 k × 全部带"口径会选 (1,-1),
     两者在 164/240 个 (k,带) 上候选归属不同。
