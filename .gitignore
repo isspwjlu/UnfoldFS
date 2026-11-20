@@ -5,3 +5,19 @@ run/
 fs/
 .superpowers/
 scripts/_check_plan.py
+
+# LaTeX 中间产物(paper/ 的源码与图要入库)
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/mainNotes.bib
+
+# 开源版本不包含: 测试数据 / 结果 / 第三方手册
+tests/data/PROCAR
+tests/data/DOSCAR
+tests/data/*.npz
+out/
+ref/VASPKIT_manual.md
+docs/superpowers/
