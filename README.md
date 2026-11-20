@@ -14,7 +14,7 @@
 * 代码: **https://github.com/isspwjlu/unfold_fs**
 * 论文: *Unfolded Fermi surfaces from supercell band calculations: extracting,
   validating, and rendering the Fermi surface of a supercell spectral function*
-  (PRB; 稿件本身不在本仓库内)
+  (arXiv: 待发布)
 * 许可: MIT (`LICENSE`)
 
 **开源版本不含测试数据与计算结果**: `tests/data/` 里的 VASP 输出(PROCAR/DOSCAR/
