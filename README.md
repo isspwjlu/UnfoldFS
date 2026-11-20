@@ -14,14 +14,15 @@
 * 代码: **https://github.com/isspwjlu/unfold_fs**
 * 论文: *Unfolded Fermi surfaces from supercell band calculations: extracting,
   validating, and rendering the Fermi surface of a supercell spectral function*
-  (PRB, 稿件见 `paper/`)
+  (PRB; 稿件本身不在本仓库内)
 * 许可: MIT (`LICENSE`)
 
 **开源版本不含测试数据与计算结果**: `tests/data/` 里的 VASP 输出(PROCAR/DOSCAR/
-golden npz)、`out/` 下的结果图、以及第三方手册(VASPKIT manual)都不在仓库里。
-依赖这些文件的测试会自动跳过(缺文件即 skip); 想在本地跑完整测试, 把
-`tests/data/` 补回去即可。复现论文里的算例需要自己跑 VASP(脚本见
-`scripts/cdw/` 与 `scripts/figures/`)。
+golden npz)、`out/` 下的结果图、第三方手册(VASPKIT manual)、以及论文稿件本身
+都不在仓库里。依赖这些文件的测试会自动跳过(缺文件即 skip); 想在本地跑完整测试,
+把 `tests/data/` 补回去即可。复现论文里的算例需要自己跑 VASP(脚本见
+`scripts/cdw/` 与 `scripts/figures/`, 出图默认写到 `paper/figs/`, 该目录需要自己
+新建)。
 
 ## 1. 安装
 

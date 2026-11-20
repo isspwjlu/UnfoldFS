@@ -21,3 +21,6 @@ tests/data/*.npz
 out/
 ref/VASPKIT_manual.md
 docs/superpowers/
+
+# 论文稿件(本地保留, 不公开)
+paper/
