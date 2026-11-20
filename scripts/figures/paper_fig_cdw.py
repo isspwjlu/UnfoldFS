@@ -57,7 +57,7 @@ def kpath_marks(ax, labels):
 
 
 def build(ef, assign_dat, full_dat, labels, out, png=None, e_min=-1.0,
-          e_max=1.0, sigma=0.05, height=3.6, width=None):
+          e_max=1.0, sigma=0.05, height=3.0, width=None):
     S.apply_prb_style()
     df, efull, wf = read_dat(full_dat)
     width = width or S.FULL_WIDTH
@@ -103,7 +103,7 @@ def main():
     ap.add_argument("--e-min", type=float, default=-3.0, help="相对 E_F 的下限")
     ap.add_argument("--e-max", type=float, default=1.5, help="相对 E_F 的上限")
     ap.add_argument("--sigma", type=float, default=0.05)
-    ap.add_argument("--height", type=float, default=3.6)
+    ap.add_argument("--height", type=float, default=3.0)
     ap.add_argument("--width", type=float, default=0.0,
                     help="画布宽度 (in); 0 = 全栏 7.0 in, 3.4 = 单栏")
     args = ap.parse_args()
