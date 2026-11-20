@@ -62,11 +62,11 @@ python "$HERE/paper_fig_verify.py" --prim PRIMCELL.vasp \
 
 # ---------------------------------------------------------------- 图 6 CDW 态
 # 需要 CDW 算例的反折叠结果(见 scripts/cdw/); 没有就跳过。
-# 单栏图: 画布 3.4 x 2.65 in => 论文里印刷高 2.40 in(全栏宽会把它压扁)。
+# 单栏图: 画布 3.4 x 2.4 in => 论文里印刷高 2.19 in(全栏宽会把它压扁)。
 CDW_DAT="${CDW_DAT:-A_unfolded_full_G.dat}"
 CDW_ASSIGN="${CDW_ASSIGN:-A_unfolded_assign_G.dat}"
 if [ -f "$CDW_DAT" ]; then
-  python "$HERE/paper_fig_cdw.py" --ef "${CDW_EF:-5.467486}"     --assign "$CDW_ASSIGN" --full "$CDW_DAT"     --width 3.4 --height 2.65 --sigma 0.05 --e-min -1.0 --e-max 1.0     --labels '$\Gamma$:0,M:1.080,K:1.703,$\Gamma$:2.950,A:3.475,L:4.555,H:5.178,A:6.424'     --out "$OUT/fig6_cdw.pdf" --png "$OUT/fig6_cdw.png"
+  python "$HERE/paper_fig_cdw.py" --ef "${CDW_EF:-5.467486}"     --assign "$CDW_ASSIGN" --full "$CDW_DAT"     --width 3.4 --height 2.4 --sigma 0.05 --e-min -1.0 --e-max 1.0     --labels '$\Gamma$:0,M:1.080,K:1.703,$\Gamma$:2.950,A:3.475,L:4.555,H:5.178,A:6.424'     --out "$OUT/fig6_cdw.pdf" --png "$OUT/fig6_cdw.png"
 else
   echo "(跳过图 6: 没找到 $CDW_DAT)"
 fi
