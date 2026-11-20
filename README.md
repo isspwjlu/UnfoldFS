@@ -693,12 +693,16 @@ scripts/figures/     **出图脚本**（画图，不属于包；不参与测试/
   check_fs_symmetry.py 核对费米面图的对称性（几何 + 颜色）
   make_final_figures.sh 一键出 4 幅大图 + 12 幅小图 + 4 幅三维图
   README.md            画法约定 + 踩过的坑（出图前必读）
-unfold_procar.py     仓库根的**已验证原型**（与本工具的全路径交叉核对基准，
-                     max|Δw| = 4.99e-09、max|ΔE| = 0）
+scripts/cdw/         CDW 态算例（建超胞 / 查结构 / 对比展开结果）
+examples/            **归档区**：探索期原型 + 服务器算例脚本（不属于包）
+  prototypes/          unfold_procar.py = 已验证的展开原型（与本工具的全路径
+                       交叉核对基准，max|Δw| = 4.99e-09、max|ΔE| = 0）等
+  vasp/                VASP 作业提交与诊断脚本（路径是作者服务器的历史路径）
+  README.md            每个文件是什么、怎么用
 ```
 
-`unfold_procar.py` 与 `make_figures.py` 等根目录脚本是**探索阶段的原型**，
-不是 `unfoldfs` 包的一部分（不参与测试、不参与安装）。
+`examples/` 下的脚本是**探索阶段的原型**，不是 `unfoldfs` 包的一部分
+（不参与测试、不参与安装）；详见 `examples/README.md`。
 
 出图脚本（`scripts/figures/`）同理不属于包，但它们是**当前唯一正确的画法**：
 费米面必须画 `E_b(k)` 恰过 `E_F` 的那条线（画 `A(k,E_F)` 的等值线会得到高斯脊的

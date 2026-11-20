@@ -11,7 +11,7 @@ pkill -f 'vasp_std' 2>/dev/null || true
 sleep 3
 
 # 10x10x1 超胞网格 -> 30x30 原胞网格
-/data/wjlu/program/anaconda3/bin/python3 make_unfold_mesh.py --n1 10 --n2 10 --n3 1 --tag mesh10
+/data/wjlu/program/anaconda3/bin/python3 ../prototypes/make_unfold_mesh.py --n1 10 --n2 10 --n3 1 --tag mesh10
 
 cat > INCAR <<'EOF'
 ISTART = 0

@@ -24,3 +24,6 @@ docs/superpowers/
 
 # 论文稿件(本地保留, 不公开)
 paper/
+
+# 本机私有远程 helper(依赖 ~/.claude/ssh_login.py), 不公开
+rsh.py

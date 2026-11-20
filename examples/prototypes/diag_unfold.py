@@ -2,11 +2,12 @@
 w(k') = (1/N_atoms) |sum_j sum_lm c_{j,lm} exp(i (k' + s0 K).R_j)|^2
 检验: (a) 单 G 主导度 max/sum  (b) 归一化 sum_G w / sum|p|^2  (应 ~1)
 """
+import os
 import sys
 
 import numpy as np
 
-sys.path.insert(0, '/data/wjlu/work/claude/unfold_fs_demo')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import unfold_procar as U
 
 d = '/data/wjlu/work/claude/unfold_fs_demo/lo12'
