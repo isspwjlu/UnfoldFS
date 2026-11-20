@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "unfoldfs"
 version = "0.1.0"
-description = "超胞 VASP 计算的反折叠与费米面生成"
+description = "UnfoldFS: unfolding supercell VASP band structures and rendering Fermi surfaces in the primitive BZ"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
