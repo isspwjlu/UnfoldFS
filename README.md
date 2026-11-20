@@ -9,6 +9,20 @@
 
 ---
 
+## 0. 仓库与论文
+
+* 代码: **https://github.com/isspwjlu/unfold_fs**
+* 论文: *Unfolded Fermi surfaces from supercell band calculations: extracting,
+  validating, and rendering the Fermi surface of a supercell spectral function*
+  (PRB, 稿件见 `paper/`)
+* 许可: MIT (`LICENSE`)
+
+**开源版本不含测试数据与计算结果**: `tests/data/` 里的 VASP 输出(PROCAR/DOSCAR/
+golden npz)、`out/` 下的结果图、以及第三方手册(VASPKIT manual)都不在仓库里。
+依赖这些文件的测试会自动跳过(缺文件即 skip); 想在本地跑完整测试, 把
+`tests/data/` 补回去即可。复现论文里的算例需要自己跑 VASP(脚本见
+`scripts/cdw/` 与 `scripts/figures/`)。
+
 ## 1. 安装
 
 ```bash
@@ -671,9 +685,21 @@ docs/
   algorithms.md      算法、约定与实测数字
   formats.md         输出格式的逐字段规范
 tests/               258 个用例通过 + 1 个 xfail（含 tests/data/ 下的合成 fixture）
+scripts/figures/     **出图脚本**（画图，不属于包；不参与测试/安装）
+  plot_band.py         展开能带图（原胞蓝线 + 两种超胞反折叠热图）
+  plot_fs.py           费米面图（真费米面 + 谱权重配色）
+  plot_fs_3d.py        三维反折叠费米面（PyVista/VTK；sheet=物理版 / tube=权重版）
+  check_fs_symmetry.py 核对费米面图的对称性（几何 + 颜色）
+  make_final_figures.sh 一键出 4 幅大图 + 12 幅小图 + 4 幅三维图
+  README.md            画法约定 + 踩过的坑（出图前必读）
 unfold_procar.py     仓库根的**已验证原型**（与本工具的全路径交叉核对基准，
                      max|Δw| = 4.99e-09、max|ΔE| = 0）
 ```
 
 `unfold_procar.py` 与 `make_figures.py` 等根目录脚本是**探索阶段的原型**，
 不是 `unfoldfs` 包的一部分（不参与测试、不参与安装）。
+
+出图脚本（`scripts/figures/`）同理不属于包，但它们是**当前唯一正确的画法**：
+费米面必须画 `E_b(k)` 恰过 `E_F` 的那条线（画 `A(k,E_F)` 的等值线会得到高斯脊的
+「两壁」），颜色用「过 E_F 那条带的谱权重」并按原胞完整点群轨道平均。
+画法约定与踩过的坑见 `scripts/figures/README.md`。
