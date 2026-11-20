@@ -1,6 +1,6 @@
-# unfoldfs — Supercell band unfolding → Fermi surfaces in the primitive BZ
+# UnfoldFS — Supercell band unfolding → Fermi surfaces in the primitive BZ
 
-`unfoldfs` unfolds the result of a **supercell VASP calculation** back into the
+**UnfoldFS** unfolds the result of a **supercell VASP calculation** back into the
 **primitive first Brillouin zone** and turns it into a Fermi surface carrying the
 spectral weight `A(k, E_F)`, written in formats that **VESTA / XCrySDen /
 FermiSurfer** open directly.
@@ -12,7 +12,7 @@ FermiSurfer** open directly.
 
 ## 0. Repository and paper
 
-* Code: **https://github.com/isspwjlu/unfold_fs**
+* Code: **https://github.com/isspwjlu/UnfoldFS**
 * Paper: *Unfolded Fermi surfaces from supercell band calculations: extracting,
   validating, and rendering the Fermi surface of a supercell spectral function*
   (arXiv: to be announced)
@@ -29,7 +29,8 @@ the paper's examples means running VASP yourself (scripts in `scripts/cdw/` and
 pip install -e .
 ```
 
-That gives you the `unfoldfs` command. If you prefer not to install the package,
+That gives you the `unfoldfs` command (the package is called `unfoldfs`; the
+project is UnfoldFS). If you prefer not to install the package,
 the module entry point is equivalent (`python -m unfoldfs.cli --help`).
 
 | Dependency | Requirement | Notes |
@@ -164,7 +165,7 @@ The complete list and all measured numbers → [`docs/algorithms.md`](docs/algor
 ## 7. Repository layout
 
 ```
-unfoldfs/            the tool itself (installable package)
+unfoldfs/            the tool itself (the installable UnfoldFS package)
   geometry.py        structure parsing / transform-convention detection / candidate G / common symmetry set
   grid.py            uniform grid / symmetric orbit decomposition / k-point dedup / KPOINTS writer
   vaspio.py          EIGENVAL / DOSCAR / PROCAR (LORBIT=12) parsing
@@ -180,5 +181,5 @@ scripts/cdw/          the CDW example (build the supercell / check the structure
 examples/             archive: exploration-stage prototypes and server job scripts (not part of the package)
 ```
 
-The scripts under `scripts/` and `examples/` are not part of the `unfoldfs`
+The scripts under `scripts/` and `examples/` are not part of the UnfoldFS
 package (they are not installed).
