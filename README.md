@@ -13,8 +13,8 @@ FermiSurfer** open directly.
 ## 0. Repository and paper
 
 * Code: **https://github.com/isspwjlu/UnfoldFS**
-* Paper: *UnfoldFS: extracting, validating, and rendering Fermi surfaces from
-  supercell band calculations* (arXiv: to be announced)
+* Paper: *UnfoldFS: Fermi surfaces from supercell band calculations*
+  (arXiv: to be announced)
 * License: MIT (`LICENSE`)
 
 The public version ships without the test data, the computed results and the
