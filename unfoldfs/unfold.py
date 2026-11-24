@@ -53,8 +53,10 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from .geometry import Structure, Transform, periodic_distance
+from .geometry import Structure, Transform, periodic_delta, periodic_distance
+from .pwunfold import plane_wave_weights
 from .vaspio import BandData, ProcarData
+from .wfc import iter_wavecar_kpoints, read_wavecar_header
 
 __all__ = [
     "AtomCopies", "UnfoldedResult", "DominanceReport", "build_atom_copies",
@@ -111,6 +113,12 @@ DOMINANCE_GOOD = 0.85
 
 # 原子副本匹配容差(分数坐标下的整数性判据)
 _COPY_TOL = 1e-6
+
+# 平面波路线: 平面波归入候选等价类的残差容差(分数坐标的周期距离)
+_PW_CLASS_TOL = 1e-6
+
+# 平面波路线: 完备性 Σ_j w_j = 1 的容差(候选集是平面波基的划分 ⇒ 必为 1)
+_PW_COMPLETENESS_TOL = 1e-6
 
 # k 点匹配容差(分数坐标, 周期距离)
 _K_TOL = 1e-5
@@ -176,6 +184,12 @@ class UnfoldedResult:
     k_cand: np.ndarray
     energies: np.ndarray
     weights: np.ndarray
+    orbital_weights: Optional[np.ndarray] = None
+    """逐轨道谱权重 (n_k, detM, n_band_eff, norb); 默认 None(不计算)。
+
+    只有 ``unfold_supercell(..., with_orbitals=True)`` 时才有。
+    轨道成分请按 W_orb / Σ_n W_orb 归一化后使用(见 :func:`_weight_matrix`)。
+    """
     s1: int = 1               # 采用的相位符号约定
     s2: int = 1
     dominance: float = float("nan")   # 选定约定下的单 G 主导度(均值)
@@ -303,8 +317,17 @@ def _weight_matrix(k_super_frac: np.ndarray, coeffs: np.ndarray,
                    cp: _CopyArrays, tr: Transform, m_eff: np.ndarray,
                    a_prim: np.ndarray, prim_cart: np.ndarray,
                    b_prim: np.ndarray, b_super: np.ndarray,
-                   s1: int, s2: int) -> Tuple[np.ndarray, np.ndarray]:
-    """候选原胞 k(分数) 与谱权重 W(k') (detM, n_band)。"""
+                   s1: int, s2: int,
+                   with_orbital: bool = False) -> Tuple[np.ndarray, np.ndarray]:
+    """候选原胞 k(分数) 与谱权重 W(k') (detM, n_band)。
+
+    ``with_orbital=True`` 时额外返回**逐轨道**权重 (detM, n_band, norb)::
+
+        W_orb[g, b, n] = |Σ_i bloch_i · p[i, b, n]|²
+
+    ⚠ 逐轨道权重之和**不等于**总权重: |Σ_n c_n|² 与 Σ_n |c_n|² 之间有交叉项。
+       所以轨道成分要按 W_orb / Σ_n W_orb 归一化后才是"成分占比"。
+    """
     _, k_frac, d_g = _candidate_k(k_super_frac, m_eff, tr.m_inv.T,
                                   b_prim, b_super)
     # 副本平移项的相位: exp(s1·i·(k'−K)·T)
@@ -315,8 +338,16 @@ def _weight_matrix(k_super_frac: np.ndarray, coeffs: np.ndarray,
     p = np.einsum("gc,bcn->gbcn", phase, c)
     p /= cp.n_copies[cp.parent][None, None, :, None]
     p = np.add.reduceat(p, cp.starts, axis=2)                      # (detM, nb, n_prim, norb)
+    # ⚠ **总权重必须走原来的求和顺序** —— 换成"先算逐轨道再求和"在浮点上
+    # **不逐位相同**(求和次序不同), 而论文里的数字依赖逐位可复现。
+    # 所以逐轨道那条另算一条路径, 只在 with_orbital 时才做。
     total = np.einsum("gi,gbi->gb", bloch, p.sum(axis=3))
-    return k_frac, np.abs(total) ** 2
+    w_total = np.abs(total) ** 2
+    if not with_orbital:
+        return k_frac, w_total
+    # 逐轨道: (detM, nb, norb)。不先对 norb 求和, 才能保留轨道分辨
+    total_orb = np.einsum("gi,gbin->gbn", bloch, p)
+    return k_frac, w_total, np.abs(total_orb) ** 2
 
 
 def _dominance(w: np.ndarray) -> np.ndarray:
@@ -341,7 +372,9 @@ def unfold_at_k(k_super_frac: np.ndarray, coeffs: np.ndarray,
                 energies: np.ndarray, tr: Transform, copies: AtomCopies,
                 m_eff: np.ndarray, a_prim: np.ndarray, prim_cart: np.ndarray,
                 b_prim: np.ndarray, b_super: np.ndarray,
-                s1: int, s2: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                s1: int, s2: int,
+                with_orbital: bool = False
+                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """展开一个超胞 k 点。
 
     coeffs   (n_band, n_ions, norb) 复投影系数(晶胞周期规范)
@@ -358,10 +391,13 @@ def unfold_at_k(k_super_frac: np.ndarray, coeffs: np.ndarray,
             f"coeffs 的带数 {coeffs.shape[0]} != energies 的带数 "
             f"{energies.shape[0]}")
     cp = _copy_arrays(copies, a_prim)
-    k_frac, w = _weight_matrix(k_super_frac, coeffs, cp, tr, m_eff,
-                                a_prim, prim_cart, b_prim, b_super, s1, s2)
-    e = np.repeat(energies[None, :], k_frac.shape[0], axis=0)
-    return k_frac, e, w
+    out = _weight_matrix(k_super_frac, coeffs, cp, tr, m_eff,
+                          a_prim, prim_cart, b_prim, b_super, s1, s2,
+                          with_orbital=with_orbital)
+    e = np.repeat(energies[None, :], out[0].shape[0], axis=0)
+    if with_orbital:
+        return out[0], e, out[1], out[2]
+    return out[0], e, out[1]
 
 
 def _evaluate_conventions(samples: List[Tuple[np.ndarray, np.ndarray]],
@@ -571,7 +607,9 @@ def unfold_supercell(band: BandData, procar: ProcarData, tr: Transform,
                      a_prim: np.ndarray, prim_cart: np.ndarray,
                      b_prim: np.ndarray, b_super: np.ndarray,
                      k_super_list: np.ndarray,
-                     strict_dominance: bool = False) -> UnfoldedResult:
+                     strict_dominance: bool = False,
+                     with_orbitals: bool = False,
+                     min_dominance: float = MIN_DOMINANCE) -> UnfoldedResult:
     """展开整个超胞 k 点集合, 并做候选重组。
 
     k_super_list = grid_map.k_super(长度 n_k)
@@ -634,29 +672,53 @@ def unfold_supercell(band: BandData, procar: ProcarData, tr: Transform,
 
     # --- 单次全量权重 pass(只算选中的约定)
     w_best = np.zeros((n_k, det_m, n_band))
+    norb = int(np.asarray(procar.coeffs).shape[2])
+    w_orb_best = np.zeros((n_k, det_m, n_band, norb)) if with_orbitals else None
     for ik in range(n_k):
-        _, w = _weight_matrix(k_list[ik], procar.coeffs[pro_idx[ik], :n_band],
-                              cp, tr, m_eff, a_prim, prim_cart, b_prim, b_super,
-                              s1, s2)
-        w_best[ik] = w
+        out = _weight_matrix(k_list[ik], procar.coeffs[pro_idx[ik], :n_band],
+                             cp, tr, m_eff, a_prim, prim_cart, b_prim, b_super,
+                             s1, s2, with_orbital=with_orbitals)
+        w_best[ik] = out[1]
+        if with_orbitals:
+            w_orb_best[ik] = out[2]
 
+    return _pack_unfolded(w_best, band, band_idx, k_list, m_eff, tr, b_prim,
+                          b_super, report, strict_dominance, w_orb_best, norb,
+                          n_band, s1, s2, with_orbitals,
+                          min_dominance=min_dominance)
+
+
+def _pack_unfolded(w_best, band, band_idx, k_list, m_eff, tr, b_prim, b_super,
+                   report, strict_dominance, w_orb_best, norb, n_band, s1, s2,
+                   with_orbitals: bool = False,
+                   min_dominance: float = MIN_DOMINANCE) -> UnfoldedResult:
+    """主导度统计 + 候选重组 + 打包(两条展开路线共用)。
+
+    w_best : (n_k, det_m, n_band) 每个候选原胞动量上的谱权重
+
+    ``min_dominance``: 单 G 主导度的下限(硬错)。默认 0.5。对**破坏平移对称**
+    的态(CDW、缺陷超胞)要放宽 —— 那里的主导度低是**态的性质**(态不是原胞
+    平移的本征态), 不是展开的数值失败。
+    """
+    n_k, det_m, _ = w_best.shape
     # --- 每态主导度的分布 + 聚合下限(硬错)
     dom = _dominance(w_best)                       # (n_k, n_band)
     states = dom[w_best.sum(axis=1) > 0]
     if states.size == 0:
         raise ValueError("所有候选的权重都是 0 —— 展开结果为空")
     dominance = float(states.mean())
-    if dominance < MIN_DOMINANCE:
+    if dominance < min_dominance:
         raise ValueError(
-            f"全量展开的平均单 G 主导度 {dominance:.4f} < {MIN_DOMINANCE} —— "
-            "展开没有把态集中到唯一一个候选 G 上, 相位约定/副本平均不可信")
+            f"全量展开的平均单 G 主导度 {dominance:.4f} < {min_dominance} —— "
+            "展开没有把态集中到唯一一个候选 G 上, 相位约定/副本平均不可信"
+            "(对破坏平移对称的态可放宽 --min-dominance)")
     report = replace(report, mean=dominance, min=float(states.min()),
                       median=float(np.median(states)),
                       frac_above_good=float(np.mean(states > DOMINANCE_GOOD)))
-    if strict_dominance and float(states.min()) < MIN_DOMINANCE:
+    if strict_dominance and float(states.min()) < min_dominance:
         raise ValueError(
             f"严格每态主导度下限: 最差的态只有 {states.min():.4f} < "
-            f"{MIN_DOMINANCE} —— 展开把态摊到了多个候选 G 上, 谱函数不可信")
+            f"{min_dominance} —— 展开把态摊到了多个候选 G 上, 谱函数不可信")
 
     e_all = np.asarray(band.energies, dtype=float)[band_idx, :n_band]
     k_cand = np.zeros((n_k, det_m, 3))
@@ -681,6 +743,8 @@ def unfold_supercell(band: BandData, procar: ProcarData, tr: Transform,
     n_band_eff = int(counts.max())
     energies = np.full((n_k, det_m, n_band_eff), np.inf)
     weights = np.zeros((n_k, det_m, n_band_eff))
+    orbital_weights = (np.zeros((n_k, det_m, n_band_eff, norb))
+                       if with_orbitals else None)
     valid = np.zeros((n_k, det_m, n_band_eff), dtype=bool)
     for ik in range(n_k):
         for j in range(det_m):
@@ -688,7 +752,113 @@ def unfold_supercell(band: BandData, procar: ProcarData, tr: Transform,
             energies[ik, j, :e.size] = e
             weights[ik, j, :e.size] = w
             valid[ik, j, :e.size] = True
+            if with_orbitals:
+                # 同一套 (候选归属 + 能量排序) ⇒ 逐带挑出同一批带
+                sel = np.nonzero((assign[ik] == j) & nonzero[ik])[0]
+                order = sel[np.argsort(e_all[ik, sel], kind="stable")]
+                orbital_weights[ik, j, :order.size] = w_orb_best[ik, j, order]
     return UnfoldedResult(k_cand=k_cand, energies=energies, weights=weights,
+                           orbital_weights=orbital_weights,
                            s1=int(s1), s2=int(s2), dominance=dominance,
                            valid=valid, dominance_report=report,
                            band_energies=e_all, band_weights=w_best)
+
+
+
+def _plane_wave_primitive_coords(gidx: np.ndarray,
+                                 m_inv_T: np.ndarray) -> np.ndarray:
+    """平面波的整数索引 -> **原胞倒空间分数坐标**。
+
+    超胞倒格矢基 B_sc = B_prim · M^{-T}(行向量约定) ⇒ 整数索引 n 的平面波,
+    在原胞倒空间基下的分数坐标 = n · M^{-T}。
+    """
+    return gidx.astype(float) @ m_inv_T
+
+
+def unfold_supercell_plane_waves(band: BandData, wavecar_path: str, tr: Transform,
+                                  m_eff: np.ndarray, a_prim: np.ndarray,
+                                  prim_cart: np.ndarray, b_prim: np.ndarray,
+                                  b_super: np.ndarray, k_super_list: np.ndarray,
+                                  strict_dominance: bool = False,
+                                  min_dominance: float = MIN_DOMINANCE
+                                  ) -> UnfoldedResult:
+    """平面波路线: 严格谱权重 w(k') = Σ_g |C(g + k' - K)|²。
+
+    公式出自 Popescu & Zunger, PRB **85**, 085201 (2012) ��录 Eq. (A8);
+    实现细节见 :mod:`unfoldfs.pwunfold`。
+
+    与 PROCAR 路线的差别(论文 §II):
+    - 权重是**严格的谱权重**(平面波基正交完备)而不是相对量;
+    - **没有相位约定**: 权重是模方, 与超胞态的整体相位无关 ⇒ 不做约定择优,
+      也就没有"约定落在简并区"的告警;
+    - **没有"代表原子平均"这一步** ⇒ 没有那一步带来的协变性破缺。
+
+    WAVECAR 的 k 点顺序**不假定**与 EIGENVAL 相同: 用 WAVECAR 自带的笛卡尔 k
+    换算回超胞分数坐标, 再与 EIGENVAL 的 k 逐点匹配(周期距离)。
+
+    det(M) == 1 时没有展开可言, 直接报错(原胞直算另走 PROCAR 路线)。
+    """
+    _check_transform(tr, m_eff)
+    if tr.det == 1:
+        raise ValueError("det(M) == 1 没有展开可言; 原胞直算请用 PROCAR 路线")
+    k_list = np.atleast_2d(np.asarray(k_super_list, dtype=float))
+    n_k = k_list.shape[0]
+    n_band_eig = int(band.energies.shape[1])
+    header = read_wavecar_header(wavecar_path, nkpts=n_k, nspin=1)
+    if header.nbands < n_band_eig:
+        raise ValueError(
+            "WAVECAR 只有 %d 条带, 少于 EIGENVAL 的 %d 条 —— WAVECAR 与 "
+            "EIGENVAL 必须出自同一次计算" % (header.nbands, n_band_eig))
+    n_band_use = min(header.nbands, n_band_eig)
+    det_m = int(tr.det)
+    m_inv_T = np.asarray(tr.m_inv, dtype=float).T
+    a_super = np.asarray(a_prim, float) @ m_eff.T   # 超胞晶格(行向量)
+    w_best = np.zeros((n_k, det_m, n_band_use))
+    completeness = np.zeros((n_k, n_band_use))
+    n_matched = 0
+    for kp in iter_wavecar_kpoints(wavecar_path, header):
+        if kp.index >= n_k:
+            break
+        # WAVECAR 头里的 k 是**分数** k(超胞晶体坐标, 与 EIGENVAL 同一约定),
+        # 直接与 EIGENVAL 的 k 逐点比对(不依赖两个文件的 k 顺序一致)
+        k_wc = np.mod(np.asarray(kp.k_frac, dtype=float), 1.0)
+        dd_k = np.abs(k_list - k_wc[None, :])
+        dd_k = np.minimum(dd_k, 1.0 - dd_k)
+        d = np.linalg.norm(dd_k, axis=1)
+        j = int(np.argmin(d))
+        if d[j] > 1e-4:
+            raise ValueError(
+                "WAVECAR 的第 %d 个 k 点在 EIGENVAL 的 k 列表里找不到"
+                "(最近距离 %.2e)" % (kp.index, d[j]))
+        # 候选: 每个超胞 k 有 det(M) 个候选原胞 k'
+        g_cand, _k_frac, _d_g = _candidate_k(k_wc, m_eff, m_inv_T, b_prim, b_super)
+        # 等价类判定: 平面波 n 属于候选 j <=> (K+n)·M^{-T} ≡ k'_j·M^{-T} (mod 1)
+        u = np.mod(_plane_wave_primitive_coords(kp.gvec, m_inv_T), 1.0)
+        u_cand = np.mod(_plane_wave_primitive_coords(g_cand, m_inv_T), 1.0)
+        dd = np.abs(u[:, None, :] - u_cand[None, :, :])
+        dd = np.minimum(dd, 1.0 - dd).max(axis=2)          # (nplw, detM)
+        labels = np.argmin(dd, axis=1)
+        if float(dd.min(axis=1).max()) > _PW_CLASS_TOL:
+            raise ValueError(
+                "第 %d 个 k 点有平面波无法归入任何一个候选等价类(最大残差 "
+                "%.2e) —— 变换矩阵与 WAVECAR 的晶胞不自洽" % (kp.index,
+                                                             dd.min(axis=1).max()))
+        w, comp = plane_wave_weights(kp.coeffs[:n_band_use].T, labels,
+                                     np.arange(det_m))
+        w_best[j] = w
+        completeness[j] = comp
+        n_matched += 1
+    if n_matched != n_k:
+        raise ValueError("WAVECAR 匹配到 %d 个 k 点, 期望 %d" % (n_matched, n_k))
+    # 完备性: Σ_j w_j = 1(候选集是平面波基的划分)。偏离即说明分类有错。
+    dev = np.abs(completeness - 1.0)
+    if float(dev.max()) > _PW_COMPLETENESS_TOL:
+        raise ValueError(
+            "完备性 Σ_j w_j = 1 不成立(最大偏差 %.2e) —— 候选等价类的构造有误"
+            % float(dev.max()))
+    band_idx = np.arange(n_k)
+    report = DominanceReport(scores=(), degenerate=False)
+    return _pack_unfolded(w_best, band, band_idx, k_list, m_eff, tr, b_prim,
+                          b_super, report, strict_dominance, None, 0,
+                          n_band_use, s1=1, s2=1, with_orbitals=False,
+                          min_dominance=min_dominance)

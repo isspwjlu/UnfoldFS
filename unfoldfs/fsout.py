@@ -278,7 +278,12 @@ def make_e_grid(e_f: float, half_width: float, n: int) -> np.ndarray:
 BOHR_IN_ANGSTROM = 0.529177210903
 
 _HEADER_COMMENT = [
-    "unfoldfs: unfolded Fermi surface (spectral function A(k, E_F))",
+    # ⚠ 这**不是**费米面, 而是 E_F 处的**展宽谱函数**。对它取等值面得到的是
+    # 高斯脊的**两壁**, 不是费米面(脊顶)—— 见 README §6 第 4 条与论文 §III.A。
+    # cube 格式只允许**两行**注释(第 3 行就是 natoms), 所以警示与单位说明
+    # 必须挤在两行里。
+    "unfoldfs: broadened spectral function A(k, E_F) -- NOT the Fermi surface "
+    "(its isosurface = ridge flanks, not the crest)",
     "units: E in eV; cell vectors in Bohr (cube format = atomic units); "
     "k = 2pi/Angstrom / 0.529177; reciprocal box = BZ",
 ]
@@ -290,11 +295,16 @@ def _isolevel_hint(vmax: float) -> str:
     VESTA 的默认 isolevel = 0 —— 只有当高斯尾巴**恰好**下溢到 0.0 时才看得见
     等值面(实测: 换个 sigma 或能量窗口就可能什么都没有)。故给出"最大值的一
     半"作为建议层级: 稳健, 且落在 (0, max) 内。
+
+    ⚠ 这个层级是给"让等值面可见"用的, **不是**给"得到费米面"用的 ——
+       0.5·max 恰好落在脊的**两壁**上(见文件头与 README §6 第 4 条)。
     """
     if not np.isfinite(vmax) or vmax <= 0.0:
         return f"field max = {vmax:.3e}; (empty field: no isosurface)"
     return (f"field max = {vmax:.3e}; "
-            f"use isosurface level ~ {0.5 * vmax:.3e}")
+            f"use isosurface level ~ {0.5 * vmax:.3e} "
+            f"(visibility only; this is the ridge's flank, not the Fermi "
+            f"surface -- draw the FS from FS.bxsf / band.N)")
 
 
 def _check_lines(lines: List[str], min_lines: int, path: str) -> None:
@@ -609,7 +619,8 @@ def read_fermisurfer_band(path: str) -> Dict:
 
 def write_spectral_npz(path: str, expanded: ExpandedData, b_prim: np.ndarray,
                        e_f: float, *, vbm: float, cbm: float, e_grid: np.ndarray,
-                       sigma: float) -> None:
+                       sigma: float, orbital_labels: Optional[Sequence[str]] = None
+                       ) -> None:
     """写完整谱函数 + 元信息(自用/二次分析)。
 
     存: A(k,E) 体数据、E 网格、k 坐标(笛卡尔 + 分数)、逐带能量/权重/有效位
@@ -623,6 +634,14 @@ def write_spectral_npz(path: str, expanded: ExpandedData, b_prim: np.ndarray,
     a = build_spectral_function(expanded, e_grid, float(sigma))
     k_cart = np.asarray(expanded.k_cart, dtype=float)
     k_frac = k_cart @ np.linalg.inv(np.asarray(b_prim, dtype=float))
+    extra = {}
+    if expanded.orbital_weights is not None:
+        n_orb = int(expanded.orbital_weights.shape[2])
+        extra["band_orb"] = np.asarray(expanded.orbital_weights, dtype=float)
+        labels = list(orbital_labels) if orbital_labels else []
+        if len(labels) < n_orb:                 # 兜底: 不足的名字用序号占位
+            labels += [f"orb{i}" for i in range(len(labels), n_orb)]
+        extra["orb_labels"] = np.array(labels[:n_orb])
     np.savez_compressed(
         path,
         A=a,
@@ -638,4 +657,5 @@ def write_spectral_npz(path: str, expanded: ExpandedData, b_prim: np.ndarray,
         sigma=float(sigma),
         k_units=np.array("2pi/Angstrom"),
         e_units=np.array("eV"),
+        **extra,
     )

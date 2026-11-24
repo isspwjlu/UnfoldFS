@@ -18,7 +18,7 @@ unfold_band_plot_mirror.m`` 读 ``ENERGY.grd`` / ``MOMENTUM.grd`` / ``WEIGHT.grd
   * ``KLABELS`` = 表头 + N 行"标签 + 距离"(标签**右对齐**在 12 列, 距离右对齐在
     12 列)+ 2 行只含一个空格 + vaspkit 的提示行。
 
-**权重语义(必须与 vaspkit 282 区分开)**: 这里的权重是 **Popescu 投影法给出的
+**权重语义(必须与 vaspkit 282 区分开)**: 这里的权重是 **Bloch-character 投影法给出的
 G 分辨权重**(路径点上取"原胞 k 等于该路径点"的那个候选的投影权重),
 **不是** vaspkit 282 用 WAVECAR 平面波展开得到的原胞带 |c(k)|²。两者都叫
 "权重"但物理含义不同 ⇒ 见 docs/algorithms.md 的对应一节。
@@ -366,8 +366,8 @@ def assemble_band(unfolded, k_prim: np.ndarray, tol: float = CANDIDATE_TOL,
 
     * ``assign``（默认）：每个路径点取"原胞 k 等于该路径点"的候选(见
       ``select_zero_candidate``), 候选内的带按能量升序 ⇒ 画出来**就是原胞的
-      能带 + 它的 Popescu 权重**（干净, 但没有折叠副本 ⇒ 没有低权重色散背景）。
-    * ``full``（经典 Popescu 展开能带图）：每个路径点画**全部**超胞带, 颜色 =
+      能带 + 它的 Bloch-character 权重**（干净, 但没有折叠副本 ⇒ 没有低权重色散背景）。
+    * ``full``（经典 Bloch-character 展开能带图）：每个路径点画**全部**超胞带, 颜色 =
       该带在**匹配通道**上的权重 ⇒ 强带 = 原胞在 k' 的带, 弱带 = 别的 k' 的带
       （折叠副本）⇒ 谱有"低权重色散"的弥散背景, 与论文里的展开能带图一致。
 

@@ -455,6 +455,20 @@ def test_cube_header_states_the_units_and_the_fake_lattice(tmp_path):
     assert "reciprocal" in head.lower()
 
 
+def test_cube_header_says_it_is_not_the_fermi_surface(tmp_path):
+    """⚠ FS.cube 里装的是 A(k,E_F) —— **不是**费米面。
+
+    头部必须说清楚, 否则用户按"画等值面"的常规做法就会得到高斯脊的**两壁**
+    (这正是论文 §III.A 批评的那个构造)。见 README §6 第 4 条。
+    """
+    exp = _make_expanded()
+    path = tmp_path / "FS.cube"
+    write_cube(str(path), exp, B_PRIM, _expected_a(exp))
+    head = "\n".join(path.read_text(encoding="utf-8").splitlines()[:2])
+    assert "NOT the Fermi surface" in head
+    assert "flank" in head
+
+
 def test_cube_header_states_the_field_max_and_a_suggested_isolevel(tmp_path):
     """VESTA 的默认 isolevel = 0 —— 头部必须告诉用户该选什么层级。
 

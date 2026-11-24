@@ -40,7 +40,7 @@ k 侧约定: ``k'_prim = (K + g)·(M^-1)^T`` —— 倒空间用 M^-T, **注意�
 笛卡尔坐标整整差一个倒格矢。
 
 **点群轨道对称化(修复轮 5)**: 展开得到的 A(k,E) 在晶体点群下**不协变** ——
-同一轨道上的对称相关点给出不同的谱权重(机制: Popescu 副本平均用的是**一个
+同一轨道上的对称相关点给出不同的谱权重(机制: Bloch-character 副本平均用的是**一个
 代表原子**的位置, 对称操作把代表原子映到另一个原子(附带原胞晶格平移 Δᵢ)时
 相位多出 (k'−K)·Δᵢ 项)。``symmetrize_spectral_function`` 把 A(k,E) 按轨道
 平均, 正好抵消这一项(实测最大相对偏差 1.000e+00 -> 0.000e+00), 即把展开谱
@@ -98,6 +98,13 @@ class ExpandedData:
     band_w: np.ndarray
     valid: np.ndarray
     spec: GridSpec
+    orbital_weights: Optional[np.ndarray] = None
+    """逐轨道谱权重 (n_points, n_band_eff, norb); 默认 None(不计算)。
+
+    只有 ``unfold_supercell(..., with_orbitals=True)`` 时才有。
+    ⚠ 各轨道的权重之和**不等于** band_w(交叉项)⇒ 成分占比要用
+       ``W_orb / Σ_n W_orb`` 归一化后使用。
+    """
 
 
 def _grid_frac_points(gm: GridMap) -> np.ndarray:
@@ -137,7 +144,8 @@ def _wrap01(v: np.ndarray) -> np.ndarray:
 
 
 def _merge_source_bands(sources: List[Tuple[np.ndarray, np.ndarray]],
-                        merge_tol: float) -> Tuple[np.ndarray, np.ndarray]:
+                        merge_tol: float,
+                        orbitals: Optional[List[np.ndarray]] = None):
     """把多个源的带按**能量对齐**合并: 能量相同(差 <= merge_tol)的带权重相加。
 
     ``sources`` = [(能量数组, 权重数组), ...]; 每个数组已按能量升序、且**不含**
@@ -148,13 +156,20 @@ def _merge_source_bands(sources: List[Tuple[np.ndarray, np.ndarray]],
     * 同一个源内部的匹配是**单调**的(第 n 条带只会匹配到第 n 条已合并带之后
       的位置)⇒ 简并带在源之间也能一一对上;
     * 合并后的列表按能量升序(稳定排序 ⇒ 源 0 的顺序不变)。
+
+    ``orbitals`` 给了就同时合并逐轨道权重(每个元素是该源的 (n_band, norb)
+    数组, 与 sources 一一对应), 返回值多一个 (n_merged, norb) 数组。
     """
     merged_e: List[float] = []
     merged_w: List[float] = []
     merged_src: List[set] = []
+    merged_o: List[np.ndarray] = []
+    n_orb = 0 if orbitals is None else int(np.asarray(orbitals[0]).shape[1])
     for s, (e_src, w_src) in enumerate(sources):
         cursor = 0
-        for e, w in zip(np.asarray(e_src, float), np.asarray(w_src, float)):
+        o_src = None if orbitals is None else np.asarray(orbitals[s], dtype=float)
+        for idx, (e, w) in enumerate(zip(np.asarray(e_src, float),
+                                         np.asarray(w_src, float))):
             hit = -1
             for i in range(cursor, len(merged_e)):
                 if abs(float(e) - merged_e[i]) <= merge_tol and \
@@ -165,16 +180,26 @@ def _merge_source_bands(sources: List[Tuple[np.ndarray, np.ndarray]],
                 merged_e.append(float(e))
                 merged_w.append(float(w))
                 merged_src.append({s})
+                if orbitals is not None:
+                    merged_o.append(o_src[idx])
             else:
                 merged_w[hit] += float(w)
                 merged_src[hit].add(s)
+                if orbitals is not None:
+                    merged_o[hit] = merged_o[hit] + o_src[idx]
                 cursor = hit + 1
     if not merged_e:
-        return np.zeros(0, dtype=float), np.zeros(0, dtype=float)
+        empty = np.zeros(0, dtype=float)
+        if orbitals is None:
+            return empty, empty
+        return empty, empty, np.zeros((0, n_orb), dtype=float)
     e = np.array(merged_e, dtype=float)
     w = np.array(merged_w, dtype=float)
     order = np.argsort(e, kind="stable")
-    return e[order], w[order]
+    if orbitals is None:
+        return e[order], w[order]
+    o = np.asarray(merged_o, dtype=float)[order]
+    return e[order], w[order], o
 
 
 def expand_to_full_grid(unfolded: UnfoldedResult, grid_map: GridMap,
@@ -243,10 +268,13 @@ def expand_to_full_grid(unfolded: UnfoldedResult, grid_map: GridMap,
     else:
         valid = np.isfinite(energies)
     kcand = np.asarray(unfolded.k_cand, dtype=float)
+    orb_src = unfolded.orbital_weights      # (n_k, detM, n_band_eff, norb) 或 None
+    n_orb = 0 if orb_src is None else int(orb_src.shape[3])
 
     # 每个网格点的源列表: [(能量, 权重, 候选分数坐标), ...]
     src_e: List[List[np.ndarray]] = [[] for _ in range(n_points)]
     src_w: List[List[np.ndarray]] = [[] for _ in range(n_points)]
+    src_o: List[List[np.ndarray]] = [[] for _ in range(n_points)]
     src_frac: List[List[np.ndarray]] = [[] for _ in range(n_points)]
     primary: Dict[int, Tuple[int, int]] = {}      # 网格点 -> (K, 候选)(前 n_k 行)
     for k in range(n_rows):
@@ -282,6 +310,8 @@ def expand_to_full_grid(unfolded: UnfoldedResult, grid_map: GridMap,
             v = valid[k, j]
             src_e[i].append(energies[k, j][v])
             src_w[i].append(weights[k, j][v])
+            if orb_src is not None:
+                src_o[i].append(np.asarray(orb_src[k, j])[v])
             src_frac[i].append(cand[j])
             if k < n_k:
                 if i in primary:
@@ -300,27 +330,36 @@ def expand_to_full_grid(unfolded: UnfoldedResult, grid_map: GridMap,
             "集合不一致?")
 
     # 多源合并: 同一网格点的各源的带按能量对齐后相加
-    merged = [_merge_source_bands(list(zip(src_e[i], src_w[i])), merge_tol)
-              for i in range(n_points)]
+    if orb_src is None:
+        merged = [_merge_source_bands(list(zip(src_e[i], src_w[i])), merge_tol)
+                  for i in range(n_points)]
+    else:
+        merged = [_merge_source_bands(list(zip(src_e[i], src_w[i])), merge_tol,
+                                      src_o[i]) for i in range(n_points)]
     # 带轴长度: 不小于展开结果原来的带轴长度(补位槽的口径保持不变)
     n_band_eff = int(energies.shape[2])
-    for e, _ in merged:
+    for e, _ in [(m[0], m[1]) for m in merged]:
         n_band_eff = max(n_band_eff, int(e.size))
     band_e = np.full((n_points, n_band_eff), np.inf)
     band_w = np.zeros((n_points, n_band_eff))
+    band_orb = (np.zeros((n_points, n_band_eff, n_orb))
+                if orb_src is not None else None)
     out_valid = np.zeros((n_points, n_band_eff), dtype=bool)
     frac = np.zeros((n_points, 3))
     for i in range(n_points):
-        e, w = merged[i]
+        e, w = merged[i][0], merged[i][1]
         m = int(e.size)
         band_e[i, :m] = e
         band_w[i, :m] = w
         out_valid[i, :m] = True
+        if band_orb is not None:
+            band_orb[i, :m] = merged[i][2]
         # k_cart 取**候选的**分数坐标(落在 [0,1)³ 内)而不是轨道像 p_i
         frac[i] = src_frac[i][0]
     k_cart = frac @ np.asarray(gm.b_prim, dtype=float)
     return ExpandedData(k_cart=k_cart, band_e=band_e, band_w=band_w,
-                         valid=out_valid, spec=gm.spec)
+                         valid=out_valid, spec=gm.spec,
+                         orbital_weights=band_orb)
 
 
 def build_spectral_function(expanded: ExpandedData, e_grid: np.ndarray,
@@ -435,7 +474,7 @@ def symmetrize_spectral_function(a: np.ndarray, grid_map: GridMap,
     **为什么需要它**: 展开得到的 A(k,E) 在晶体点群下**不协变** —— 同一轨道上
     的对称相关点给出不同的谱权重(实测最大相对偏差 MoS2 9.186e-01 /
     1T-TaS2 1.000e+00, 即"一个谱峰被映到 0")。机制见 docs/algorithms.md §15:
-    Popescu 副本平均用的是**一个代表原子**的位置, 对称操作把代表原子映到
+    Bloch-character 副本平均用的是**一个代表原子**的位置, 对称操作把代表原子映到
     另一个原子(附带原胞晶格平移 Δᵢ)时相位会多出 (k'−K)·Δᵢ 项 ⇒ 权重不协变。
     **按轨道平均正好抵消这一项** ⇒ 偏差降到机器精度。
 

@@ -38,6 +38,10 @@ from .band import (assemble_band, dedup_k_points, path_distances, path_labels,
                    write_kpoints_explicit)
 from .expand import (build_spectral_function, expand_to_full_grid,
                      symmetrize_spectral_function)
+from .fs import (crest_curves, crest_field, dispersion, fermi_velocity,
+                 load_spectral_npz, orbital_fraction_at_peak,
+                 spectral_at_ef_from_bands, spectral_curves,
+                 symmetrize_field, velocity_to_si, verify_fermi_surface)
 from .fsout import (band_edges, has_fermi_crossing, make_e_grid,
                     select_fermi_energy, write_bxsf,
                     write_cube, write_fermisurfer_bands,
@@ -47,7 +51,8 @@ from .geometry import (common_symmetry_ops_detailed, primitive_symmetry_ops,
 from .grid import (GridSpec, build_grid_map, choose_grid_points,
                    filter_ops_by_grid_detailed, load_grid_map,
                    primitive_grid_points, save_grid_map, write_kpoints)
-from .unfold import build_atom_copies, unfold_supercell
+from .unfold import (build_atom_copies, unfold_supercell,
+                     unfold_supercell_plane_waves)
 from .vaspio import BandData, read_doscar_fermi, read_eigenval, read_procar
 
 __all__ = ["main", "cmd_gen", "cmd_unfold", "cmd_band", "cmd_info"]
@@ -424,16 +429,32 @@ def _check_grid_map_consistency(gm, tr, prim, sc) -> None:
                 "`unfoldfs gen`。")
 
 
-def _print_convention_line(unfolded, det: int) -> None:
+def _min_dominance(args) -> float:
+    """单 G 主导度下限: 命令行给了就用给的, 否则用模块默认值。"""
+    from .unfold import MIN_DOMINANCE
+    v = getattr(args, "min_dominance", None)
+    return MIN_DOMINANCE if v is None else float(v)
+
+
+def _print_convention_line(unfolded, det: int, plane_wave: bool = False) -> None:
     """打印相位约定那一行 —— 直通模式(det(M)=1)下**没有**约定可择优。
 
     直通模式不能打印"单 G 主导度 nan"(那是个填充值, 不是分数), 也不该
     打印 s1/s2(没有择优发生过)⇒ 换成一行说清模式与权重定义的话。
+
+    平面波路线同样**没有相位约定**(权重是模方, 与态的整体相位无关)⇒ 同样
+    换成一行说清权重定义的话。
     """
     if det == 1:
         print("模式          : 原胞直通 (det(M)=1 —— 不做展开; "
-              "权重 = Σ_{ion,lm}|c|², 与超胞展开模式的 Popescu G 投影不是"
+              "权重 = Σ_{ion,lm}|c|², 与超胞展开模式的 Bloch-character G 投影不是"
               "同一个定义)")
+        return
+    if plane_wave:
+        print("权重定义      : 平面波严格谱权重 Σ_g |C(g + k' - K)|² "
+              "(Popescu--Zunger 附录 Eq. A8; 完备性 Σ_k' w = 1) —— "
+              "**无相位约定**(权重是模方, 与态的整体相位无关); "
+              f"单 G 主导度 {unfolded.dominance:.4f}")
         return
     print(f"相位约定      : s1 = {unfolded.s1:+d}, s2 = {unfolded.s2:+d} "
           f"(单 G 主导度 {unfolded.dominance:.4f})")
@@ -441,7 +462,8 @@ def _print_convention_line(unfolded, det: int) -> None:
 
 def _write_spectral_npz(path: str, expanded, b_prim: np.ndarray, e_f: float, *,
                         vbm: float, cbm: float, e_grid: np.ndarray, sigma: float,
-                        symmetrize=None, ops=None) -> None:
+                        symmetrize=None, ops=None,
+                        orbital_labels=None) -> None:
     """写 ``A(k,E).npz``; 给定 ``symmetrize`` 时把文件里的 A 换成**对称化后**的。
 
     ``fsout.write_spectral_npz`` 自己从 ``expanded`` 重算 A(k,E) —— 而对称化是
@@ -454,9 +476,11 @@ def _write_spectral_npz(path: str, expanded, b_prim: np.ndarray, e_f: float, *,
 
     ``ops``: 对称化用的对称操作(缺省 = 原胞完整点群, 见
     ``expand.symmetrize_spectral_function``)。
+    ``orbital_labels``: 轨道名(PROCAR 表头读出的), 随逐轨道权重一起落盘。
     """
     write_spectral_npz(path, expanded, b_prim, e_f, vbm=vbm, cbm=cbm,
-                       e_grid=e_grid, sigma=sigma)
+                       e_grid=e_grid, sigma=sigma,
+                       orbital_labels=orbital_labels)
     if symmetrize is None:
         return
     a = symmetrize_spectral_function(
@@ -496,11 +520,17 @@ def cmd_unfold(args: argparse.Namespace) -> int:
                   f"费米面会缺态。请在 INCAR 里加大 NBANDS(建议 "
                   f"unfoldfs gen --nbands 覆盖)。", file=sys.stderr)
 
-    procar = read_procar(os.path.join(run_dir, "PROCAR"))
-    if procar.kpoints.shape[0] != gm.n_k:
-        raise ValueError(
-            f"PROCAR 里的 k 点数 {procar.kpoints.shape[0]} != grid_map 记录 "
-            f"{gm.n_k}。请确认 PROCAR 与 EIGENVAL 出自同一次计算。")
+    wavecar = getattr(args, "wavecar", None)
+    if wavecar is None:
+        procar = read_procar(os.path.join(run_dir, "PROCAR"))
+        if procar.kpoints.shape[0] != gm.n_k:
+            raise ValueError(
+                f"PROCAR 里的 k 点数 {procar.kpoints.shape[0]} != grid_map 记录 "
+                f"{gm.n_k}。请确认 PROCAR 与 EIGENVAL 出自同一次计算。")
+    else:
+        if not os.path.exists(wavecar):
+            raise ValueError(f"WAVECAR 不存在: {wavecar}")
+        procar = None
 
     dos_path = os.path.join(run_dir, "DOSCAR")
     need_dos = str(args.ef).strip().lower() in ("auto", "doscar", "dos")
@@ -516,7 +546,10 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     sc = read_poscar(supercell)
     tr = resolve_transform(sc, prim, read_transmat(transmat))
     _check_grid_map_consistency(gm, tr, prim, sc)
-    copies = build_atom_copies(prim, sc, tr)
+    # 原子副本表只有轨道投影路线用得到(平面波路线的权重只依赖平面波系数
+    # 与倒格矢)⇒ 惰性构造, 否则畸变超胞(CDW、缺陷)会在这里就报
+    # "原子副本匹配失败", 而平面波路线根本不需要原子对应。
+    copies = None if wavecar is not None else build_atom_copies(prim, sc, tr)
     b_prim = reciprocal(prim.lattice)
     b_super = reciprocal(sc.lattice)
 
@@ -562,10 +595,24 @@ def cmd_unfold(args: argparse.Namespace) -> int:
             print(f"提示: {message}", file=sys.stderr)
 
     # 展开必须传 gm.k_super(去重后的超胞 k), 不是 IR 点列表
-    unfolded = unfold_supercell(
-        band, procar, tr, copies, tr.m_eff, prim.lattice,
-        prim.positions @ prim.lattice, b_prim, b_super, gm.k_super,
-        strict_dominance=args.strict_dominance)
+    if wavecar is not None:
+        # 平面波路线: 严格谱权重, 无相位约定, 无代表原子平均
+        unfolded = unfold_supercell_plane_waves(
+            band, wavecar, tr, tr.m_eff, prim.lattice,
+            prim.positions @ prim.lattice, b_prim, b_super, gm.k_super,
+            strict_dominance=args.strict_dominance,
+            min_dominance=_min_dominance(args))
+        if getattr(args, "orbitals", False):
+            raise ValueError(
+                "平面波路线暂不提供逐轨道权重(轨道分辨来自 PROCAR 的分波)。"
+                "要轨道分辨请走 PROCAR 路线, 或在两条路线上都跑一遍。")
+    else:
+        unfolded = unfold_supercell(
+            band, procar, tr, copies, tr.m_eff, prim.lattice,
+            prim.positions @ prim.lattice, b_prim, b_super, gm.k_super,
+            strict_dominance=args.strict_dominance,
+            with_orbitals=getattr(args, "orbitals", False),
+            min_dominance=_min_dominance(args))
     expanded = expand_to_full_grid(unfolded, gm)
 
     # ★ 点群轨道对称化(默认开): 把展开谱 A(k,E) 投影到"对称不变子空间" ——
@@ -579,7 +626,7 @@ def cmd_unfold(args: argparse.Namespace) -> int:
     full_ops = primitive_symmetry_ops(prim, _symprec(args))
     n_common = int(gm.ops.rotations.shape[0])
 
-    _print_convention_line(unfolded, tr.det)
+    _print_convention_line(unfolded, tr.det, plane_wave=(wavecar is not None))
     print("点群对称化    : " + ("已启用(按**原胞完整点群**("
                                f"{full_ops.rotations.shape[0]} 个操作)轨道平均 "
                                "A(k,E); --no-symmetrize 可关闭)" if symmetrize
@@ -611,11 +658,17 @@ def cmd_unfold(args: argparse.Namespace) -> int:
           "的有效带数一致), 按带序号平均会把不同的带混在一起;"
           "谱函数派生的输出(FS.cube / A(k,E).npz)是完全对称的)")
     e_grid = make_e_grid(e_f, _NPZ_HALF_WIDTH, _NPZ_N_POINTS)
+    # 逐轨道权重只有 PROCAR 路线才有(平面波路线不读 PROCAR)
     _write_spectral_npz(npz_path, expanded, b_prim, e_f, vbm=vbm, cbm=cbm,
                         e_grid=e_grid, sigma=args.sigma,
                         symmetrize=gm if symmetrize else None,
-                        ops=full_ops if symmetrize else None)
+                        ops=full_ops if symmetrize else None,
+                        orbital_labels=(procar.orbital_labels
+                                        if procar is not None else None))
     print(f"已写出        : {npz_path}")
+    if expanded.orbital_weights is not None and procar is not None:
+        print(f"  含逐轨道谱权重 band_orb (轨道: "
+              f"{', '.join(procar.orbital_labels)})")
     # BXSF 只支持 Gamma 网格(见 docs/formats.md §3): MP 网格下跳过它,
     # 但把原因说清楚 —— 其余输出(FS.cube / band.N / npz)对 MP 网格都成立
     try:
@@ -746,7 +799,13 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
             "--transmat ... --kpath KPATH.in --outdir <dir>`")
 
     band_data = _read_eigenval_needed(run_dir, args.ef)
-    procar = read_procar(os.path.join(run_dir, "PROCAR"))
+    wavecar = getattr(args, "wavecar", None)
+    if wavecar is None:
+        procar = read_procar(os.path.join(run_dir, "PROCAR"))
+    else:
+        if not os.path.exists(wavecar):
+            raise ValueError(f"WAVECAR 不存在: {wavecar}")
+        procar = None
     dos_path = os.path.join(run_dir, "DOSCAR")
     need_dos = str(args.ef).strip().lower() in ("auto", "doscar", "dos")
     if os.path.exists(dos_path):
@@ -760,7 +819,9 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
     prim = read_poscar(primcell)
     sc = read_poscar(supercell)
     tr = resolve_transform(sc, prim, read_transmat(transmat))
-    copies = build_atom_copies(prim, sc, tr)
+    # 原子副本表只有轨道投影路线用得到(平面波路线的权重不依赖原子对应)⇒
+    # 惰性构造: 否则畸变超胞(如 CDW 态)会在这里就报"副本匹配失败"。
+    copies = None if wavecar is not None else build_atom_copies(prim, sc, tr)
     b_prim = reciprocal(prim.lattice)
     b_super = reciprocal(sc.lattice)
 
@@ -794,10 +855,19 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
     # 完全同一条规则** —— 修复轮 7 / B4: `band` 曾经把路径点摊开再采样,
     # 于是两个子命令在同一组超胞 k 上选出了不同的 (s1, s2)
     # (实测 band=(-1,+1) vs unfold=(+1,-1))⇒ 结果不可复现。
-    unfolded = unfold_supercell(
-        band_data, procar, tr, copies, tr.m_eff, prim.lattice,
-        prim.positions @ prim.lattice, b_prim, b_super, k_unique,
-        strict_dominance=args.strict_dominance)
+    if wavecar is not None:
+        # 平面波路线: 严格谱权重, 无相位约定, 无代表原子平均
+        unfolded = unfold_supercell_plane_waves(
+            band_data, wavecar, tr, tr.m_eff, prim.lattice,
+            prim.positions @ prim.lattice, b_prim, b_super, k_unique,
+            strict_dominance=args.strict_dominance,
+            min_dominance=_min_dominance(args))
+    else:
+        unfolded = unfold_supercell(
+            band_data, procar, tr, copies, tr.m_eff, prim.lattice,
+            prim.positions @ prim.lattice, b_prim, b_super, k_unique,
+            strict_dominance=args.strict_dominance,
+            min_dominance=_min_dominance(args))
     unfold_mode = getattr(args, "unfold_mode", "assign")
     energy, weight = assemble_band(unfolded, path.k_prim, index_map=index_map,
                                    mode=unfold_mode)
@@ -825,7 +895,8 @@ def cmd_band_unfold(args: argparse.Namespace) -> int:
     write_klabels(klabels_path, labels)
     write_band_dat(dat_path, dist, energy, weight)
 
-    _print_convention_line(unfolded, tr.det)
+    _print_convention_line(unfolded, tr.det,
+                          plane_wave=(wavecar is not None))
     print("点群对称化    : " + ("已启用(按点群轨道平均路径上对称相关点的权重; "
                                "--no-symmetrize 可关闭)" if symmetrize
                                else "已关闭(--no-symmetrize)"))
@@ -897,6 +968,157 @@ def _symmetry_summary(gm) -> str:
     return f"保留 {n_keep} / 剔除 {len(dropped)} (原因: {detail})"
 
 
+def cmd_fs(args: argparse.Namespace) -> int:
+    """从 ``A(k,E).npz`` 提取费米面(脊顶)并做诊断。
+
+    这是"最后一步"的可执行版本: 提取真费米面(脊顶)、报点群协变性的离散度
+    δ(R)、在给出原胞直算结果时做验证协议(重合率 + 距离统计), 并可读出
+    费米速度与轨道成分。
+
+    ⚠ δ(R) 必须用**未对称化**的谱来算: npz 里的 A 已经过轨道平均, 用它算
+    恒得 0。这里从逐带数据重建原始谱, 同时报出对称化后的值作对照。
+    """
+    slice_ = load_spectral_npz(args.npz, kz=args.kz)
+    prim = read_poscar(args.prim)
+    b_prim = reciprocal(prim.lattice)
+    b2d = np.asarray(b_prim)[:2, :2]
+
+    # --- 协变性诊断: 原始谱 vs 对称化后的谱 ---
+    if not args.no_covariance:
+        ops = primitive_symmetry_ops(prim, symprec=args.symprec)
+        print(f"点群: {len(ops.rotations)} 个操作 "
+              f"(spglib symprec={args.symprec:g} Å)")
+        raw = spectral_at_ef_from_bands(
+            slice_.band_e, slice_.band_w, slice_.valid, slice_.e_grid,
+            slice_.e_f, slice_.sigma)
+        d_raw_max, d_raw_mean = dispersion(raw, ops, b_prim)
+        d_sym_max, d_sym_mean = dispersion(slice_.a_ef, ops, b_prim)
+        print(f"协变性 δ(R): 未对称化 max "
+              f"{d_raw_max:.3e} | mean {d_raw_mean:.3e}")
+        print(f"                  对称化后 max {d_sym_max:.3e} | "
+              f"mean {d_sym_mean:.3e}")
+        if d_raw_max > 1e-6:
+            print("  ⚠ 展开谱在点群下**不协变**"
+                  "（对称相关的点给出不同的谱权重）"
+                  "；请用已对称化的谱变开取费米面。",
+                  file=sys.stderr)
+
+    # --- 提取费米面 ---
+    crest = crest_field(slice_.a, slice_.e_grid, slice_.e_f, slice_.sigma,
+                        max_shift=args.max_shift,
+                        min_weight_frac=args.min_weight_frac,
+                        b2d=b2d, blur_cells=args.blur)
+    if args.symmetrize and not args.no_covariance:
+        # 脊顶场本身也要轨道平均: 嵌套体系(如体相 1T-TaS2)在嵌套向量处
+        # 两条带在 E_F 附近交换 → 主峰跳到另一条 → E* 偏离 E_F → 等值线在那里
+        # 不存在 → **费米面的臂在\"腰"处整段消失**。
+        ops_s = primitive_symmetry_ops(prim, symprec=args.symprec)
+        crest = symmetrize_field(crest, slice_.fx, slice_.fy, ops_s)
+    if args.mode == "spectral":
+        print("⚠ --mode spectral 取的是 A(k,E_F) 的等值线, "
+              "那是高斯脊的**两壁**, "
+              "**不是费米面**; 仅用于复现"
+              "社区惯用画法。", file=sys.stderr)
+        curves = spectral_curves(slice_.a_ef, slice_.fx, slice_.fy, b2d,
+                                 b_prim[0][:2], b_prim[1][:2])
+    else:
+        curves = crest_curves(crest - slice_.e_f, slice_.fx, slice_.fy, b2d,
+                              b_prim[0][:2], b_prim[1][:2])
+        n_ok = int(np.isfinite(crest).sum())
+        print(f"脊顶场: {n_ok} / {crest.size} 个 k 通过"
+              f"三道闸门")
+
+    if not curves:
+        print("错误: 没有取到任何费米面"
+              "曲线 —— 检查 E_F、展宽与网格。",
+              file=sys.stderr)
+        return 1
+    total = sum(len(c) for c in curves)
+    print(f"费米面曲线: {len(curves)} 段, 共 {total} "
+          f"个顶点")
+
+    # --- 验证协议 ---
+    if args.verify:
+        other = load_spectral_npz(args.verify, kz=args.kz)
+        other_crest = crest_field(other.a, other.e_grid, other.e_f, other.sigma,
+                                  max_shift=args.max_shift,
+                                  min_weight_frac=args.min_weight_frac,
+                                  b2d=b2d, blur_cells=args.blur)
+        other_curves = (spectral_curves(other.a_ef, other.fx, other.fy, b2d,
+                                         b_prim[0][:2], b_prim[1][:2])
+                        if args.mode == "spectral" else
+                        crest_curves(other_crest - other.e_f, other.fx, other.fy,
+                                     b2d, b_prim[0][:2], b_prim[1][:2]))
+        mesh = float(np.linalg.norm(b2d[0])) / slice_.n1
+        # 直算的 δ(R) 是**网格离散的地板**——对称相关的点不一定是网格点，所以重现的 A 并不完全对称；
+        # 把它报出来, 才能区分"结构性的不对称"与"投影引入的不对称"。
+        if not args.no_covariance:
+            ops = primitive_symmetry_ops(prim, symprec=args.symprec)
+            d_ref_raw = spectral_at_ef_from_bands(
+                other.band_e, other.band_w, other.valid, other.e_grid,
+                other.e_f, other.sigma)
+            d_ref_max, _ = dispersion(d_ref_raw, ops, b_prim)
+            d_cur_raw = spectral_at_ef_from_bands(
+                slice_.band_e, slice_.band_w, slice_.valid, slice_.e_grid,
+                slice_.e_f, slice_.sigma)
+            d_cur_max, _ = dispersion(d_cur_raw, ops, b_prim)
+            print(f"  δ(R) 地板(原胞直算) {d_ref_max:.3e} | "
+                  f"展开 {d_cur_max:.3e} | 超出部分 "
+                  f"{d_cur_max - d_ref_max:.3e}")
+        for name, cur_a, cur_b in (("展开 vs 原胞", curves, other_curves),
+                                    ("原胞 vs 原胞", other_curves, other_curves)):
+            a = np.concatenate(cur_a) if cur_a else np.zeros((0, 2))
+            b = np.concatenate(cur_b) if cur_b else np.zeros((0, 2))
+            if len(a) < 2 or len(b) < 2:
+                continue
+            rep = verify_fermi_surface(a, b, mesh)
+            print(f"验证[{name}]: 重合 {rep['coincidence'] * 100:.2f}% | "
+                  f"中位 {rep['median']:.3e} 格 | 最大 "
+                  f"{rep['max']:.3e} 格")
+
+    # --- 费米速度 + 轨道成分 ---
+    extra = {}
+    if args.velocity:
+        vel = fermi_velocity(crest, slice_.fx, slice_.fy, b2d, e_f=slice_.e_f,
+                             n_rays=args.rays)
+        if len(vel["v_f"]):
+            v_si = velocity_to_si(vel["grad_frac"], b2d)
+            good = np.isfinite(v_si)
+            print(f"费米速度: {int(good.sum())} / {len(v_si)} "
+                  f"条射线有交点 | |v_F| 中位 "
+                  f"{np.nanmedian(np.abs(v_si[good])):.3e} m/s")
+            extra["v_f"] = v_si
+            extra["fermi_vectors"] = vel["vectors"]
+        else:
+            print("费米速度: 没有找到过 E_F 的交点")
+    if args.orbitals:
+        orb = orbital_fraction_at_peak(slice_.orbital_weights, slice_.band_e,
+                                       slice_.valid, crest)
+        if orb is None:
+            print("轨道成分: npz 里没有 band_orb "
+                  "(用 unfold --orbitals 重算)", file=sys.stderr)
+        else:
+            labels = slice_.orbital_labels
+            flat = orb.reshape(-1, orb.shape[-1])
+            tot = np.nansum(flat, axis=0)
+            order = np.argsort(tot)[::-1]
+            print("轨道成分 (全局均值, 前三): " +
+                  ", ".join(f"{labels[i]} {tot[i] / max(tot.sum(), 1e-30) * 100:.1f}%"
+                            for i in order[:3]))
+            extra["orbital_fraction"] = orb
+
+    if args.out:
+        np.savez_compressed(
+            args.out,
+            curves=np.concatenate(curves) if curves else np.zeros((0, 2)),
+            n_curves=np.array(len(curves)),
+            e_f=np.array(slice_.e_f),
+            mode=np.array(args.mode),
+            **extra)
+        print(f"已写出 {args.out}")
+    return 0
+
+
 def cmd_info(args: argparse.Namespace) -> int:
     """打印网格规模、对称性与约化率。"""
     gridmap_path = args.grid_map or os.path.join(args.dir, "grid_map.npz")
@@ -963,6 +1185,19 @@ def _add_unfold_args(p: argparse.ArgumentParser) -> None:
                    help="谱函数展宽 (eV)")
     p.add_argument("--strict-dominance", action="store_true",
                    help="要求每个态的单 G 主导度 >= 0.5(严格模式)")
+    p.add_argument("--min-dominance", type=float, default=None,
+                   help="单 G 主导度的下限(默认 0.5)。对**破坏平移对称**的态"
+                        "(CDW、缺陷超胞)要放宽 —— 那里的主导度低是态的性质, "
+                        "不是展开的数值失败")
+    p.add_argument("--orbitals", action="store_true",
+                   help="同时算**逐轨道**谱权重, 写进 A(k,E).npz 的 band_orb "
+                        "(轨道成分; ⚠ 各轨道权重之和 ≠ 总权重, 占比要自己按 "
+                        "band_orb/Σ_orb band_orb 归一化)")
+    p.add_argument("--wavecar", default=None,
+                   help="改走**平面波路线**: 从 WAVECAR 的平面波系数算严格谱权重 "
+                        "w(k')=|⟨k'|Ψ_K⟩|²(Popescu--Zunger 构造)。"
+                        "默认走 PROCAR 的轨道投影路线。指定本选项时 PROCAR 只在"
+                        "需要轨道分辨时才读")
     p.add_argument("--e-ref", choices=("abs", "ef"), default="abs",
                    help="PNG 的 y 轴参考: abs = 绝对能量(默认); "
                         "ef = E - E_F(E_F 落在 0, 与论文里的画法一致)")
@@ -970,7 +1205,7 @@ def _add_unfold_args(p: argparse.ArgumentParser) -> None:
                    default="assign",
                    help="能带图的展开方式: assign = 每个路径点只画**归属到该 k'** 的带"
                         "(干净, 但没有折叠副本); full = 画**全部**超胞带, 颜色 = 该带在"
-                        "k' 通道的权重(经典 Popescu 展开能带图: 有低权重色散的弥散背景)")
+                        "k' 通道的权重(经典 Bloch-character 展开能带图: 有低权重色散的弥散背景)")
     p.add_argument("--symprec", type=float, default=1e-5,
                    help="对称性判定的容差(Angstrom; spglib 的 symprec)。"
                         "结构坐标有 1e-5 级噪声时 1e-5 会漏掉大部分操作"
@@ -1019,6 +1254,14 @@ def _add_band_args(p: argparse.ArgumentParser) -> None:
                         "(对应 MATLAB 脚本里的 IsPlotMirror)")
     p.add_argument("--strict-dominance", action="store_true",
                    help="要求每个态的单 G 主导度 >= 0.5(严格模式)")
+    p.add_argument("--min-dominance", type=float, default=None,
+                   help="单 G 主导度的下限(默认 0.5)。对**破坏平移对称**的态"
+                        "(CDW、缺陷超胞)要放宽 —— 那里的主导度低是态的性质, "
+                        "不是展开的数值失败")
+    p.add_argument("--wavecar", default=None,
+                   help="改走**平面波路线**: 从 WAVECAR 的平面波系数算严格谱权重 "
+                        "w(k')=Σ_g |C(g+k'-K)|²(Popescu--Zunger 构造)。"
+                        "默认走 PROCAR 的轨道投影路线。")
     p.add_argument("--e-ref", choices=("abs", "ef"), default="abs",
                    help="PNG 的 y 轴参考: abs = 绝对能量(默认); "
                         "ef = E - E_F(E_F 落在 0, 与论文里的画法一致)")
@@ -1026,7 +1269,7 @@ def _add_band_args(p: argparse.ArgumentParser) -> None:
                    default="assign",
                    help="能带图的展开方式: assign = 每个路径点只画**归属到该 k'** 的带"
                         "(干净, 但没有折叠副本); full = 画**全部**超胞带, 颜色 = 该带在"
-                        "k' 通道的权重(经典 Popescu 展开能带图: 有低权重色散的弥散背景)")
+                        "k' 通道的权重(经典 Bloch-character 展开能带图: 有低权重色散的弥散背景)")
     p.add_argument("--symprec", type=float, default=1e-5,
                    help="对称性判定的容差(Angstrom; spglib 的 symprec)。"
                         "结构坐标有 1e-5 级噪声时 1e-5 会漏掉大部分操作"
@@ -1074,7 +1317,7 @@ def build_parser() -> argparse.ArgumentParser:
             "KLABELS + unfolded_band.dat/.png\n"
             "输出四个 vaspkit 格式的文件, 用户组现有的 MATLAB 脚本"
             "(unfold_band_plot_mirror.m)可以直接画。\n"
-            "⚠ WEIGHT.grd 里的权重是 **Popescu 投影法的 G 分辨权重**"
+            "⚠ WEIGHT.grd 里的权重是 **Bloch-character 投影法的 G 分辨权重**"
             "(路径点上取原胞 k 等于该路径点的那个候选的投影权重),\n"
             "   **不是** vaspkit 282 用 WAVECAR 平面波展开得到的原胞带 |c(k)|² —— "
             "两者都叫权重但含义不同。\n"
@@ -1089,6 +1332,51 @@ def build_parser() -> argparse.ArgumentParser:
     p_info.add_argument("--grid-map", default=None,
                         help="grid_map.npz(默认 <dir>/grid_map.npz)")
     p_info.set_defaults(func=cmd_info)
+
+    p_fs = sub.add_parser(
+        "fs", help="提取费米面(脊顶)并做协变性/验证诊断",
+        description=(
+            "从 unfold 写出的 A(k,E).npz 提取**真费米面**(高斯脊的脊顶, 即"
+            "恰过 E_F 的那条带), 并报点群协变性的离散度 δ(R)、在给出原胞"
+            "直算结果时做验证协议(重合率 + 点到线段距离)、可选算费米速度。\n"
+            "--mode spectral 取的是 A(k,E_F) 的等值线 —— 那是脊的**两壁**, "
+            "**不是费米面**, 只用于复现社区惯用画法。\n"
+            "⚠ 三道闸门(真局域极大 / |E*-E_F| < 0.25 eV / "
+            "A(k,E_F) > 0.02·max)缺一不可, 否则会画出 A(k,E_F)=0 的幽灵小圈。"))
+    p_fs.add_argument("--npz", required=True, help="A(k,E).npz(unfold 写出)")
+    p_fs.add_argument("--prim", required=True, help="原胞 POSCAR(取点群与倒格矢)")
+    p_fs.add_argument("--kz", type=float, default=None,
+                      help="取哪一层 kz(分数坐标; 默认中间层)")
+    p_fs.add_argument("--mode", choices=("crest", "spectral"), default="crest",
+                      help="crest = 脊顶(真费米面, 默认); "
+                           "spectral = A(k,E_F) 等值线(两壁, 非费米面)")
+    p_fs.add_argument("--symprec", type=float, default=1e-4,
+                      help="spglib 对称性容差 (Å)")
+    p_fs.add_argument("--max-shift", type=float, default=0.25,
+                      help="闸门②: |E*(k)-E_F| 上限 (eV)")
+    p_fs.add_argument("--min-weight-frac", type=float, default=0.02,
+                      help="闸门③: A(k,E_F)/max A 下限")
+    p_fs.add_argument("--no-covariance", action="store_true",
+                      help="跳过协变性诊断")
+    p_fs.add_argument("--symmetrize", action="store_true", default=True,
+                      help="对脊顶场做点群轨道平均(默认开; 嵌套体系必须开, "
+                           "否则费米面的臂会在'腰'处整段消失)")
+    p_fs.add_argument("--no-symmetrize", dest="symmetrize",
+                      action="store_false",
+                      help="不做脊顶场的轨道平均(仅用于对比)")
+    p_fs.add_argument("--verify", default=None,
+                      help="原胞直算的 A(k,E).npz; 给出则做验证协议")
+    p_fs.add_argument("--velocity", action="store_true",
+                      help="算费米速度(沿 Γ 射线, 用脊顶场)")
+    p_fs.add_argument("--orbitals", action="store_true",
+                      help="报费米面上的轨道成分(需要 npz 里有 band_orb)")
+    p_fs.add_argument("--blur", type=float, default=1.0,
+                      help="脊顶场的笛卡尔模糊宽度(网格格数); 0 = 不模糊。"
+                           "⚠ 必须 >0, 否则主峰换带处的跳变会拉出横穿 BZ "
+                           "的直线(假象)")
+    p_fs.add_argument("--rays", type=int, default=180, help="射线数")
+    p_fs.add_argument("--out", default=None, help="把曲线顶点写到 npz")
+    p_fs.set_defaults(func=cmd_fs)
     return parser
 
 

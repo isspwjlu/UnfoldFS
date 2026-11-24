@@ -37,7 +37,7 @@ from unfoldfs.grid import (GridSpec, build_grid_map,
                            primitive_grid_points, save_grid_map,
                            write_kpoints)
 from unfoldfs.vaspio import read_eigenval, read_procar
-from tests.conftest import FIXTURE_EIGENVAL
+from tests.conftest import FIXTURE_EIGENVAL, FIXTURE_PRIMCELL
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -538,6 +538,48 @@ def test_unfold_prints_fermi_energy(mini_run, capsys):
     out = capsys.readouterr().out
     assert "E_F" in out
     assert "-5.950000 eV" in out
+
+
+def test_unfold_with_orbitals_writes_orbital_weights(tmp_path, mini_run):
+    """--orbitals: 逐轨道谱权重必须落进 npz, 且**默认不写**(不占体积)。"""
+    fs = tmp_path / "fs_orb"
+    rc = cli.main(["unfold", "--dir", str(mini_run), "--outdir", str(fs),
+                   "--orbitals"])
+    assert rc == 0
+    npz = np.load(str(fs / "A(k,E).npz"))
+    assert "band_orb" in npz.files
+    assert "orb_labels" in npz.files
+    n_points, n_band, n_orb = npz["band_orb"].shape
+    assert npz["band_w"].shape[:2] == (n_points, n_band)
+    assert len(npz["orb_labels"]) == n_orb
+    # 轨道名必须来自 PROCAR 表头(不是写死的标准九轨道顺序)
+    assert all(str(x) for x in npz["orb_labels"])
+
+
+def test_unfold_without_orbitals_does_not_write_band_orb(tmp_path, mini_run):
+    """默认路径不写 band_orb —— 逐轨道权重会显著增大 npz。"""
+    fs = tmp_path / "fs_plain"
+    rc = cli.main(["unfold", "--dir", str(mini_run), "--outdir", str(fs)])
+    assert rc == 0
+    npz = np.load(str(fs / "A(k,E).npz"))
+    assert "band_orb" not in npz.files
+
+
+def test_fs_subcommand_runs_on_an_unfolded_npz(tmp_path, mini_run, capsys):
+    """``unfoldfs fs``: 报协变性诊断; 半导体(无费米面)时**明确报错**而不是崩掉。
+
+    fixture 是半导体(E_F 落在带隙里)⇒ 没有费米面; 这时命令必须给出可读的
+    原因, 且**不能**吐 traceback。
+    """
+    fs = tmp_path / "fs"
+    assert cli.main(["unfold", "--dir", str(mini_run), "--outdir", str(fs)]) == 0
+    rc = cli.main(["fs", "--npz", str(fs / "A(k,E).npz"),
+                   "--prim", str(mini_run / "PRIMCELL.vasp")])
+    captured = capsys.readouterr()
+    assert "协变性" in captured.out
+    assert rc == 1
+    assert "没有取到任何费米面曲线" in captured.err
+    assert "Traceback" not in captured.err
 
 
 # ------------------------------------------------------------------ 点群轨道对称化
@@ -1320,3 +1362,75 @@ def test_band_e_ref_flag_defaults_to_abs_and_accepts_ef():
     parser = cli.build_parser()
     assert parser.parse_args(["band", "--dir", "x"]).e_ref == "abs"
     assert parser.parse_args(["band", "--dir", "x", "--e-ref", "ef"]).e_ref == "ef"
+
+
+def _synthetic_npz_with_orbitals(path, n=12):
+    """造一个最小的 A(k,E).npz(含 band_orb), 用于测 fs 子命令的轨道成分路径。
+
+    布局必须与真的 npz 一致(见 unfoldfs/fsout.write_spectral_npz):
+      band_e / band_w / valid / band_orb : (n_points, n_band[, norb])
+      A                                  : (n_points, n_E)
+
+    ⚠ 倒格矢用**真原胞**的(点群操作就作用在它的分数坐标里), 且带能只依赖
+    **笛卡尔半径**(点群不变量)—— 否则脊顶场不满足点群对称, 轨道平均会把它
+    抹平, 等值线消失(那是对错误数据的正确反应)。
+    """
+    import numpy as np
+    from unfoldfs.geometry import read_poscar, reciprocal
+    prim = read_poscar(str(FIXTURE_PRIMCELL))
+    b = np.asarray(reciprocal(prim.lattice))
+    fx = np.linspace(0.0, 1.0, n, endpoint=False)
+    kx, ky = np.meshgrid(fx, fx, indexing="ij")
+    k_frac = np.column_stack([kx.ravel(), ky.ravel(), np.zeros(n * n)])
+    k_cart = k_frac @ b
+    e_grid = np.linspace(-1.0, 1.0, 201)
+    e_f = 0.0
+    sigma = 0.06
+    n_band = 3
+    # 带能只依赖笛卡尔半径 ⇒ 在点群下不变
+    r2 = (k_cart[:, 0] ** 2 + k_cart[:, 1] ** 2)
+    be = np.zeros((n_band, n * n))
+    be[0] = 0.8 * (r2 - r2.min() - 0.6)
+    be[1] = 0.5
+    be[2] = -0.5
+    band_e = be.T
+    band_w = np.ones((n * n, n_band))
+    valid = np.ones((n * n, n_band), dtype=bool)
+    d = e_grid[None, :] - band_e[:, :, None]
+    a = np.einsum("pb,pbe->pe", band_w, np.exp(-d * d / (2 * sigma * sigma)))
+    norb = 4
+    band_orb = np.zeros((n * n, n_band, norb))
+    band_orb[:, 0, 2] = 2.0             # 过 E_F 的那条带集中在第 3 个轨道
+    band_orb[:, 1, 0] = 1.0
+    band_orb[:, 2, 1] = 1.0
+    np.savez_compressed(
+        path, A=a, e_grid=e_grid, k_cart=k_cart, k_frac=k_frac,
+        band_e=band_e, band_w=band_w, valid=valid, ef=e_f, vbm=-0.5, cbm=0.5,
+        sigma=sigma, k_units=np.array("2pi/Angstrom"), e_units=np.array("eV"),
+        band_orb=band_orb,
+        orb_labels=np.array(["s", "py", "pz", "dxy"]))
+    return path
+
+
+def test_fs_command_reports_the_orbital_composition(tmp_path, capsys):
+    """fs 子命令: 从含 band_orb 的 npz 报出费米面上的轨道成分。"""
+    import numpy as np
+    npz = _synthetic_npz_with_orbitals(tmp_path / "A(k,E).npz")
+    rc = cli.main(["fs", "--npz", str(npz),
+                   "--prim", str(FIXTURE_PRIMCELL),
+                   "--orbitals", "--no-covariance"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "轨道成分" in out
+    assert "pz" in out          # 主峰那条带集中在 pz
+
+
+def test_fs_command_reports_the_covariance_diagnostic(tmp_path, capsys):
+    """fs 子命令: 报未对称化与对称化后的 δ(R)。"""
+    import numpy as np
+    npz = _synthetic_npz_with_orbitals(tmp_path / "A(k,E).npz")
+    rc = cli.main(["fs", "--npz", str(npz), "--prim", str(FIXTURE_PRIMCELL)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "协变性" in out
+    assert "未对称化" in out and "对称化后" in out

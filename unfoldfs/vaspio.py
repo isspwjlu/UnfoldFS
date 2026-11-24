@@ -61,6 +61,7 @@ class ProcarData:
     weights: np.ndarray      # (nk, nb, nions, norb) |p|^2 (模方块)
     coeffs: np.ndarray       # (nk, nb, nions, norb) complex (复投影块)
     has_phase: bool          # 是否存在复投影块(无则 read_procar 直接报错)
+    orbital_labels: tuple = ()   # (norb,) 轨道名(从 PROCAR 表头读; 随赝势而变)
 
 
 def _read_lines(path: str) -> list[str]:
@@ -239,6 +240,25 @@ def _procar_norb(lines: list[str]) -> int:
     raise ValueError("PROCAR: 未找到 ion 表头")
 
 
+def _procar_orbital_labels(lines: list[str], norb: int) -> List[str]:
+    """从模方块 ion 表头取轨道名(去掉 'ion' 与 'tot')。
+
+    ⚠ 轨道数与顺序**随赝势而变**(含 TAIL/增基组时会有更多轨道), 所以
+       轨道名必须从表头读, 不能写死标准九轨道顺序。
+    """
+    for line in lines[2:]:
+        if line.lstrip().startswith("ion"):
+            fields = line.split()
+            if "tot" in fields:
+                labels = [f for f in fields[1:] if f != "tot"]
+                if len(labels) == norb:
+                    return labels
+                raise ValueError(
+                    f"PROCAR: ion 表头给出 {len(labels)} 个轨道名, 与 norb="
+                    f"{norb} 不符")
+    raise ValueError("PROCAR: 未找到 ion 表头")
+
+
 def _procar_kpoint(line: str) -> list[float]:
     """k 点行: ' k-point 1 : x y z weight = ...' -> 坐标在第 3~5 个 token。"""
     toks = line.split()
@@ -361,4 +381,5 @@ def read_procar(path: str) -> ProcarData:
     if not has_phase:
         raise ValueError(
             "PROCAR 中没有复投影块 —— 需要 LORBIT=12; LORBIT=11 不写相位")
-    return ProcarData(kpoints, weights, coeffs, has_phase)
+    return ProcarData(kpoints, weights, coeffs, has_phase,
+                      tuple(_procar_orbital_labels(lines, norb)))

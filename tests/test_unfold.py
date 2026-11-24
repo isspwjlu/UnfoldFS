@@ -1,4 +1,4 @@
-"""unfold 模块测试: Popescu 投影法展开、副本相位还原平均、候选 G 重组。
+"""unfold 模块测试: Bloch-character 投影展开、副本相位还原平均、候选 G 重组。
 
 fixture = 3x3x1 MoS2 超胞 (27 原子) + 原胞 (3 原子), M = diag(3,3,1), det(M)=9。
 数值基线均来自 fixture 实测(与已验证的原型 examples/prototypes/unfold_procar.py 同源):
@@ -715,14 +715,14 @@ def test_candidate_g_for_k_is_robust_to_k_outside_the_first_bz():
 
 # ------------------------------------------------------------------ det(M)=1 直通模式
 #
-# det(M)=1 ⇒ "超胞"就是原胞, 没有折叠、没有多份副本。但工具原来的 Popescu
+# det(M)=1 ⇒ "超胞"就是原胞, 没有折叠、没有多份副本。但工具原来的 Bloch-character
 # 路径在数学上**退化**: 候选 G 只有一个(g=0) ⇒ 4 种相位约定的主导度必然
 # 都是 1.0(完全相同)⇒ 择优守卫抛"4 种相位约定没有区分度", 工具连原胞
 # 都算不了。
 #
 # ⇒ det(M)=1 时**不做展开**, 直接用原胞的带能量与轨道投影权重
 #     w_n(k) = Σ_{ion,lm} |c_{ion,lm,n}(k)|²      (非相干和)
-# 与超胞展开模式的权重(Popescu 的**相干** G 投影)不是同一个定义。
+# 与超胞展开模式的权重(Bloch-character 的**相干** G 投影)不是同一个定义。
 
 def _primitive_direct_fixture():
     """det(M)=1 的合成数据: 原胞当超胞(TRANSMAT = 单位阵)。
@@ -808,15 +808,15 @@ def test_primitive_direct_skips_the_convention_selection():
 
 
 def test_primitive_direct_is_not_the_popescu_coherent_weight():
-    """直通模式(Σ|c|²)与展开模式(Popescu 相干 G 投影)不是同一个定义。
+    """直通模式(Σ|c|²)与展开模式(Bloch-character 相干 G 投影)不是同一个定义。
 
-    det(M)=1 时 Popescu 权重会退化成 |Σ_i e^{i k'·r_i} Σ_lm c_{i,lm}|² ——
+    det(M)=1 时 Bloch-character 权重会退化成 |Σ_i e^{i k'·r_i} Σ_lm c_{i,lm}|² ——
     逐原子的**相干**求和。两者必须不同(否则文档里"两种模式"的说法是假的)。
     """
     pd = _primitive_direct_fixture()
     res = _unfold_primitive_direct(pd)
     c = pd["coeffs"]
-    # Popescu(相干): 先在原胞原子上相干求和, 再取模方
+    # Bloch-character(相干): 先在原胞原子上相干求和, 再取模方
     bloch = np.exp(1j * ((pd["k_list"] @ pd["b_prim"])
                          @ (pd["prim"].positions @ pd["prim"].lattice).T))  # (n_k,n_ions)
     coherent = np.abs(np.einsum("ki,kbin->kb", bloch, c)) ** 2
