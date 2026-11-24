@@ -6,6 +6,11 @@
 > 逐条核对实际写出的文件 —— 文档与实现不一致时测试会失败。
 >
 > 核对环境：服务器 `<server>`（master），2026-11-17。
+> **路径占位符**：下文出现的 `$TOOLSDIR` / `$WORKDIR` / `$PPDIR` 是**占位符**，
+> 指向本机 VASP / VASPKIT / XCrySDen / FermiSurfer 的安装目录、计算工作目录与
+> PAW 赝势库目录，用前请自行 `export`（见 README §7）。
+
+
 > 参考物：XCrySDen 1.5.60（`$TOOLSDIR/xcrysden-1.5.60-bin-semishared`）、
 > FermiSurfer 2.2.1（`$TOOLSDIR/fermisurfer-2.2.1`）、
 > VASPKIT 1.5.1（`$TOOLSDIR/vaspkit.1.5.1`）。

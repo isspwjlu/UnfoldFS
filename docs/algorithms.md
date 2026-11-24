@@ -21,6 +21,18 @@
 > VASP 为 `vasp.6.6.0 06Mar2026`，Python 3.9.13（numpy 1.23.5 / scipy 1.13.1 /
 > spglib 2.0.2）（T8 §5.1）。
 
+> **路径占位符**：文中与脚本里出现的三类目录不是某台机器上的固定路径，而是
+> **占位符**，用前请自行设置：
+>
+> | 占位符 | 指向 |
+> |---|---|
+> | `$WORKDIR` | 计算的工作目录（下文出现的 `$WORKDIR/...` 都是它下面的子目录） |
+> | `$TOOLSDIR` | VASP / VASPKIT / XCrySDen / FermiSurfer 的安装目录 |
+> | `$PPDIR` | PAW 赝势库所在目录 |
+>
+> 例：`export WORKDIR=/path/to/work TOOLSDIR=/path/to/tools PPDIR=/path/to/pp`。
+> 论文正文中的对应表述见 `paper/`（未公开）。
+
 ---
 
 ## 1. 折叠/展开的行–列约定
