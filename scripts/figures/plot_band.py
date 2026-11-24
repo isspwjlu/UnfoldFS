@@ -54,20 +54,33 @@ def read_dat(path):
 
 
 def heatmap_panel(ax, dist, en, w, e_f, lo, hi, sigma, cmap="jet",
-                  rasterized=False):
-    """A(k,E) 热图: 颜色 = 按画窗归一化的线性权重, y 轴 = E - E_F。"""
+                  rasterized=False, norm=None, wcol=None):
+    """A(k,E) 热图: 颜色 = 按画窗归一化的权重, y 轴 = E - E_F。
+
+    ``norm`` 可传 matplotlib 的 Normalize/LogNorm; 缺省是线性 0..1。
+    ``wcol``: 直接给定**颜色值**(与 w 同形)⇒ 绕开"按画窗归一化的权重"这一步,
+    用来画别的编码(例如"到原胞带的能量偏差")。给定它时 norm/vmin/vmax 直接
+    作用在 wcol 上。
+    """
     step = max((hi - lo) / 1400.0, 1e-3)
     e_grid = np.arange(lo, hi + 0.5 * step, step)
     bl = np.nanmin(en, axis=1)[:, None]
     bh = np.nanmax(en, axis=1)[:, None]
     mask = np.broadcast_to((bh >= lo) & (bl <= hi), w.shape)
-    wcol = band._band_figure_colors(w, "linear", mask=mask).reshape(w.shape)
+    if wcol is None:
+        wcol = band._band_figure_colors(w, "linear", mask=mask).reshape(w.shape)
+    else:
+        wcol = np.asarray(wcol, dtype=float).reshape(w.shape)
     # 路径端点被算两次 => 去重(否则 pcolormesh 画退化格)
     keep = np.concatenate([[True], np.diff(dist) > 0])
     A = band.band_spectral_function(dist[keep], en[:, keep], wcol[:, keep],
                                     e_grid, sigma)
-    im = ax.pcolormesh(dist[keep], e_grid - e_f, A, cmap=cmap, vmin=0.0,
-                       vmax=1.0, shading="auto", rasterized=rasterized)
+    if norm is None:
+        im = ax.pcolormesh(dist[keep], e_grid - e_f, A, cmap=cmap, vmin=0.0,
+                           vmax=1.0, shading="auto", rasterized=rasterized)
+    else:
+        im = ax.pcolormesh(dist[keep], e_grid - e_f, A, cmap=cmap, norm=norm,
+                           shading="auto", rasterized=rasterized)
     ax.axhline(0.0, color="w", linestyle="--", linewidth=0.9, zorder=3)
     ax.set_ylim(lo - e_f, hi - e_f)
     ax.set_xlim(dist[0], dist[-1])

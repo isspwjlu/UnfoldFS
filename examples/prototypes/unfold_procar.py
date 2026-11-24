@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""投影法超胞能带反折叠 (Popescu, PRL 104, 216401 (2012)) + E_F 谱函数 / 费米面。
+"""投影法超胞能带反折叠 (Popescu & Zunger, PRB 85, 085201 (2012)) + E_F 谱函数 / 费米面。
+
+注: Popescu-Zunger 原文用超胞**平面波**系数算 <k'|Km>; 本原型用 PROCAR 的
+PAW 球内**分波**系数代替 ⇒ 权重不是严格谱权重(只在同一次计算内相对可比)。
 
 需要 LORBIT=12 的 PROCAR (VASP 5.4/6.x 写复投影系数 Re/Im; LORBIT=11 不写相位!)。
 

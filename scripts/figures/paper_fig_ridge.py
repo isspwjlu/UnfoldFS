@@ -28,8 +28,23 @@ from unfoldfs.geometry import read_poscar, reciprocal
 
 COLOR_WALL = S.PALETTE["red_strong"]    # 两壁(误判的构造)
 COLOR_FS = S.PALETTE["blue_main"]       # 真费米面
-COLOR_BZ = S.PALETTE["gray_mid"]        # 布里渊区边界
+COLOR_BZ = S.PALETTE["bz_edge"]         # BZ 边界: 暗蓝
 BG = (0.02, 0.03, 0.35)                 # 费米面面板的深底(与权重色标配套)
+
+# 图内固定文字(en = 原样, zh = 中文)。Γ 与公式保持不变。
+LBL = {
+    "cut_x":    {"en": r"distance along the cut  (2$\pi$/Å)",
+                 "zh": r"沿切线的距离（2$\pi$/Å）"},
+    "a_title":  {"en": r"(a) $A(\mathbf{k},E)$ along a cut through $\Gamma$",
+                 "zh": r"(a) 过$\Gamma$切线上的$A(\mathbf{k},E)$"},
+    "b_title":  {"en": r"(b) $A(\mathbf{k},E_F)$ contour at $0.5A_{\max}$",
+                 "zh": r"(b) $A(\mathbf{k},E_F)$在$0.5A_{\max}$处的等值线"},
+    "c_title":  {"en": r"(c) true Fermi surface", "zh": "(c) 真费米面"},
+    "leg_flank": {"en": r"$0.5A_{\max}$ crossings (flanks)",
+                  "zh": r"$0.5A_{\max}$交点（两壁）"},
+    "leg_crest": {"en": r"band crossing $E_F$ (crest)",
+                  "zh": r"能带过$E_F$（脊顶）"},
+}
 
 
 def wall_segments(a_ef, fx, fy, b, b2d, level):
@@ -78,8 +93,8 @@ def fs_segments(g, fx, fy, b2d, b1, b2):
     return segs
 
 
-def build(npz, poscar, out, png=None, ewin=0.48, height=2.6):
-    S.apply_prb_style()
+def build(npz, poscar, out, png=None, ewin=0.48, height=2.6, lang="en"):
+    S.apply_prb_style(lang=lang)
     prim = read_poscar(poscar)
     b = np.asarray(reciprocal(prim.lattice))
     b2d = b[:2, :2]
@@ -105,7 +120,7 @@ def build(npz, poscar, out, png=None, ewin=0.48, height=2.6):
     i_hi = int(np.argmin(np.abs(ew - (e_f + ewin))))
 
     fig = plt.figure(figsize=(S.FULL_WIDTH, height))
-    gs = fig.add_gridspec(1, 3, width_ratios=[1.35, 1.0, 1.0], wspace=0.30)
+    gs = fig.add_gridspec(1, 3, width_ratios=[0.92, 1.0, 1.0], wspace=0.34)
 
     # ---------------- (a) 谱图 ----------------
     ax = fig.add_subplot(gs[0, 0])
@@ -120,10 +135,9 @@ def build(npz, poscar, out, png=None, ewin=0.48, height=2.6):
         if ok.sum() > 2:
             ax.plot(dist[ok], line_E[bb][ok] - e_f, color="w", lw=0.7,
                     alpha=0.55)
-    ax.set_xlabel(r"distance along the cut  (2$\pi$/Å)")
+    ax.set_xlabel(LBL["cut_x"][lang])
     ax.set_ylabel(r"$E-E_F$  (eV)")
-    ax.set_title(r"(a) $A(\mathbf{k},E)$ along a cut through $\Gamma$",
-                 fontsize=S.FS_TITLE)
+    ax.set_title(LBL["a_title"][lang], fontsize=S.FS_TITLE)
 
     a_line = line_A[:, i_ef]
     lev = 0.5 * float(np.nanmax(a_line))
@@ -146,9 +160,9 @@ def build(npz, poscar, out, png=None, ewin=0.48, height=2.6):
     ax.axvline(x_fs, color=COLOR_FS, lw=2.0)
     ax.legend(handles=[
         plt.Line2D([], [], color=COLOR_WALL, lw=1.6,
-                   label=r"$0.5A_{\max}$ crossings (flanks)"),
+                   label=LBL["leg_flank"][lang]),
         plt.Line2D([], [], color=COLOR_FS, lw=2.0,
-                   label=r"band crossing $E_F$ (crest)"),
+                   label=LBL["leg_crest"][lang]),
     ], loc="lower left", fontsize=S.FS_ANNOT, frameon=True,
         facecolor="white", edgecolor="none", framealpha=0.85,
         handlelength=1.4, borderpad=0.3)
@@ -166,8 +180,7 @@ def build(npz, poscar, out, png=None, ewin=0.48, height=2.6):
                          lw=0.9, ls="--"))
     ax.set_xlabel(r"$k_1$  (2$\pi$/Å)")
     ax.set_ylabel(r"$k_2$  (2$\pi$/Å)")
-    ax.set_title(r"(b) $A(\mathbf{k},E_F)$ contour at $0.5A_{\max}$",
-                 fontsize=S.FS_TITLE)
+    ax.set_title(LBL["b_title"][lang], fontsize=S.FS_TITLE)
 
     # ---------------- (c) 真费米面 ----------------
     ax = fig.add_subplot(gs[0, 2])
@@ -184,7 +197,7 @@ def build(npz, poscar, out, png=None, ewin=0.48, height=2.6):
                          lw=0.9, ls="--"))
     ax.set_xlabel(r"$k_1$  (2$\pi$/Å)")
     ax.set_ylabel(r"$k_2$  (2$\pi$/Å)")
-    ax.set_title(r"(c) true Fermi surface", fontsize=S.FS_TITLE)
+    ax.set_title(LBL["c_title"][lang], fontsize=S.FS_TITLE)
 
     fig.subplots_adjust(left=0.065, right=0.905, top=0.90, bottom=0.16,
                         wspace=0.34)
@@ -210,9 +223,11 @@ def main():
     ap.add_argument("--png", default="")
     ap.add_argument("--ewin", type=float, default=0.48)
     ap.add_argument("--height", type=float, default=2.6)
+    ap.add_argument("--lang", choices=("en", "zh"), default="en",
+                    help="图内固定文字的语言")
     args = ap.parse_args()
     build(args.npz, args.prim, args.out, png=args.png or None,
-          ewin=args.ewin, height=args.height)
+          ewin=args.ewin, height=args.height, lang=args.lang)
 
 
 if __name__ == "__main__":

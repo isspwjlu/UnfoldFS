@@ -11,7 +11,7 @@
   * ``band``  逐带的 (E_b − E_F) 零等值线 —— **精确**(线性插值到网格内),
              适合原胞(带序在 k 上连续)。
              ⚠ 反折叠超胞不适用: 超胞带在展开后**带号会跳**(同一带号在不同 k 上
-               可能是不同的 Popescu 副本)⇒ 零等值线碎成竖条/碎片。
+               可能是不同的 Bloch-character 副本)⇒ 零等值线碎成竖条/碎片。
   * ``peak``  A(k,·) 在 E_F 附近**主峰的能量** E*(k) 的零等值线 —— 光滑、对称
              (A 已按原胞点群对称化), 对原胞与反折叠超胞**同一口径**。
 
@@ -116,7 +116,14 @@ def fold_to_bz(cart, b1, b2):
 
 
 def zero_contours(field2d, fx, fy, b2d, b1, b2):
-    """标量场的零等值线 -> 折回第一 BZ 的曲线列表"""
+    """标量场的零等值线 -> 折回第一 BZ 的曲线列表(笛卡尔)。
+
+    ⚠ 必须用**逐点**的 Voronoi 折叠(`fold_to_bz`), 不能改成"按段整体平移":
+      逐点折叠对每个点独立选最近像 ⇒ 与点群**协变** ⇒ 画出来的费米面对称。
+      按段平移虽然能让臂连续伸出边界, 但每段独立选平移量 ⇒ **破坏协变性**
+      ⇒ 费米面变得不对称(实测 2026-11-23)。对称比连续更重要:
+      越界的部分本来就要由周期性折回, 臂在边界处结束是标准画法。
+    """
     tile = np.ma.masked_invalid(np.tile(field2d, (3, 3)))
     tx = np.concatenate([fx - 1.0, fx, fx + 1.0])
     ty = np.concatenate([fy - 1.0, fy, fy + 1.0])
@@ -262,6 +269,11 @@ def symmetrize(field, ops, n1, n2):
 
     ⚠ 要把**原点**的值加到**像**上(`field.ravel()`); 写成 `field[i2,j2]` 就是
     "把每点加给自己" ⇒ 平均退化成恒等 ⇒ 图案仍然不对称。
+
+    ⚠ **NaN 安全**: 只在**有限**的像之间平均; 若某个点的所有像都是 NaN,
+      结果保持 NaN(而不是 0)。这对含 NaN 的场(脊顶能量场在没有局域极大的
+      地方是 NaN)是关键: 写成 0 会把"没有峰"当成"峰在 E=0", 随后被闸门
+      整片删掉 ⇒ 曲线全消失(实测 1T-TaS2 单层直接变 0 段)。
     """
     if not len(ops):
         return field
@@ -279,7 +291,8 @@ def symmetrize(field, ops, n1, n2):
         ok = np.isfinite(vals)
         np.add.at(out, (i2, j2), np.where(ok, vals, 0.0))
         np.add.at(cnt, (i2, j2), ok.astype(float))
-    return np.divide(out, np.maximum(cnt, 1), out=np.zeros_like(out), where=cnt > 0)
+    # cnt == 0 => 该点的所有像都是 NaN => 保持 NaN(不是 0)
+    return np.divide(out, cnt, out=np.full_like(out, np.nan), where=cnt > 0)
 
 
 def get_ops(prim, symprec=1e-4):
@@ -294,47 +307,71 @@ def get_ops(prim, symprec=1e-4):
     return ds.rotations[keep], ds.translations[keep]
 
 
-def peak_energy_field(a, e_grid, e_f, sigma, win=0.20):
+def peak_energy_field(a, e_grid, e_f, sigma, win=0.20, nearest=False):
     """每个 k 上 A(k,·) 在 E_F 附近**主峰**的能量 E*(k)(光滑函数)。
 
     ⚠ 必须确认这个峰是**真的局域极大**(A[j-1] < A[j] > A[j+1]), 否则会把
     "窗口边缘上的强带尾巴"当成峰 —— 那种"峰"离 E_F 有 0.3 eV, E* 在那里乱跳
     ⇒ 凭空画出**孤零零的小圈**(实测: 那些圈上 A(k,E_F)=0, 谱权重全在别处)。
     没有真峰的地方一律给 NaN(等值线自然断开)。
+
+    ``nearest=True``: 在窗口内取**离 E_F 最近**的那个局域极大, 而不是
+    **最高**的那个。
+    ⚠ 区别很要紧(实测 2026-11-24, 体相 1T-TaS2): 嵌套的费米面上有两条带
+      同时靠近 E_F, 最高的那条未必是过 E_F 的那条 ⇒ E* 偏掉 ~0.1 eV ⇒
+      轨道平均后偏差中位 0.08 eV ⇒ 曲线的"腰"整段被闸门删掉, 画出来只剩
+      中心附近几段小钩。用"最近的"就能全程跟住过 E_F 的那条带。
     """
     ew = np.asarray(e_grid, dtype=float)
-    sel = np.abs(ew - e_f) <= win
-    aw = a[..., sel]
-    ews = ew[sel]
-    j = np.argmax(aw, axis=-1)
-    e0 = ews[j]
-    # 局域极大检验(在全能量网格上): 左邻 < 峰 < 右邻
-    # 窗口内的下标 -> 全能量网格的下标
-    sel_idx = np.nonzero(sel)[0]
-    jfull = sel_idx[j][..., None]
-    left = np.take_along_axis(a, np.clip(jfull - 1, 0, None), axis=-1)[..., 0]
-    right = np.take_along_axis(a, np.clip(jfull + 1, 0, None), axis=-1)[..., 0]
-    peak = np.take_along_axis(a, jfull, axis=-1)[..., 0]
-    is_peak = (peak > left) & (peak > right) & (peak > 0.0)
+    if nearest:
+        nE = a.shape[-1]
+        left = np.concatenate([a[..., :1], a[..., :-1]], axis=-1)
+        right = np.concatenate([a[..., 1:], a[..., -1:]], axis=-1)
+        is_peak = (a > left) & (a > right) & (a > 0.0)
+        sel = np.abs(ew - e_f) <= win
+        cost = np.where(sel & is_peak, np.abs(ew - e_f)[None, None, :], np.inf)
+        j = np.argmin(cost, axis=-1)
+        found = np.isfinite(np.take_along_axis(cost, j[..., None], axis=-1)[..., 0])
+        e0 = ew[j]
+    else:
+        sel = np.abs(ew - e_f) <= win
+        aw = a[..., sel]
+        ews = ew[sel]
+        j = np.argmax(aw, axis=-1)
+        e0 = ews[j]
+        # 局域极大检验(在全能量网格上): 左邻 < 峰 < 右邻
+        # 窗口内的下标 -> 全能量网格的下标
+        sel_idx = np.nonzero(sel)[0]
+        jfull = sel_idx[j][..., None]
+        left = np.take_along_axis(a, np.clip(jfull - 1, 0, None), axis=-1)[..., 0]
+        right = np.take_along_axis(a, np.clip(jfull + 1, 0, None), axis=-1)[..., 0]
+        peak = np.take_along_axis(a, jfull, axis=-1)[..., 0]
+        is_peak = (peak > left) & (peak > right) & (peak > 0.0)
     dist = np.abs(ew[None, None, :] - e0[..., None])
     near = (dist <= 2.0 * sigma) * a
     num = (near * ew[None, None, :]).sum(axis=-1)
     den = near.sum(axis=-1)
     with np.errstate(invalid="ignore", divide="ignore"):
         e_star = np.where(den > 0, num / den, np.nan)
-    return np.where(is_peak, e_star, np.nan)
+    return np.where(found if nearest else is_peak, e_star, np.nan)
 
 
 def weight_at_peak(be, bw, va, e_star):
-    """每个 k 上「主峰那条带」的谱权重(离 E* 最近的带)。"""
-    w = np.zeros(e_star.shape)
+    """每个 k 上「主峰那条带」的谱权重(离 E* 最近的带)。
+
+    ⚠ 没有有效带的地方必须给 **NaN**, 不能给 0: 取色时用的是高斯核插值
+      (``sample_equiv``), 它会把邻域里的 0 混进来 ⇒ 直接计算的费米面上
+      权重从 1 被抹成 0.86(假的)。实测(2026-11-24): 原胞直算的 band_w
+      恒为 1, 而这里算出来的中位数却是 0.8583 —— 那全是插值污染。
+    """
+    w = np.full(e_star.shape, np.nan)
     dbest = np.full(e_star.shape, np.inf)
     for b in range(be.shape[0]):
-        ok = va[b] & np.isfinite(be[b])
+        ok = va[b] & np.isfinite(be[b]) & np.isfinite(e_star)
         db = np.where(ok, np.abs(be[b] - e_star), np.inf)
         m = db < dbest
         dbest = np.where(m, db, dbest)
-        w = np.where(m, np.where(ok, bw[b], 0.0), w)
+        w = np.where(m, np.where(ok, bw[b], np.nan), w)
     return w
 
 
@@ -345,12 +382,32 @@ def wrap_text(text, width=52):
 
 
 def panel_data(path, b_prim, b2d, b1, b2, ops, args):
-    """一个面板要画的东西 -> (segs, wts, kz_info)"""
+    """一个面板要画的东西 -> (segs, wts, kz_info)
+
+    ``args.refine = N``: 在原网格上算出脊顶能量场之后, 用**协变高斯插值**
+    (``sample_equiv``) 把它重建到 N×N 的细网格上再提等值线。
+    ⚠ 只在**网格太粗**时用(实测 24×24 的体相 1T-TaS2): 那个网格的间距
+      (0.090 2π/Å) 与费米面的特征尺度相当, 直接提等值线得到的是**折线碎片**
+      (实测: 原胞的费米面被画成 6 段小钩, 而不是六瓣花瓣 —— 那是采样不足,
+      不是物理)。插值重建给出正确的六瓣, 但它终究是插值, 所以正文必须
+      写明网格分辨率。
+    ⚠ 在**网格够细**时不要用: 96×96 的算例上插值会引入 ~0.24 个网格间距的
+      系统偏移(核宽 ~1 格 ⇒ 把脊抹平), 比不插值更差。
+    """
     d = load(path.strip(), getattr(args, "kz", None))
     n1, n2, fx, fy = d["n1"], d["n2"], d["fx"], d["fy"]
     e_f = d["e_f"]
     if args.method == "peak":
-        e_star = peak_energy_field(d["a"], d["e_grid"], e_f, d["sigma"])
+        e_star = peak_energy_field(d["a"], d["e_grid"], e_f, d["sigma"],
+                                   nearest=getattr(args, "nearest", False))
+        if not args.no_sym:
+            # ⚠ 脊顶能量场**也要**轨道平均, 不只是权重: E*(k) 在对称相关点上
+            #   并不一致(嵌套处两条带交换 ⇒ "最高峰"跳到另一条 ⇒ E* 偏掉
+            #   ~0.1 eV), 不平均就会在费米面的"腰"处把曲线整段切断
+            #   (实测体相 1T-TaS2: 54 个断点, 全在 |k|=0.25)。
+            #   平均后腰处的 E* 归零 ⇒ 曲线连续(这正是"轨道平均恢复协变性"
+            #   在画费米面时的那一步)。
+            e_star = symmetrize(e_star, ops, n1, n2)
         wfield = weight_at_peak(d["be"], d["bw"], d["va"], e_star)
         if not args.no_sym:
             wfield = symmetrize(wfield, ops, n1, n2)
@@ -358,12 +415,27 @@ def panel_data(path, b_prim, b2d, b1, b2, ops, args):
             # 笛卡尔等距模糊: 抹平"主峰在副本之间跳变"造成的折角,
             # 同时保持点群协变(笛卡尔核 ⇒ 严格对称)
             e_star = blur_cartesian(e_star, b2d, args.blur)
+        i_ef = int(np.argmin(np.abs(d["e_grid"] - e_f)))
+        a_ef = d["a"][:, :, i_ef]
+        refine = int(getattr(args, "refine", 0) or 0)
+        if refine > n1:
+            # 重建到细网格(分数坐标居中, 周期延拓由 sample_equiv 处理)
+            fxf = (np.arange(refine) + 0.5) / refine - 0.5
+            F1, F2 = np.meshgrid(fxf, fxf, indexing="ij")
+            cart = np.stack([F1 * b2d[0, 0] + F2 * b2d[1, 0],
+                             F1 * b2d[0, 1] + F2 * b2d[1, 1]],
+                            axis=-1).reshape(-1, 2)
+            e_star = sample_equiv(e_star, cart, b2d,
+                                  args.sigma_cells).reshape(refine, refine)
+            wfield = sample_equiv(wfield, cart, b2d,
+                                  args.sigma_cells).reshape(refine, refine)
+            a_ef = sample_equiv(a_ef, cart, b2d,
+                                args.sigma_cells).reshape(refine, refine)
+            fx = fy = fxf
         # 只保留"峰就在 E_F 附近"的区域: 远处本来就不该有曲线
         e_gate = np.where(np.abs(e_star - e_f) <= args.mask, e_star, np.nan)
         # 再加一道物理闸门: **E_F 处确实有谱权重**的地方才算费米面
         # (否则追踪到的"峰"可能在 E_F 之外很远, 平滑后凭空过零 ⇒ 孤零零的小圈)
-        i_ef = int(np.argmin(np.abs(d["e_grid"] - e_f)))
-        a_ef = d["a"][:, :, i_ef]
         keep = a_ef >= args.wmin * float(np.nanmax(a_ef))
         e_gate = np.where(keep, e_gate, np.nan)
         curves = [(c, None) for c in

@@ -10,7 +10,7 @@
 
 | 文件 | 内容 |
 |---|---|
-| `unfold_procar.py` | **投影法超胞能带反折叠**（Popescu, PRL 104, 216401 (2012)）的独立实现。`unfoldfs` 包的展开算法就是从这里移植的，`docs/algorithms.md` §11.1 用它做**全路径交叉核对**（`max|Δw| = 4.99e-09`、`max|ΔE| = 0`），`tests/test_unfold.py` 的数值基线也同源于它 |
+| `unfold_procar.py` | **投影法超胞能带反折叠**（Popescu & Zunger, PRB 85, 085201 (2012)）的独立实现。`unfoldfs` 包的展开算法就是从这里移植的，`docs/algorithms.md` §11.1 用它做**全路径交叉核对**（`max|Δw| = 4.99e-09`、`max|ΔE| = 0`），`tests/test_unfold.py` 的数值基线也同源于它 |
 | `unfold_fs.py` | 由 vaspkit 282 的 `EBS.dat` 构建 $E_F$ 处的谱函数并渲染反折叠费米面（早期的"用别人的展开结果"路线） |
 | `validate_unfold.py` | 在 $\Gamma$ 点对比"自实现投影法展开"与"VASPKIT 282（平面波法）展开"的能量与权重 |
 | `diag_unfold.py` | 诊断展开公式的变体：单 $G$ 主导度、归一化 $\sum_G w / \sum|p|^2$ |

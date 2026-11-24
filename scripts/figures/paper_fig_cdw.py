@@ -38,6 +38,10 @@ from plot_band import read_dat, heatmap_panel
 
 CMAP = "turbo"
 
+# 本图只有一幅面板, 图内的文字**全是公式与单位**(E−E_F、w、高对称点标记),
+# 没有可以翻译的英文句子 ⇒ --lang 只切字体栈(为将来加中文标注留口)。
+# 高对称点(Γ/M/K/A/L/H)是符号, 不译。
+
 
 def kpath_marks(ax, labels):
     """k 路径竖线 + 高对称点标签(标签在坐标区外, 一律黑色)。"""
@@ -57,8 +61,8 @@ def kpath_marks(ax, labels):
 
 
 def build(ef, assign_dat, full_dat, labels, out, png=None, e_min=-1.0,
-          e_max=1.0, sigma=0.05, height=2.4, width=None):
-    S.apply_prb_style()
+          e_max=1.0, sigma=0.05, height=2.4, width=None, lang="en"):
+    S.apply_prb_style(lang=lang)
     df, efull, wf = read_dat(full_dat)
     width = width or S.FULL_WIDTH
 
@@ -75,8 +79,8 @@ def build(ef, assign_dat, full_dat, labels, out, png=None, e_min=-1.0,
     for row, (d, e, w, title) in enumerate(rows):
         ax = fig.add_subplot(gs[row, 0])
         # heatmap_panel 的 lo/hi 是**绝对能量**(画的是 E-E_F) ⇒ 相对窗口加回 E_F
-        heatmap_panel(ax, d, e, w, ef, ef + e_min, ef + e_max, sigma,
-                      cmap=CMAP, rasterized=True)
+        im = heatmap_panel(ax, d, e, w, ef, ef + e_min, ef + e_max, sigma,
+                           cmap=CMAP, rasterized=True)
         if title:
             ax.set_title(title, fontsize=S.FS_TITLE)
         ax.set_ylabel(r"$E-E_F$  (eV)")
@@ -85,7 +89,20 @@ def build(ef, assign_dat, full_dat, labels, out, png=None, e_min=-1.0,
         ax.set_xticks([])
         kpath_marks(ax, labels)
 
-    fig.subplots_adjust(left=0.105, right=0.995, top=0.96, bottom=0.075)
+    # 色标: 图注把颜色说成"谱权重", 读者没有色标就解不出这个量 ⇒ 必须给。
+    cax = fig.add_axes([0.955, 0.20, 0.011, 0.55])
+    grad = np.linspace(0.0, 1.0, 256).reshape(-1, 1)
+    cax.imshow(grad, aspect="auto", cmap=CMAP, origin="lower",
+               extent=(0.0, 1.0, 0.0, 1.0), interpolation="nearest")
+    cax.set_xticks([])
+    cax.set_yticks([0.0, 1.0])
+    cax.set_yticklabels(["0", "1"])
+    cax.tick_params(labelsize=7, length=2, pad=2)
+    for sp in cax.spines.values():
+        sp.set_visible(False)
+    cax.set_ylabel(r"$w$", fontsize=8, rotation=270, labelpad=12, va="bottom")
+
+    fig.subplots_adjust(left=0.105, right=0.940, top=0.96, bottom=0.075)
     S.save(fig, out, png_preview=png)
     plt.close(fig)
 
@@ -106,6 +123,8 @@ def main():
     ap.add_argument("--height", type=float, default=2.4)
     ap.add_argument("--width", type=float, default=0.0,
                     help="画布宽度 (in); 0 = 全栏 7.0 in, 3.4 = 单栏")
+    ap.add_argument("--lang", choices=("en", "zh"), default="en",
+                    help="图内文字的语言(本图目前只有公式, 只有字体栈会变)")
     args = ap.parse_args()
 
     labels = []
@@ -117,7 +136,7 @@ def main():
     build(args.ef, args.assign, args.full, labels, args.out,
           png=args.png or None, e_min=args.e_min, e_max=args.e_max,
           sigma=args.sigma, height=args.height,
-          width=(args.width or None))
+          width=(args.width or None), lang=args.lang)
 
 
 if __name__ == "__main__":

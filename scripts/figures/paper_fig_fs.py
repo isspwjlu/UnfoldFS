@@ -38,7 +38,7 @@ from unfoldfs.geometry import read_poscar, reciprocal
 
 CMAP = "turbo"
 COLOR_DIRECT = "#1f3fbf"          # 原胞直算: 蓝线
-COLOR_BZ = S.PALETTE["neutral"]    # 布里渊区边界: 中性灰虚线
+COLOR_BZ = S.PALETTE["bz_edge"]     # BZ 边界: 暗蓝(浅灰在深底上像"一圈白线")
 
 
 def draw_panel(ax, segs, wts, blue, title, hexv, lims, lw):
@@ -74,7 +74,7 @@ def add_colorbar(fig, rect):
 
 
 def build(prim_poscar, npz_paths, titles, out, png=None, method="peak",
-          blue_panels=(0,), lw=1.8, height=2.75):
+          blue_panels=(0,), lw=1.8, height=2.75, kz=None):
     S.apply_prb_style()
     prim = read_poscar(prim_poscar)
     b_prim = np.asarray(reciprocal(prim.lattice))
@@ -88,7 +88,7 @@ def build(prim_poscar, npz_paths, titles, out, png=None, method="peak",
     ops, _ = P.get_ops(prim)
 
     A = SimpleNamespace(no_sym=False, blur=1.0, sigma_cells=1.5, mask=0.25,
-                        wmin=0.02, method=method, kz=None)
+                        wmin=0.02, method=method, kz=kz)
 
     n = len(npz_paths)
     fig, axes = plt.subplots(1, n, figsize=(S.FULL_WIDTH, height), squeeze=False)
@@ -118,6 +118,8 @@ def main():
     ap.add_argument("--blue-panels", default="0")
     ap.add_argument("--lw", type=float, default=1.8)
     ap.add_argument("--height", type=float, default=2.75)
+    ap.add_argument("--kz", type=float, default=None,
+                    help="kz 切片(分数坐标, 1.0 = 2*pi/c); 默认取中间那层")
     args = ap.parse_args()
 
     build(args.prim, [p.strip() for p in args.npz.split(",")],
@@ -125,7 +127,7 @@ def main():
           method=args.method,
           blue_panels={int(x) for x in args.blue_panels.split(",")
                        if x.strip() != ""},
-          lw=args.lw, height=args.height)
+          lw=args.lw, height=args.height, kz=args.kz)
 
 
 if __name__ == "__main__":

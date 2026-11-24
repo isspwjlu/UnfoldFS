@@ -60,6 +60,15 @@ python "$HERE/paper_fig_verify.py" --prim PRIMCELL.vasp \
   --scs-npz tas2_fs_scsqrt3.npz \
   --out "$OUT/fig5_verify.pdf" --png "$OUT/fig5_verify.png"
 
+# ---------------------------------------------------------------- 图 7 费米速度
+# 等值面(两壁) vs 脊顶: 能量偏移、面积抵消、v_F 散布。
+# 逐点数值与正文 §III.A 同源(见 paper/fact_sheet.md §2.13)。
+# ⚠ --npz-unf 要的是**同一材料**的超胞展开数据(与 --npz-prim 同体系,
+#   否则 (a)(b) 的倒格矢对不上)。这里用 1H-NbSe2 的原胞与 3x1x1 展开。
+python "$HERE/paper_fig_vf.py" --npz-prim nbse2/prim.npz \
+  --npz-unf nbse2/sc3x1x1.npz \
+  --out "$OUT/fig7_velocity.pdf" --png "$OUT/fig7_velocity.png" --height 2.6
+
 # ---------------------------------------------------------------- 图 6 CDW 态
 # 需要 CDW 算例的反折叠结果(见 scripts/cdw/); 没有就跳过。
 # 单栏图: 画布 3.4 x 2.4 in => 论文里印刷高 2.19 in(全栏宽会把它压扁)。

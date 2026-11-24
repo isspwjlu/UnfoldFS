@@ -41,6 +41,23 @@ FULL_WIDTH = 7.0
 
 FONT_STACK = ["Arial", "Helvetica", "DejaVu Sans", "sans-serif"]
 
+# 中文版字体栈(只在 --lang zh 时用)。
+#
+# ⚠ 中文字体必须排在**前面**, 原因不是审美而是 matplotlib 的机制:
+#   * 一旦字符串里含 "$...$", **整串**都走 mathtext 渲染通道;
+#   * mathtext 有一个 "default" 字体槽, 它由 findfont(字体属性) 解析成
+#     **单一**字体(mathtext 没有逐字回退)⇒ 汉字必须由这个"主字体"提供,
+#     否则整串中文都变成空心方框(tofu);
+#   * 所以主字体取 微软雅黑(SimHei 备用): 它同时有完整的拉丁字形和汉字,
+#     数学符号则仍走 mathtext 自己的 DejaVu 字体槽(rm/it/bf), 与英文版一致。
+#   * 纯文本字符串(不含 $)走 matplotlib ≥ 3.6 的逐字回退, 缺字自动落到
+#     列表里的下一个中文字体。
+# ⚠ "font.family" 必须给成**具体字体的列表**(而不是 "sans-serif"):
+#   "sans-serif" 只会解析出 font.sans-serif 里的**第一个**字体, 回退不生效。
+FONT_STACK_ZH = ["Microsoft YaHei", "SimHei", "Arial", "DejaVu Sans",
+                 "sans-serif"]
+FONT_FAMILY_ZH = ["Microsoft YaHei", "SimHei", "Arial", "DejaVu Sans"]
+
 # 房子风格的语义色(blue=主角/直接算, green=改进, red=对照/误判, neutral=辅助)
 PALETTE = {
     "blue_main": "#0F4D92",
@@ -52,6 +69,10 @@ PALETTE = {
     "red_2": "#E9A6A1",
     "red_strong": "#B64342",
     "neutral": "#CFCECE",
+    # BZ 边界在**深底**面板上用: 浅灰(#CFCECE)在深蓝底上像"一圈白线",
+    # 把费米面衬得像是被它截断(用户 2026-11-23 指出)⇒ 改成与背景接近的暗蓝,
+    # 仍能看出第一布里渊区在哪, 但不再抢眼。
+    "bz_edge": "#39487F",
     "gray_mid": "#767676",
     "gray_dark": "#4D4D4D",
     "highlight": "#FFD700",
@@ -60,11 +81,19 @@ PALETTE = {
 }
 
 
-def apply_prb_style(fontsize: float = FS_TICK) -> None:
-    """把 rcParams 设成 PRB 论文图的口径。"""
+def apply_prb_style(fontsize: float = FS_TICK, lang: str = "en") -> None:
+    """把 rcParams 设成 PRB 论文图的口径。
+
+    ``lang="zh"``: 字体栈换成中文版(微软雅黑/SimHei 优先)—— 汉字与拉丁
+    字母都由中文字体出(**含 $...$ 的字符串整串走 mathtext, 而 mathtext 的
+    "default" 字体槽只解析成单一字体, 所以主字体必须是中文字体**); 数学
+    符号本身仍走 mathtext 自己的 DejaVu 字体槽(rm/it/bf), 与英文版一致。
+    ``lang="en"``(默认)的 rcParams 与从前**逐字相同**。
+    """
+    zh = (lang == "zh")
     matplotlib.rcParams.update({
-        "font.family": "sans-serif",
-        "font.sans-serif": FONT_STACK,
+        "font.family": FONT_FAMILY_ZH if zh else "sans-serif",
+        "font.sans-serif": FONT_STACK_ZH if zh else FONT_STACK,
         "font.size": fontsize,
         "axes.titlesize": FS_TITLE,
         "axes.labelsize": FS_AXLAB,

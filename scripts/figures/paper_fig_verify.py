@@ -33,7 +33,7 @@ from unfoldfs.geometry import read_poscar, reciprocal
 
 COLOR_DIRECT = S.PALETTE["blue_main"]
 COLOR_UNFOLD = S.PALETTE["red_strong"]
-COLOR_BZ = S.PALETTE["gray_mid"]
+COLOR_BZ = S.PALETTE["bz_edge"]
 
 
 class _A:

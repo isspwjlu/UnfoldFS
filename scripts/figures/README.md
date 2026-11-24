@@ -129,6 +129,10 @@ unfoldfs unfold --dir <算例目录> --ef auto        # ⇒ A(k,E).npz 带 kz �
 | `paper_fig_fs.py` | 图 4: 反折叠费米面(原胞蓝线 + 两种超胞) |
 | `paper_fig_verify.py` | 图 5: 验证协议(重合 + 距离 + 权重分布) |
 | `paper_fig_cdw.py` | 图 6: 1T-TaS2 **CDW 态**的反折叠能带(有隙) |
+| `paper_fig_vf.py` | 图 7: **费米速度** —— Γ 口袋上 v_F **着色**的费米面(脊顶 vs 两壁, 共用色标) + 比值的累积分布 |
+| `paper_fig_vf3d.py` | 同上的**三维版**(PyVista; 参考 bands4vasp Fig.4 的画法; 单层体系里 FS 只是薄壳, 论文未采用) |
+| `paper_fig_velocity.py` | 图 7 的**数值**统计(与正文同源; 输出 JSON) |
+| `paper_fig_defect.py` | 图 9: 体相 1T-TaS2 **缺陷超胞** Ta9S16 的反折叠费米面(原胞蓝线 / 完美超胞 / 缺陷超胞, 后两者共用谱权重色标) |
 | `make_paper_figures.sh` | 一次出齐上面全部图 -> `paper/figs/*.pdf` |
 
 ```bash
