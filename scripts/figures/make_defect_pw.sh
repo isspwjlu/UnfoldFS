@@ -1,4 +1,7 @@
 #!/bin/bash
+# ⚠ 下面的 $WORKDIR / $TOOLSDIR / $PPDIR 是**占位符**(原为某台机器上的
+#   具体路径, 已从公开仓库中移除)。使用前请自行设置:
+#   export WORKDIR=/path/to/work  TOOLSDIR=/path/to/tools  PPDIR=/path/to/pp
 # 缺陷超胞的平面波路线 —— **服务器端**部分: 检查 → 展开 → 原胞参考 → 数字。
 #
 # 幂等: 已经做过的步骤会跳过 ⇒ 可以反复跑(监控用)。

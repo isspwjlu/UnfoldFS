@@ -1,4 +1,7 @@
 #!/bin/bash
+# ⚠ 下面的 $WORKDIR / $TOOLSDIR / $PPDIR 是**占位符**(原为某台机器上的
+#   具体路径, 已从公开仓库中移除)。使用前请自行设置:
+#   export WORKDIR=/path/to/work  TOOLSDIR=/path/to/tools  PPDIR=/path/to/pp
 # 缺陷超胞的**48×48** 平面波路线 —— 服务器端: 展开 → 原胞参考。
 #
 # 为什么重算: 24×24 的网格(间距 0.090 2π/Å)与费米面的特征尺度(~0.3~0.8)

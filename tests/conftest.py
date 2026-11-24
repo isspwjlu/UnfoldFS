@@ -17,10 +17,15 @@ FIXTURE_PROCAR = DATA_DIR / "PROCAR"
 import pytest  # noqa: E402
 
 _FIXTURE_USERS = {
-    "test_expand.py": ("PROCAR",),
+    "test_band.py": ("DOSCAR", "EIGENVAL", "PROCAR"),
+    "test_cli.py": ("DOSCAR", "EIGENVAL", "PROCAR"),
+    "test_expand.py": ("EIGENVAL", "PROCAR"),
+    "test_fs.py": ("PROCAR",),
+    "test_fsout.py": ("DOSCAR", "EIGENVAL"),
     "test_geometry.py": ("DOSCAR", "EIGENVAL", "PROCAR"),
-    "test_unfold.py": ("PROCAR",),
-    "test_vaspio.py": ("DOSCAR", "PROCAR"),
+    "test_orbitals.py": ("EIGENVAL", "PROCAR"),
+    "test_unfold.py": ("EIGENVAL", "PROCAR"),
+    "test_vaspio.py": ("DOSCAR", "EIGENVAL", "PROCAR"),
 }
 
 

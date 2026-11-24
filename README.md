@@ -310,7 +310,25 @@ plotting script works on them unchanged.
 
 The complete list and all measured numbers → [`docs/algorithms.md`](docs/algorithms.md) §14.
 
-## 7. Repository layout
+## 7. Placeholders in the documentation and scripts
+
+The documentation and the server-side scripts refer to three directories
+of the machine the calculations were run on. They are written as
+environment variables rather than as absolute paths:
+
+| variable | what it points to |
+|---|---|
+| `$WORKDIR` | the working directory of the calculations |
+| `$TOOLSDIR` | where VASP, VASPKIT, XCrySDen and FermiSurfer are installed |
+| `$PPDIR` | where the PAW pseudopotentials live |
+
+Export them before running the scripts, e.g.
+
+```bash
+export WORKDIR=/path/to/work TOOLSDIR=/path/to/tools PPDIR=/path/to/pp
+```
+
+## 8. Repository layout
 
 ```
 unfoldfs/            the tool itself (the installable UnfoldFS package)

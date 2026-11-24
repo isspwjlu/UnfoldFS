@@ -1,4 +1,7 @@
 #!/bin/bash
+# ⚠ 下面的 $WORKDIR / $TOOLSDIR / $PPDIR 是**占位符**(原为某台机器上的
+#   具体路径, 已从公开仓库中移除)。使用前请自行设置:
+#   export WORKDIR=/path/to/work  TOOLSDIR=/path/to/tools  PPDIR=/path/to/pp
 # 体相 1T-TaS2 的 3x3x1 超胞 + S 空位缺陷 (Ta9S16): 服务器端计算 + 反折叠。
 #
 # 阶段 (按顺序执行):
