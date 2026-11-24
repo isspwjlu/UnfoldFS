@@ -27,3 +27,13 @@ paper/
 
 # 本机私有远程 helper(依赖 ~/.claude/ssh_login.py), 不公开
 rsh.py
+
+# 论文分析用的下载数据(从服务器取; 体积大, 不进版本库)
+.fsdata/
+
+# 平面波路线论文稿件(本地保留, 不公开)
+paper_pw/
+
+# 本机临时文件 / 文献缓存
+.tmp_*.py
+.refcache/
